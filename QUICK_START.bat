@@ -24,7 +24,7 @@ echo.
 echo ✅ SETUP COMPLETE!
 echo.
 echo 🎯 DEVELOPMENT COMMANDS:
-echo    npm run dev         - Start file watcher (auto-bundle + deploy)
+echo    npm run watch       - Start file watcher (auto-bundle + deploy)
 echo    npm run watch       - Watch files and auto-bundle + deploy
 echo    npm run build       - Build and deploy once
 echo.
@@ -40,7 +40,6 @@ echo    • Auto-bundle to NavBot.lua
 echo    • Auto-deploy to LMAOBox
 echo    • Ready to load in LMAOBox
 echo.
-echo 🎮 STARTING DEVELOPMENT MODE...
-call npm run dev
-
+echo 🎮 Start watcher in this terminal:  npm run watch
+echo 🚀 Push to main/master to auto-bundle and create a GitHub Release.
 pause

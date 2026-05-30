@@ -1,68 +1,87 @@
-// Simple file watcher using Node.js built-in modules
-const fs = require('fs');
-const path = require('path');
-const { exec } = require('child_process');
+// Watch NavBot/**/*.lua → bundle → deploy (runs in current terminal, no extra windows)
+const { execFile } = require("node:child_process");
+const path = require("node:path");
+const chokidar = require("chokidar");
 
-console.log('🔄 Starting Simple Auto-Bundle Watcher for NavBot...');
+const ROOT = process.cwd();
+let debounceTimer = null;
+let isRunning = false;
 
-// Bundle function
-function bundle() {
-    return new Promise((resolve, reject) => {
-        console.log('📦 Bundling NavBot...');
-        exec('node bundle.js', (error, stdout, stderr) => {
-            if (error) {
-                console.error('❌ Bundle failed:', error.message);
-                reject(error);
-                return;
-            }
-            console.log('✅ Bundle successful');
-            
-            // Auto-deploy
-            console.log('🚀 Auto-deploying...');
-            exec('BundleAndDeploy.bat', (deployError, deployStdout, deployStderr) => {
-                if (deployError) {
-                    console.error('❌ Deploy failed:', deployError.message);
-                } else {
-                    console.log('✅ Deploy successful');
-                }
-            });
-            
-            resolve(stdout);
-        });
-    });
-}
-
-// Simple file watcher using fs.watch
-const watchDir = 'NavBot';
-console.log(`👀 Watching ${watchDir} for changes...`);
-
-function watchDirectory(dir) {
-    if (!fs.existsSync(dir)) {
-        console.error(`❌ Directory ${dir} does not exist`);
-        return;
-    }
-
-    fs.watch(dir, { recursive: true }, (eventType, filename) => {
-        if (filename && filename.endsWith('.lua')) {
-            console.log(`📝 File changed: ${path.join(dir, filename)}`);
-            
-            // Debounce rapid changes
-            setTimeout(() => {
-                bundle().catch(console.error);
-            }, 500);
+function runNode(scriptName) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [path.join(ROOT, "scripts", scriptName)],
+      { cwd: ROOT },
+      (error, stdout, stderr) => {
+        if (stdout) process.stdout.write(stdout);
+        if (stderr) process.stderr.write(stderr);
+        if (error) {
+          reject(error);
+          return;
         }
-    });
+        resolve();
+      },
+    );
+  });
 }
 
-watchDirectory(watchDir);
+function runBundleScript() {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [path.join(ROOT, "bundle.js")],
+      { cwd: ROOT },
+      (error, stdout, stderr) => {
+        if (stdout) process.stdout.write(stdout);
+        if (stderr) process.stderr.write(stderr);
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      },
+    );
+  });
+}
 
-// Initial bundle
-bundle().catch(console.error);
+async function bundleAndDeploy() {
+  if (isRunning) {
+    return;
+  }
+  isRunning = true;
+  try {
+    console.log("Bundling NavBot...");
+    await runBundleScript();
+    console.log("Deploying to LMAOBox...");
+    await runNode("deploy.cjs");
+    console.log("Ready.");
+  } catch (error) {
+    console.error("bundle/deploy failed:", error.message);
+  } finally {
+    isRunning = false;
+  }
+}
 
-console.log('🎯 Press Ctrl+C to stop');
+function scheduleBundle(reason, filePath) {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+  }
+  debounceTimer = setTimeout(() => {
+    console.log(`${reason}: ${filePath}`);
+    bundleAndDeploy().catch(console.error);
+  }, 400);
+}
 
-// Handle Ctrl+C
-process.on('SIGINT', () => {
-    console.log('\n👋 Stopping watcher...');
-    process.exit(0);
-});
+console.log("Watching NavBot/**/*.lua (bundle + deploy on save)...");
+console.log("Press Ctrl+C to stop.");
+
+chokidar
+  .watch(path.join(ROOT, "NavBot", "**", "*.lua"), {
+    ignoreInitial: true,
+    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+  })
+  .on("change", (filePath) => scheduleBundle("changed", filePath))
+  .on("add", (filePath) => scheduleBundle("added", filePath));
+
+bundleAndDeploy().catch(console.error);
