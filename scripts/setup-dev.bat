@@ -5,21 +5,11 @@ echo 🔄 Setting up NavBot Development Environment...
 echo 📦 Installing Node.js dependencies...
 call npm install
 
-:: Install git hooks
-echo 🔗 Setting up git hooks...
-copy .git\hooks\prepare-commit-msg .git\hooks\prepare-commit-msg.bak
-copy .git\hooks\pre-commit .git\hooks\pre-commit.bak
-copy .git\hooks\post-commit .git\hooks\post-commit.bak
-
 :: Create VERSION file if it doesn't exist
 if not exist VERSION (
     echo 1.0.0 > VERSION
     echo 📝 Created VERSION file
 )
-
-:: Set up auto-deploy environment variable
-setx AUTO_DEPLOY "true"
-echo 🚀 Auto-deploy enabled
 
 :: Initial bundle
 echo 📦 Running initial bundle...
