@@ -121,7 +121,7 @@ local function onCreateMove(userCmd)
 	end
 
 	if G.currentState == G.States.MOVING or G.currentState == G.States.FOLLOWING then
-		MovementDecisions.checkStuckState(userCmd)
+		MovementDecisions.checkStuckState()
 	end
 
 	if G.currentState == G.States.STUCK then
@@ -320,11 +320,6 @@ callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed
-
--- Fresh console on each script load (easier to read SmartJump debug)
-pcall(function()
-	client.Command("clear", true)
-end)
 
 -- Initialize navigation if a valid map is loaded
 Notify.Alert("NavBot loaded!")

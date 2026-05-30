@@ -164,7 +164,7 @@ local function onCreateMove(userCmd)
 	end
 
 	if G.currentState == G.States.MOVING or G.currentState == G.States.FOLLOWING then
-		MovementDecisions.checkStuckState(userCmd)
+		MovementDecisions.checkStuckState()
 	end
 
 	if G.currentState == G.States.STUCK then
@@ -363,11 +363,6 @@ callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed
-
--- Fresh console on each script load (easier to read SmartJump debug)
-pcall(function()
-	client.Command("clear", true)
-end)
 
 -- Initialize navigation if a valid map is loaded
 Notify.Alert("NavBot loaded!")
@@ -1305,14 +1300,6 @@ local G = {
 		},
 		jumpState = "STATE_IDLE",
 		leftGroundThisJump = false,
-		airborneTicks = 0,
-		prepareTicks = 0,
-		prepareEnterTick = nil,
-		ctapEnterTick = nil,
-		ctapTicks = 0,
-		duckTicksThisJump = 0,
-		lastDuckCountTick = nil,
-		allowLedgeGrabDuck = false,
 		ShouldJump = false,
 		LastSmartJumpAttempt = 0,
 		LastEmergencyJump = 0,
@@ -1331,7 +1318,6 @@ local G = {
 		jumpFailCooldownUntil = nil,
 		lastJumpTime = 0,
 		LastObstacleHeight = 0,
-		lastLandTick = nil,
 	},
 	BotIsMoving = false,
 	BotMovementDirection = Vector3(0, 0, 0),
@@ -8473,16 +8459,9 @@ local ARRIVAL_DIST = 1.5
 
 local SmartJump = {}
 
-local JUMP_STUCK_SUPPRESS_TICKS = 90
-local JUMP_FAIL_COOLDOWN_TICKS = 66
+local JUMP_STUCK_SUPPRESS_TICKS = 48
+local JUMP_FAIL_COOLDOWN_TICKS = 22
 local JUMP_STATE_TIMEOUT_TICKS = 132
-local JUMP_MIN_AIRBORNE_TICKS = 3
--- Duck-jump timing: 1 cmd duck (PREPARE), 1 cmd unduck+jump on ground (CTAP), then ASCENDING.
-local JUMP_PREPARE_HOLD_TICKS = 1
-local JUMP_MAX_DUCK_TICKS = 1
-local JUMP_CTAP_MIN_VZ = 50
-local JUMP_MIN_RUN_SPEED = 180
-local JUMP_LAND_REJUMP_TICKS = 66
 
 function SmartJump.isActive()
 	if SJ.jumpState ~= SJC.STATE_IDLE then
@@ -8495,126 +8474,23 @@ function SmartJump.isActive()
 	return false
 end
 
-local function getAdvanceKey(cmd)
-	if cmd and cmd.command_number then
-		return cmd.command_number
-	end
-	return globals.TickCount()
-end
-
-local function logJumpStateTransition(fromState, toState, cmd, pLocal, onGround, reason)
-	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
-		return
-	end
-	if fromState == toState then
-		return
-	end
-
+local function beginJumpAttempt()
 	local tick = globals.TickCount()
-	local cmdNum = (cmd and cmd.command_number) and cmd.command_number or -1
-	local ticksInPrev = 0
-	if SJ.stateStartTime then
-		ticksInPrev = tick - SJ.stateStartTime
-	end
-
-	local speed2d = 0
-	local velZ = 0
-	if pLocal then
-		local vel = pLocal:EstimateAbsVelocity()
-		if vel then
-			speed2d = vel:Length2D()
-			velZ = vel.z
-		end
-	end
-
-	Log:Info(
-		"SmartJump tick=%d cmd=%d | %s -> %s (%d ticks in prev) | %s | onGround=%s spd=%.0f vz=%.1f | duck=%s prep=%s air=%s leftGnd=%s bot=%s",
-		tick,
-		cmdNum,
-		tostring(fromState or "nil"),
-		tostring(toState),
-		ticksInPrev,
-		tostring(reason or ""),
-		tostring(onGround),
-		speed2d,
-		velZ,
-		tostring(SJ.duckTicksThisJump or 0),
-		tostring(SJ.prepareTicks or 0),
-		tostring(SJ.airborneTicks or 0),
-		tostring(SJ.leftGroundThisJump),
-		tostring(G.currentState)
-	)
+	SJ.leftGroundThisJump = false
+	SJ.jumpState = SJC.STATE_PREPARE_JUMP
+	SJ.suppressStuckUntilTick = tick + JUMP_STUCK_SUPPRESS_TICKS
+	SJ.jumpCommitUntilTick = tick + 8
 end
 
-function SmartJump.isOnJumpFailCooldown()
-	local untilTick = SJ.jumpFailCooldownUntil
-	return untilTick ~= nil and globals.TickCount() < untilTick
-end
-
-function SmartJump.hasMinJumpSpeed(pLocal)
-	if not pLocal then
-		return false
-	end
-	local vel = pLocal:EstimateAbsVelocity()
-	return vel ~= nil and vel:Length2D() >= JUMP_MIN_RUN_SPEED
+local function markJumpFailed()
+	SJ.jumpState = SJC.STATE_IDLE
+	SJ.leftGroundThisJump = false
+	SJ.jumpFailCooldownUntil = globals.TickCount() + JUMP_FAIL_COOLDOWN_TICKS
 end
 
 local function isOnJumpFailCooldown()
-	return SmartJump.isOnJumpFailCooldown()
-end
-
-local function beginJumpAttempt(cmd, pLocal, onGround, reason)
-	if not onGround then
-		return
-	end
-	if isOnJumpFailCooldown() then
-		return
-	end
-
-	local tick = globals.TickCount()
-	if SJ.lastLandTick and tick - SJ.lastLandTick < JUMP_LAND_REJUMP_TICKS then
-		return
-	end
-
-	if not SmartJump.hasMinJumpSpeed(pLocal) then
-		return
-	end
-
-	local fromState = SJ.jumpState
-	if fromState and fromState ~= SJC.STATE_IDLE then
-		return
-	end
-
-	SJ.leftGroundThisJump = false
-	SJ.airborneTicks = 0
-	SJ.prepareTicks = 0
-	SJ.ctapTicks = 0
-	SJ.prepareEnterTick = tick
-	SJ.ctapEnterTick = nil
-	SJ.duckTicksThisJump = 0
-	SJ.lastDuckCountTick = nil
-	SJ.allowLedgeGrabDuck = false
-	SJ.jumpState = SJC.STATE_PREPARE_JUMP
-	SJ.suppressStuckUntilTick = tick + JUMP_STUCK_SUPPRESS_TICKS
-	SJ.jumpCommitUntilTick = tick + JUMP_STATE_TIMEOUT_TICKS
-	SJ.stateStartTime = tick
-	SJ.lastState = SJC.STATE_PREPARE_JUMP
-	G.Navigation.lowVelocityTicks = 0
-	if G.currentState == G.States.STUCK then
-		G.currentState = G.States.MOVING
-	end
-	logJumpStateTransition(fromState, SJC.STATE_PREPARE_JUMP, cmd, pLocal, onGround, reason or "beginJumpAttempt")
-end
-
-local function markJumpFailed(cmd, pLocal, onGround, reason)
-	local fromState = SJ.jumpState
-	SJ.jumpState = SJC.STATE_IDLE
-	SJ.leftGroundThisJump = false
-	SJ.airborneTicks = 0
-	SJ.prepareTicks = 0
-	SJ.jumpFailCooldownUntil = globals.TickCount() + JUMP_FAIL_COOLDOWN_TICKS
-	SJ.lastState = SJC.STATE_IDLE
-	logJumpStateTransition(fromState, SJC.STATE_IDLE, cmd, pLocal, onGround, reason or "markJumpFailed")
+	local untilTick = SJ.jumpFailCooldownUntil
+	return untilTick ~= nil and globals.TickCount() < untilTick
 end
 
 local SJ_DEBUG_INTERVAL = 22
@@ -8918,14 +8794,6 @@ local function shouldJumpAtLiveWall(cmd, pLocal)
 	return false
 end
 
-function SmartJump.wantsLiveJump(cmd)
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or not pLocal:IsAlive() then
-		return false
-	end
-	return shouldJumpAtLiveWall(cmd, pLocal)
-end
-
 local function tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace)
 	local clearNow = canClearObstacle(newPos, wishDir, hitbox, maxSpeed, wallTrace)
 	if not clearNow then
@@ -9100,9 +8968,6 @@ local function shouldLateJump(cmd, pLocal)
 	if not pLocal then
 		return false
 	end
-	if SJ.lastLandTick and globals.TickCount() - SJ.lastLandTick < JUMP_LAND_REJUMP_TICKS then
-		return false
-	end
 	if not isPlayerOnGround(pLocal) then
 		sjDebugThrottled("airborne", "skip: not on ground (state=%s)", tostring(SJ.jumpState))
 		return false
@@ -9132,15 +8997,13 @@ local function shouldLateJump(cmd, pLocal)
 	return shouldLateJumpManual(cmd, pLocal)
 end
 
---- State transitions at most once per command (CreateMove may run multiple times per tick).
+--- State transitions at most once per tick (CreateMove may run multiple times).
 local function advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
-	local advanceKey = getAdvanceKey(cmd)
-	if SJ.lastAdvanceTick == advanceKey then
+	local tick = globals.TickCount()
+	if SJ.lastAdvanceTick == tick then
 		return
 	end
-	SJ.lastAdvanceTick = advanceKey
-
-	local tick = globals.TickCount()
+	SJ.lastAdvanceTick = tick
 
 	if SJ.jumpState == SJC.STATE_IDLE then
 		if not onGround or not (hasWishDir or shouldJump) then
@@ -9157,7 +9020,7 @@ local function advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
 				tostring(G.BotIntendedWishDir ~= nil),
 				tostring(isBotPathfollowing(cmd))
 			)
-			beginJumpAttempt(cmd, pLocal, onGround, "idle:shouldLateJump")
+			beginJumpAttempt()
 		else
 			sjDebugThrottled(
 				"idle_no_trigger",
@@ -9169,36 +9032,12 @@ local function advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
 			)
 		end
 	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
-		if not onGround then
-			markJumpFailed(cmd, pLocal, onGround, "airborneDuringPrepare")
-		elseif tick > (SJ.prepareEnterTick or 0) then
-			SJ.jumpState = SJC.STATE_CTAP
-			SJ.ctapEnterTick = tick
-			SJ.ctapTicks = 0
-		end
+		SJ.jumpState = SJC.STATE_CTAP
 	elseif SJ.jumpState == SJC.STATE_CTAP then
-		if tick <= (SJ.ctapEnterTick or 0) then
-			return
-		end
-		SJ.ctapTicks = (SJ.ctapTicks or 0) + 1
-		local velocity = pLocal:EstimateAbsVelocity()
-		local vz = velocity and velocity.z or 0
-		if vz >= JUMP_CTAP_MIN_VZ then
-			SJ.jumpState = SJC.STATE_ASCENDING
-			if not onGround then
-				SJ.airborneTicks = (SJ.airborneTicks or 0) + 1
-			end
-		elseif not onGround and vz <= 0 then
-			markJumpFailed(cmd, pLocal, onGround, "airborneDuringCtap")
-		elseif SJ.ctapTicks > 6 then
-			markJumpFailed(cmd, pLocal, onGround, "ctapTimeout")
-		end
+		SJ.jumpState = SJC.STATE_ASCENDING
 	elseif SJ.jumpState == SJC.STATE_ASCENDING then
 		if not onGround then
-			SJ.airborneTicks = (SJ.airborneTicks or 0) + 1
-			if SJ.airborneTicks >= JUMP_MIN_AIRBORNE_TICKS then
-				SJ.leftGroundThisJump = true
-			end
+			SJ.leftGroundThisJump = true
 		end
 		local velocity = pLocal:EstimateAbsVelocity()
 		local currentPos = pLocal:GetAbsOrigin()
@@ -9212,86 +9051,43 @@ local function advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
 				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
 				if obstacleTrace.fraction < 1 then
 					shouldUnduck = true
-					SJ.allowLedgeGrabDuck = true
 				end
 			end
 		end
 
 		if shouldUnduck then
 			SJ.jumpState = SJC.STATE_DESCENDING
+		elseif onGround and tick > (SJ.jumpCommitUntilTick or 0) and not SJ.leftGroundThisJump then
+			markJumpFailed()
 		end
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
-		if not onGround then
-			SJ.airborneTicks = (SJ.airborneTicks or 0) + 1
-			if SJ.airborneTicks >= JUMP_MIN_AIRBORNE_TICKS then
-				SJ.leftGroundThisJump = true
-			end
-		elseif onGround and SJ.leftGroundThisJump and (SJ.airborneTicks or 0) >= JUMP_MIN_AIRBORNE_TICKS then
+		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
+			beginJumpAttempt()
+		elseif onGround and SJ.leftGroundThisJump then
 			SJ.jumpState = SJC.STATE_IDLE
 			SJ.leftGroundThisJump = false
-			SJ.airborneTicks = 0
-			SJ.lastLandTick = tick
-			SJ.suppressStuckUntilTick = tick + 22
+		elseif onGround and tick > (SJ.jumpCommitUntilTick or 0) then
+			markJumpFailed()
 		end
 	end
-end
-
---- Duck is limited to JUMP_MAX_DUCK_TICKS per jump attempt (counts game ticks, not CreateMove calls).
----@param allowLedgeGrabExtra boolean|nil Duck_Grab over a lip may exceed the CTAP duck budget.
-local function tryApplyDuck(cmd, allowLedgeGrabExtra)
-	local used = SJ.duckTicksThisJump or 0
-	if not allowLedgeGrabExtra and used >= JUMP_MAX_DUCK_TICKS then
-		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-		return false
-	end
-
-	local tick = globals.TickCount()
-	if SJ.lastDuckCountTick ~= tick then
-		SJ.lastDuckCountTick = tick
-		SJ.duckTicksThisJump = used + 1
-	end
-
-	cmd:SetButtons(cmd.buttons | IN_DUCK)
-	return true
-end
-
-local function forceUnduck(cmd)
-	cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-end
-
---- Ledge-grab duck during ascent (not limited by PREPARE duck budget; matches pre-refactor SmartJump).
-local function applyAscendingDuck(cmd)
-	cmd:SetButtons(cmd.buttons & ~IN_JUMP)
-	cmd:SetButtons(cmd.buttons | IN_DUCK)
 end
 
 --- Apply duck/jump buttons every CreateMove call for the current state.
-local function applyJumpButtons(cmd, _pLocal, onGround, _hasWishDir)
-	cmd:SetButtons(cmd.buttons & ~IN_JUMP)
-
-	if not onGround then
-		if SJ.jumpState == SJC.STATE_ASCENDING then
-			applyAscendingDuck(cmd)
-		else
-			forceUnduck(cmd)
-		end
-		return
-	end
-
+local function applyJumpButtons(cmd, pLocal, onGround, hasWishDir)
 	if SJ.jumpState == SJC.STATE_PREPARE_JUMP then
-		tryApplyDuck(cmd)
+		cmd:SetButtons(cmd.buttons | IN_DUCK)
 		cmd:SetButtons(cmd.buttons & ~IN_JUMP)
 	elseif SJ.jumpState == SJC.STATE_CTAP then
-		if onGround then
-			forceUnduck(cmd)
-			cmd:SetButtons(cmd.buttons | IN_JUMP)
-		else
-			forceUnduck(cmd)
-		end
+		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+		cmd:SetButtons(cmd.buttons | IN_JUMP)
 	elseif SJ.jumpState == SJC.STATE_ASCENDING then
-		forceUnduck(cmd)
+		cmd:SetButtons(cmd.buttons | IN_DUCK)
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
-		forceUnduck(cmd)
+		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
+			cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+			cmd:SetButtons(cmd.buttons | IN_JUMP)
+		end
 	end
 end
 
@@ -9315,34 +9111,27 @@ function SmartJump.Main(cmd)
 	local shouldJump = false
 
 	if G.SmartJump.RequestEmergencyJump then
-		if SJ.jumpState == SJC.STATE_IDLE and onGround and not isOnJumpFailCooldown() then
-			shouldJump = true
-			G.SmartJump.RequestEmergencyJump = false
-			beginJumpAttempt(cmd, pLocal, onGround, "RequestEmergencyJump")
-		elseif SJ.jumpState ~= SJC.STATE_IDLE then
-			-- Jump already in progress; do not queue another beginJumpAttempt next tick.
-			G.SmartJump.RequestEmergencyJump = false
-		end
-		-- IDLE but on cooldown or in air: keep flag until we can start.
+		shouldJump = true
+		G.SmartJump.RequestEmergencyJump = false
+		beginJumpAttempt()
 	end
 
 	local hasWishDir = getManualWishDir(cmd) ~= nil
 		or (G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01)
 		or isBotPathfollowing(cmd)
 
-	applyJumpButtons(cmd, pLocal, onGround, hasWishDir)
 	advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
+	applyJumpButtons(cmd, pLocal, onGround, hasWishDir)
 
 	if SJ.stateStartTime == nil then
 		SJ.stateStartTime = globals.TickCount()
 	elseif globals.TickCount() - SJ.stateStartTime > JUMP_STATE_TIMEOUT_TICKS then
 		if SJ.jumpState ~= SJC.STATE_IDLE then
-			markJumpFailed(cmd, pLocal, onGround, "timeout:" .. tostring(JUMP_STATE_TIMEOUT_TICKS) .. "ticks")
+			markJumpFailed()
 		end
 	end
 
 	if SJ.lastState ~= SJ.jumpState then
-		logJumpStateTransition(SJ.lastState, SJ.jumpState, cmd, pLocal, onGround, "stateMachine")
 		SJ.stateStartTime = globals.TickCount()
 		SJ.lastState = SJ.jumpState
 	end
@@ -10194,28 +9983,11 @@ function MovementDecisions.advanceNode()
 end
 
 -- Decision: Check stuck state: Simple walkability check with cooldown
----@param userCmd UserCmd|nil
-function MovementDecisions.checkStuckState(userCmd)
+function MovementDecisions.checkStuckState()
 	-- Velocity/timeout checks ONLY when bot is walking autonomously
 	if G.Menu.Main.EnableWalking then
 		local pLocal = G.pLocal.entity
 		if pLocal then
-			if userCmd and SmartJump.wantsLiveJump(userCmd) then
-				G.Navigation.lowVelocityTicks = 0
-				if G.currentState == G.States.STUCK then
-					G.currentState = G.States.MOVING
-				end
-				if
-					not SmartJump.isActive()
-					and not SmartJump.isOnJumpFailCooldown()
-					and SmartJump.hasMinJumpSpeed(pLocal)
-					and not G.SmartJump.RequestEmergencyJump
-				then
-					G.SmartJump.RequestEmergencyJump = true
-				end
-				return
-			end
-
 			-- Track how long we've been on the same node
 			local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
 			if currentNodeId then

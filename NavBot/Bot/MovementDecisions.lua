@@ -165,28 +165,11 @@ function MovementDecisions.advanceNode()
 end
 
 -- Decision: Check stuck state: Simple walkability check with cooldown
----@param userCmd UserCmd|nil
-function MovementDecisions.checkStuckState(userCmd)
+function MovementDecisions.checkStuckState()
 	-- Velocity/timeout checks ONLY when bot is walking autonomously
 	if G.Menu.Main.EnableWalking then
 		local pLocal = G.pLocal.entity
 		if pLocal then
-			if userCmd and SmartJump.wantsLiveJump(userCmd) then
-				G.Navigation.lowVelocityTicks = 0
-				if G.currentState == G.States.STUCK then
-					G.currentState = G.States.MOVING
-				end
-				if
-					not SmartJump.isActive()
-					and not SmartJump.isOnJumpFailCooldown()
-					and SmartJump.hasMinJumpSpeed(pLocal)
-					and not G.SmartJump.RequestEmergencyJump
-				then
-					G.SmartJump.RequestEmergencyJump = true
-				end
-				return
-			end
-
 			-- Track how long we've been on the same node
 			local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
 			if currentNodeId then
