@@ -31,10 +31,12 @@ G.World_Default = {
 G.World = G.World_Default
 
 G.Misc = {
-	NodeTouchDistance = 12,
+	NodeTouchDistance = 16, -- normal portal / node reach (2D)
+	NodeOvershootTouchDistance = 48, -- only when intent dir dot drops below threshold
 	NodeTouchHeight = 82,
-	NodePassProximity = 16, -- was this close → treat current node as passed
-	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
+	NodePassProximity = 16,
+	NodePassDirDotThreshold = 0.5, -- Amalgam-style: cos(angle) between saved intent and dir-to-target
+	NodePassAngleDegrees = 60, -- legacy reference (~arccos(0.5))
 	workLimit = 1,
 }
 

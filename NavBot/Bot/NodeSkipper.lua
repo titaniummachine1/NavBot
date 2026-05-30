@@ -1,15 +1,13 @@
 --[[
 Node Skipper - Per-tick node skipping with menu-controlled limits
-Uses:
-- G.Menu.Main.MaxSkipRange: max distance to skip (default 500)
-- G.Menu.Main.MaxNodesToSkip: max nodes per tick (default 3)
-- G.Misc.NodePassProximity / NodePassAngleDegrees: passed-node detection
+Pass detection uses path progress + portal reach (PathSteering), not bearing-to-center.
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
 local Node = require("NavBot.Navigation.Node")
+local PathSteering = require("NavBot.Navigation.PathSteering")
 local WorkManager = require("NavBot.WorkManager")
 
 local Log = Common.Log.new("NodeSkipper")
@@ -20,60 +18,25 @@ local function isDoorNode(node)
 	return node and not node._minX
 end
 
-local function resetPassTracker(nodeId)
-	if not nodeId then
-		G.Navigation.nodePassTrack = nil
-		return
+local function lockIntentAfterSkip(playerPos)
+	local path = G.Navigation.path
+	if path and path[1] then
+		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
 	end
-	G.Navigation.nodePassTrack = {
-		nodeId = nodeId,
-		lastDirToNode = nil, -- previous tick: horizontal bearing from player to this node
-	}
 end
 
---- Bearing-to-node overshoot: each tick compare dir-to-node vs last tick.
---- If it swings >= 60° before normal reach distance, you walked past it.
-local function checkPassedCurrentNode(playerPos, node, nextNode)
-	if not (node and node.pos and nextNode and nextNode.pos) then
-		return false, nil
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not track or track.nodeId ~= node.id then
-		resetPassTracker(node.id)
-		track = G.Navigation.nodePassTrack
-	end
-
-	local proximity = G.Misc.NodePassProximity or 16
-	local passAngle = G.Misc.NodePassAngleDegrees or 60
-	local reachDist = G.Misc.NodeTouchDistance or 12
-
-	local dist2D = Common.Distance2D(playerPos, node.pos)
-	if dist2D <= proximity then
-		return true, "proximity"
-	end
-
-	local dirToNode = Vector3(node.pos.x - playerPos.x, node.pos.y - playerPos.y, 0)
-	local dirLen = dirToNode:Length2D()
-	if dirLen < 1 then
-		return true, "at_node"
-	end
-	dirToNode = dirToNode / dirLen
-
-	-- Overshoot: direction toward node changed sharply before we reached it
-	if track.lastDirToNode and dist2D > reachDist then
-		local bearingDelta = Common.Angle2DDegrees(track.lastDirToNode, dirToNode)
-		if bearingDelta >= passAngle then
-			track.lastDirToNode = dirToNode
-			return true, "overshoot"
-		end
-	end
-
-	track.lastDirToNode = dirToNode
-	return false, nil
+local function checkPassedCurrentNode(playerPos, currentNode, nextNode)
+	return PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
 end
 
-local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
+local function skipGoalPos(playerPos, nextNode, afterNext)
+	if afterNext and afterNext.pos then
+		return PathSteering.getSteeringPoint(playerPos, nextNode, afterNext)
+	end
+	return nextNode.pos
+end
+
+local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason, goalOverride)
 	if isDoorNode(currentNode) or isDoorNode(nextNode) then
 		Log:Debug("SKIP blocked (door): %s", reason)
 		return false
@@ -84,8 +47,9 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 		return false
 	end
 
+	local goalPos = goalOverride or skipGoalPos(playerPos, nextNode, nil)
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, nextNode.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
 		return false
@@ -99,7 +63,6 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
-	resetPassTracker(nextNode.id)
 
 	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
 	return true
@@ -127,9 +90,9 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Passed current node (proximity / overshoot) — always on, not menu-gated
 	local passed, passReason = checkPassedCurrentNode(playerPos, currentNode, nextNode)
 	if passed and trySkipCurrentNode(playerPos, currentNode, nextNode, passReason) then
+		lockIntentAfterSkip(playerPos)
 		G.Navigation.currentNodeIndex = 1
 		return true
 	end
@@ -138,18 +101,19 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Closer to next node than current node is (legacy smart skip)
-	local distPlayerToNext = Common.Distance3D(playerPos, nextNode.pos)
-	local distCurrentToNext = Common.Distance3D(currentNode.pos, nextNode.pos)
+	local steerCurrent = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local steerNext = PathSteering.getSteeringPoint(playerPos, nextNode, path[3])
+	local distPlayerToNext = Common.Distance2D(playerPos, steerNext or nextNode.pos)
+	local distCurrentToNext = Common.Distance2D(steerCurrent or currentNode.pos, steerNext or nextNode.pos)
 
 	if distPlayerToNext < distCurrentToNext then
 		if trySkipCurrentNode(playerPos, currentNode, nextNode, "closer_to_next") then
+			lockIntentAfterSkip(playerPos)
 			G.Navigation.currentNodeIndex = 1
 			return true
 		end
 	end
 
-	-- Forward skip: walk directly to path[3]
 	if #path < 3 then
 		return false
 	end
@@ -165,7 +129,8 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	local distToTarget = Common.Distance3D(playerPos, skipTarget.pos)
+	local goalPos = skipGoalPos(playerPos, skipTarget, path[4])
+	local distToTarget = Common.Distance3D(playerPos, goalPos)
 	if distToTarget > maxSkipRange then
 		return false
 	end
@@ -176,7 +141,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, skipTarget.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		return false
 	end
@@ -186,7 +151,6 @@ function NodeSkipper.Tick(playerPos)
 	local skipped1 = table.remove(path, 1)
 	if skipped1 then
 		table.insert(G.Navigation.pathHistory, 1, skipped1)
-		resetPassTracker(path[1] and path[1].id or nil)
 	end
 	local skipped2 = table.remove(path, 1)
 	if skipped2 then
@@ -198,6 +162,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
+	lockIntentAfterSkip(playerPos)
 
 	Log:Info("FORWARD SKIP: bypassed 2 nodes (direct path to %s, range %.0f)", tostring(skipTarget.id), maxSkipRange)
 	G.Navigation.currentNodeIndex = 1

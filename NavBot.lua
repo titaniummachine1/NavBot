@@ -710,10 +710,12 @@ G.World_Default = {
 G.World = G.World_Default
 
 G.Misc = {
-	NodeTouchDistance = 12,
+	NodeTouchDistance = 16, -- normal portal / node reach (2D)
+	NodeOvershootTouchDistance = 48, -- only when intent dir dot drops below threshold
 	NodeTouchHeight = 82,
-	NodePassProximity = 16, -- was this close → treat current node as passed
-	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
+	NodePassProximity = 16,
+	NodePassDirDotThreshold = 0.5, -- Amalgam-style: cos(angle) between saved intent and dir-to-target
+	NodePassAngleDegrees = 60, -- legacy reference (~arccos(0.5))
 	workLimit = 1,
 }
 
@@ -8701,6 +8703,7 @@ Handles all movement decisions while ensuring walkTo is always called
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
+local PathSteering = require("NavBot.Navigation.PathSteering")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
@@ -8789,9 +8792,14 @@ function MovementDecisions.getCurrentTarget()
 		end
 	end
 
-	-- Fallback to path node
+	-- Path segment: portal / exit toward next node (not area center on large boxes)
 	if G.Navigation.path and #G.Navigation.path > 0 then
 		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		local origin = G.pLocal and G.pLocal.Origin
+		if currentNode and origin then
+			return PathSteering.getSteeringPoint(origin, currentNode, nextNode)
+		end
 		return currentNode and currentNode.pos
 	end
 
@@ -8800,10 +8808,11 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance
-	-- Wider threshold between path nodes (passed-node proximity)
+	local reachDist = G.Misc.NodeTouchDistance or 12
 	if G.Navigation.path and #G.Navigation.path > 1 then
-		reachDist = math.max(reachDist, G.Misc.NodePassProximity or 16)
+		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
 	end
 	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
 end
@@ -8822,6 +8831,11 @@ function MovementDecisions.advanceNode()
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
+
+	local path = G.Navigation.path
+	if path and path[1] and G.pLocal and G.pLocal.Origin then
+		PathSteering.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+	end
 
 	if #G.Navigation.path == 0 then
 		Navigation.ClearPath()
@@ -8962,6 +8976,7 @@ function MovementDecisions.handleMovingState(userCmd)
 			G.BotMovementDirection = Vector3(0, 0, 0)
 		end
 
+		-- PID / walk simulation intent toward steering point (portal), not area center
 		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
 		if wishdir then
 			G.BotIntendedWishDir = wishdir
@@ -8988,16 +9003,14 @@ end)
 __bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
 Node Skipper - Per-tick node skipping with menu-controlled limits
-Uses:
-- G.Menu.Main.MaxSkipRange: max distance to skip (default 500)
-- G.Menu.Main.MaxNodesToSkip: max nodes per tick (default 3)
-- G.Misc.NodePassProximity / NodePassAngleDegrees: passed-node detection
+Pass detection uses path progress + portal reach (PathSteering), not bearing-to-center.
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
 local Node = require("NavBot.Navigation.Node")
+local PathSteering = require("NavBot.Navigation.PathSteering")
 local WorkManager = require("NavBot.WorkManager")
 
 local Log = Common.Log.new("NodeSkipper")
@@ -9008,60 +9021,25 @@ local function isDoorNode(node)
 	return node and not node._minX
 end
 
-local function resetPassTracker(nodeId)
-	if not nodeId then
-		G.Navigation.nodePassTrack = nil
-		return
+local function lockIntentAfterSkip(playerPos)
+	local path = G.Navigation.path
+	if path and path[1] then
+		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
 	end
-	G.Navigation.nodePassTrack = {
-		nodeId = nodeId,
-		lastDirToNode = nil, -- previous tick: horizontal bearing from player to this node
-	}
 end
 
---- Bearing-to-node overshoot: each tick compare dir-to-node vs last tick.
---- If it swings >= 60° before normal reach distance, you walked past it.
-local function checkPassedCurrentNode(playerPos, node, nextNode)
-	if not (node and node.pos and nextNode and nextNode.pos) then
-		return false, nil
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not track or track.nodeId ~= node.id then
-		resetPassTracker(node.id)
-		track = G.Navigation.nodePassTrack
-	end
-
-	local proximity = G.Misc.NodePassProximity or 16
-	local passAngle = G.Misc.NodePassAngleDegrees or 60
-	local reachDist = G.Misc.NodeTouchDistance or 12
-
-	local dist2D = Common.Distance2D(playerPos, node.pos)
-	if dist2D <= proximity then
-		return true, "proximity"
-	end
-
-	local dirToNode = Vector3(node.pos.x - playerPos.x, node.pos.y - playerPos.y, 0)
-	local dirLen = dirToNode:Length2D()
-	if dirLen < 1 then
-		return true, "at_node"
-	end
-	dirToNode = dirToNode / dirLen
-
-	-- Overshoot: direction toward node changed sharply before we reached it
-	if track.lastDirToNode and dist2D > reachDist then
-		local bearingDelta = Common.Angle2DDegrees(track.lastDirToNode, dirToNode)
-		if bearingDelta >= passAngle then
-			track.lastDirToNode = dirToNode
-			return true, "overshoot"
-		end
-	end
-
-	track.lastDirToNode = dirToNode
-	return false, nil
+local function checkPassedCurrentNode(playerPos, currentNode, nextNode)
+	return PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
 end
 
-local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
+local function skipGoalPos(playerPos, nextNode, afterNext)
+	if afterNext and afterNext.pos then
+		return PathSteering.getSteeringPoint(playerPos, nextNode, afterNext)
+	end
+	return nextNode.pos
+end
+
+local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason, goalOverride)
 	if isDoorNode(currentNode) or isDoorNode(nextNode) then
 		Log:Debug("SKIP blocked (door): %s", reason)
 		return false
@@ -9072,8 +9050,9 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 		return false
 	end
 
+	local goalPos = goalOverride or skipGoalPos(playerPos, nextNode, nil)
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, nextNode.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
 		return false
@@ -9087,7 +9066,6 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
-	resetPassTracker(nextNode.id)
 
 	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
 	return true
@@ -9115,9 +9093,9 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Passed current node (proximity / overshoot) — always on, not menu-gated
 	local passed, passReason = checkPassedCurrentNode(playerPos, currentNode, nextNode)
 	if passed and trySkipCurrentNode(playerPos, currentNode, nextNode, passReason) then
+		lockIntentAfterSkip(playerPos)
 		G.Navigation.currentNodeIndex = 1
 		return true
 	end
@@ -9126,18 +9104,19 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Closer to next node than current node is (legacy smart skip)
-	local distPlayerToNext = Common.Distance3D(playerPos, nextNode.pos)
-	local distCurrentToNext = Common.Distance3D(currentNode.pos, nextNode.pos)
+	local steerCurrent = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local steerNext = PathSteering.getSteeringPoint(playerPos, nextNode, path[3])
+	local distPlayerToNext = Common.Distance2D(playerPos, steerNext or nextNode.pos)
+	local distCurrentToNext = Common.Distance2D(steerCurrent or currentNode.pos, steerNext or nextNode.pos)
 
 	if distPlayerToNext < distCurrentToNext then
 		if trySkipCurrentNode(playerPos, currentNode, nextNode, "closer_to_next") then
+			lockIntentAfterSkip(playerPos)
 			G.Navigation.currentNodeIndex = 1
 			return true
 		end
 	end
 
-	-- Forward skip: walk directly to path[3]
 	if #path < 3 then
 		return false
 	end
@@ -9153,7 +9132,8 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	local distToTarget = Common.Distance3D(playerPos, skipTarget.pos)
+	local goalPos = skipGoalPos(playerPos, skipTarget, path[4])
+	local distToTarget = Common.Distance3D(playerPos, goalPos)
 	if distToTarget > maxSkipRange then
 		return false
 	end
@@ -9164,7 +9144,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, skipTarget.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		return false
 	end
@@ -9174,7 +9154,6 @@ function NodeSkipper.Tick(playerPos)
 	local skipped1 = table.remove(path, 1)
 	if skipped1 then
 		table.insert(G.Navigation.pathHistory, 1, skipped1)
-		resetPassTracker(path[1] and path[1].id or nil)
 	end
 	local skipped2 = table.remove(path, 1)
 	if skipped2 then
@@ -9186,6 +9165,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
+	lockIntentAfterSkip(playerPos)
 
 	Log:Info("FORWARD SKIP: bypassed 2 nodes (direct path to %s, range %.0f)", tostring(skipTarget.id), maxSkipRange)
 	G.Navigation.currentNodeIndex = 1
@@ -9381,6 +9361,298 @@ function WorkManager.clearWork(identifier)
 end
 
 return WorkManager
+
+end)
+__bundle_register("NavBot.Navigation.PathSteering", function(require, _LOADED, __bundle_register, __bundle_modules)
+--##########################################################################
+--  PathSteering.lua  ·  Portal targets + Amalgam-style pass detection
+--##########################################################################
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Node = require("NavBot.Navigation.Node")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+
+local PathSteering = {}
+
+local SMALL_AREA_EXTENT = 96
+local MIN_SEGMENT_LEN = 12
+
+local function getPassDirDotThreshold()
+	return G.Misc.NodePassDirDotThreshold or 0.5
+end
+
+local function getTouchDistance()
+	return G.Misc.NodeTouchDistance or 16
+end
+
+local function getOvershootTouchDistance()
+	return G.Misc.NodeOvershootTouchDistance or 48
+end
+
+local function horizontalDir(from, to)
+	local dx = to.x - from.x
+	local dy = to.y - from.y
+	local len = math.sqrt(dx * dx + dy * dy)
+	if len < 0.001 then
+		return nil, 0
+	end
+	return Vector3(dx / len, dy / len, 0), len
+end
+
+local function horizontalUnit(vec)
+	if not vec then
+		return nil
+	end
+	local flat = Vector3(vec.x, vec.y, 0)
+	local len = flat:Length2D()
+	if len < 0.001 then
+		return nil
+	end
+	return flat / len
+end
+
+local function findNodeExit(startPos, dir, node)
+	if not node._minX then
+		return nil
+	end
+
+	local minX, maxX = node._minX, node._maxX
+	local minY, maxY = node._minY, node._maxY
+	local tMin = math.huge
+	local exitX, exitY
+
+	if dir.x > 0 then
+		local t = (maxX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = maxX
+			exitY = startPos.y + dir.y * t
+		end
+	elseif dir.x < 0 then
+		local t = (minX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = minX
+			exitY = startPos.y + dir.y * t
+		end
+	end
+
+	if dir.y > 0 then
+		local t = (maxY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = maxY
+		end
+	elseif dir.y < 0 then
+		local t = (minY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = minY
+		end
+	end
+
+	if tMin == math.huge then
+		return nil
+	end
+
+	return Vector3(exitX, exitY, startPos.z)
+end
+
+local function getGroundZOnNode(pos, node)
+	if not node.nw or not node.ne or not node.sw then
+		return node._floorZ or node.pos.z
+	end
+
+	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
+	local dx = pos.x - nw.x
+	local dy = pos.y - nw.y
+	local dxNe = ne.x - nw.x
+	local dySe = se.y - nw.y
+	local inTri1 = (dxNe ~= 0 or dySe ~= 0) and (dx / dxNe + dy / dySe) <= 1.0
+
+	local v0, v1, v2 = nw, ne, se
+	if not inTri1 then
+		v0, v1, v2 = nw, se, sw
+	end
+
+	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
+	if math.abs(denom) < 0.0001 then
+		return v0.z
+	end
+
+	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
+	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
+	local w2 = 1.0 - w0 - w1
+	return w0 * v0.z + w1 * v1.z + w2 * v2.z
+end
+
+local function applyGroundZ(point, node)
+	if not point then
+		return nil
+	end
+	return Vector3(point.x, point.y, getGroundZOnNode(point, node))
+end
+
+local function isInsideNodeAABB(pos, node)
+	if Node.IsDoorNode(node) then
+		return false
+	end
+	return AreaSpatial.IsWithinArea(pos, node)
+end
+
+--- Save horizontal intent toward the new path[1] right after a node is cleared.
+function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
+	if not (targetNode and targetNode.pos) then
+		G.Navigation.nodePassTrack = nil
+		return
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, targetNode, nodeAfter)
+	local dir = horizontalDir(playerPos, steer or targetNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	G.Navigation.nodePassTrack = {
+		nodeId = targetNode.id,
+		dirToTarget = dir,
+	}
+end
+
+local function ensureSegmentIntent(playerPos, currentNode, nextNode)
+	local track = G.Navigation.nodePassTrack
+	if track and track.nodeId == currentNode.id and track.dirToTarget then
+		return track
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local dir = horizontalDir(playerPos, steer or currentNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	track = {
+		nodeId = currentNode.id,
+		dirToTarget = dir,
+	}
+	G.Navigation.nodePassTrack = track
+	return track
+end
+
+function PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	if not currentNode or not currentNode.pos then
+		return nil
+	end
+
+	if Node.IsDoorNode(currentNode) or not nextNode or not nextNode.pos then
+		return currentNode.pos
+	end
+
+	local dir = horizontalDir(playerPos, nextNode.pos)
+	if not dir then
+		dir = horizontalDir(currentNode.pos, nextNode.pos)
+	end
+	if not dir then
+		return currentNode.pos
+	end
+
+	local extent = math.max(currentNode._extentX or 0, currentNode._extentY or 0)
+	local exitPt = findNodeExit(playerPos, dir, currentNode)
+
+	if extent < SMALL_AREA_EXTENT or not exitPt then
+		return currentNode.pos
+	end
+
+	return applyGroundZ(exitPt, currentNode) or currentNode.pos
+end
+
+function PathSteering.getReachDistance2D(_currentNode, _nextNode)
+	return getTouchDistance()
+end
+
+--- Door node: only passed after crossing into the neighbor area (not while standing before the doorway).
+local function hasPassedDoorNode(playerPos, doorNode, nextNode)
+	if not Node.IsDoorNode(doorNode) then
+		return false, nil
+	end
+
+	local neighborArea = nextNode
+	if Node.IsDoorNode(nextNode) then
+		local nodes = G.Navigation.nodes
+		local targetId = doorNode.targetAreaId
+		if nodes and targetId then
+			neighborArea = nodes[targetId]
+		end
+	end
+
+	if not neighborArea or not neighborArea._minX then
+		return false, nil
+	end
+
+	if AreaSpatial.IsWithinArea(playerPos, neighborArea) then
+		return true, "door_entered_neighbor"
+	end
+
+	local dir, segLen = horizontalDir(doorNode.pos, neighborArea.pos)
+	if not dir or segLen < 4 then
+		return false, nil
+	end
+
+	local along = (playerPos.x - doorNode.pos.x) * dir.x + (playerPos.y - doorNode.pos.y) * dir.y
+	local boundarySlack = math.min(32, segLen * 0.4)
+	if along < boundarySlack then
+		return false, nil
+	end
+
+	if Common.Distance2D(playerPos, neighborArea.pos) > getOvershootTouchDistance() * 2.5 then
+		return false, nil
+	end
+
+	return true, "door_past_boundary"
+end
+
+function PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
+	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
+		return false, nil
+	end
+
+	if Node.IsDoorNode(currentNode) then
+		return hasPassedDoorNode(playerPos, currentNode, nextNode)
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local targetPos = steer or currentNode.pos
+	local dist2D = Common.Distance2D(playerPos, targetPos)
+	local touch = getTouchDistance()
+
+	local track = ensureSegmentIntent(playerPos, currentNode, nextNode)
+	local dirNow = horizontalDir(playerPos, targetPos)
+	if not dirNow then
+		dirNow = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	-- Normal reach: 16u at portal/center, inside current area AABB
+	if dist2D <= touch and isInsideNodeAABB(playerPos, currentNode) then
+		return true, "touch"
+	end
+
+	-- Amalgam-style overshoot: intent dir flipped (dot < 0.5), 48u, still inside this area's AABB
+	if track.dirToTarget and dirNow then
+		local dirDot = track.dirToTarget:Dot(dirNow)
+		if dirDot < getPassDirDotThreshold() and dist2D <= getOvershootTouchDistance() then
+			if isInsideNodeAABB(playerPos, currentNode) then
+				return true, "overshoot"
+			end
+		end
+	end
+
+	return false, nil
+end
+
+return PathSteering
 
 end)
 __bundle_register("NavBot.Bot.MovementController", function(require, _LOADED, __bundle_register, __bundle_modules)

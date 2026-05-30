@@ -6,6 +6,7 @@ Handles all movement decisions while ensuring walkTo is always called
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
+local PathSteering = require("NavBot.Navigation.PathSteering")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
@@ -94,9 +95,14 @@ function MovementDecisions.getCurrentTarget()
 		end
 	end
 
-	-- Fallback to path node
+	-- Path segment: portal / exit toward next node (not area center on large boxes)
 	if G.Navigation.path and #G.Navigation.path > 0 then
 		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		local origin = G.pLocal and G.pLocal.Origin
+		if currentNode and origin then
+			return PathSteering.getSteeringPoint(origin, currentNode, nextNode)
+		end
 		return currentNode and currentNode.pos
 	end
 
@@ -105,10 +111,11 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance
-	-- Wider threshold between path nodes (passed-node proximity)
+	local reachDist = G.Misc.NodeTouchDistance or 12
 	if G.Navigation.path and #G.Navigation.path > 1 then
-		reachDist = math.max(reachDist, G.Misc.NodePassProximity or 16)
+		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
 	end
 	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
 end
@@ -127,6 +134,11 @@ function MovementDecisions.advanceNode()
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
+
+	local path = G.Navigation.path
+	if path and path[1] and G.pLocal and G.pLocal.Origin then
+		PathSteering.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+	end
 
 	if #G.Navigation.path == 0 then
 		Navigation.ClearPath()
@@ -267,6 +279,7 @@ function MovementDecisions.handleMovingState(userCmd)
 			G.BotMovementDirection = Vector3(0, 0, 0)
 		end
 
+		-- PID / walk simulation intent toward steering point (portal), not area center
 		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
 		if wishdir then
 			G.BotIntendedWishDir = wishdir
