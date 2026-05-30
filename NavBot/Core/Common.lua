@@ -33,6 +33,40 @@ end
 local Logger = {}
 Logger.__index = Logger
 
+--- Modules available in Visuals → Debug log filter combo.
+Logger.MODULE_FILTERS = {
+	"All",
+	"SmartJump",
+	"MovementDecisions",
+	"NodeSkipper",
+	"StateHandler",
+	"GoalFinder",
+	"AStar",
+	"DoorBuilder",
+	"NavBot",
+	"Navigation",
+	"PathSteering",
+	"Phase2_Normalize",
+	"Phase3_KDTree",
+	"Phase4_Doors",
+	"SetupOrchestrator",
+	"ISWalkableTest",
+}
+
+function Logger.isModuleFilterEnabled(moduleName)
+	local visuals = G.Menu and G.Menu.Visuals
+	if not visuals then
+		return true
+	end
+
+	local filter = visuals.LogModuleFilter or "All"
+	if filter == "All" or filter == "" then
+		return true
+	end
+
+	return moduleName == filter
+end
+
 function Logger.new(moduleName)
 	local self = setmetatable({}, Logger)
 	self.moduleName = moduleName or "NavBot"
@@ -58,9 +92,14 @@ function Logger:Warn(msg, ...)
 end
 
 function Logger:Debug(msg, ...)
-	-- Only print debug messages if debug is enabled in menu
-	if not (G.Menu.Visuals and G.Menu.Visuals.Debug_Mode) then
-		return -- Skip debug output when debug is disabled
+	local mayPrint = false
+	if self.moduleName == "SmartJump" and G.Menu.SmartJump and G.Menu.SmartJump.Debug then
+		mayPrint = true
+	elseif G.Menu.Visuals and G.Menu.Visuals.Debug_Mode and Logger.isModuleFilterEnabled(self.moduleName) then
+		mayPrint = true
+	end
+	if not mayPrint then
+		return
 	end
 
 	local success, formatted = pcall(string.format, "[Debug %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)

@@ -125,7 +125,12 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	if isDoorNode(path[1]) or isDoorNode(path[2]) or isDoorNode(skipTarget) then
-		Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		G.__lastForwardSkipDoorLogTick = G.__lastForwardSkipDoorLogTick or 0
+		local now = globals.TickCount()
+		if now - G.__lastForwardSkipDoorLogTick > 66 then
+			G.__lastForwardSkipDoorLogTick = now
+			Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		end
 		return false
 	end
 

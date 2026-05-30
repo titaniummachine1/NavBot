@@ -13,6 +13,7 @@ local MenuModule = {}
 
 -- Import globals
 local G = require("NavBot.Core.Globals")
+local Common = require("NavBot.Core.Common")
 -- local Node = require("NavBot.Navigation.Node")  -- Temporarily disabled
 -- local Visuals = require("NavBot.Visuals")       -- Temporarily disabled
 
@@ -73,6 +74,10 @@ local function OnDrawMenu()
 		-- Smart Jump (works independently of NavBot enable state)
 		G.Menu.SmartJump.Enable = TimMenu.Checkbox("Smart Jump", G.Menu.SmartJump.Enable)
 		TimMenu.Tooltip("Enable intelligent jumping over obstacles (works even when NavBot is disabled)")
+		TimMenu.NextLine()
+
+		G.Menu.SmartJump.Debug = TimMenu.Checkbox("SmartJump Debug Logs", G.Menu.SmartJump.Debug or false)
+		TimMenu.Tooltip("Print SmartJump decision logs without enabling global Debug Mode or other modules")
 		TimMenu.EndSector()
 	elseif G.Menu.Tab == "Navigation" then
 		-- Movement & Pathfinding Section
@@ -179,7 +184,25 @@ local function OnDrawMenu()
 		-- Visual Settings Section
 		TimMenu.BeginSector("Visual Settings")
 		G.Menu.Visuals.Debug_Mode = TimMenu.Checkbox("Debug Mode", G.Menu.Visuals.Debug_Mode or false)
-		TimMenu.Tooltip("Enable debug visuals and verbose logging for troubleshooting")
+		TimMenu.Tooltip("Enable debug logging (use module filter below to avoid spam)")
+		TimMenu.NextLine()
+
+		local logModules = Common.Log.MODULE_FILTERS
+		G.Menu.Visuals.LogModuleFilter = G.Menu.Visuals.LogModuleFilter or "SmartJump"
+		local filterIndex = 1
+		for i = 1, #logModules do
+			if logModules[i] == G.Menu.Visuals.LogModuleFilter then
+				filterIndex = i
+				break
+			end
+		end
+		local picked = TimMenu.Selector("Debug Log Module", filterIndex, logModules)
+		if logModules[picked] then
+			G.Menu.Visuals.LogModuleFilter = logModules[picked]
+		end
+		TimMenu.Tooltip(
+		"Only this module prints [Debug] lines when Debug Mode is on (SmartJump has its own checkbox on Main)"
+		)
 		TimMenu.NextLine()
 		-- Initialize only if nil (not false)
 		if G.Menu.Visuals.EnableVisuals == nil then

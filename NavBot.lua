@@ -143,16 +143,27 @@ local function onCreateMove(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
 	elseif G.currentState == G.States.STUCK then
-		-- Only run stuck logic if walking is enabled (manual override mode = no stuck logic)
 		if G.Menu.Main.EnableWalking then
+			if G.Navigation.path and #G.Navigation.path > 0 then
+				MovementDecisions.updateWalkIntent(userCmd)
+				MovementDecisions.executeMovement(userCmd)
+			end
 			StateHandler.handleStuckState(userCmd)
 		else
-			-- Manual mode: just transition back to MOVING, skipping still works
 			G.currentState = G.States.MOVING
 		end
 	end
 
-	-- Work management
+	-- SmartJump runs last so duck/jump buttons are not overwritten by walkTo
+	if G.Menu.Main.Enable and G.Menu.SmartJump and G.Menu.SmartJump.Enable then
+		local shouldRunJump = G.currentState == G.States.MOVING
+			or G.currentState == G.States.FOLLOWING
+			or G.currentState == G.States.STUCK
+		if shouldRunJump then
+			SmartJump.Main(userCmd)
+		end
+	end
+
 	WorkManager.processWorks()
 end
 
@@ -341,7 +352,7 @@ callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")
 callbacks.Unregister("Draw", "NavBot.ProfilerDraw")
 
-callbacks.Register("CreateMove", "ZNavBot.CreateMove", onCreateMove) -- Z prefix ensures it runs after SmartJump
+callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed
@@ -383,6 +394,7 @@ local MenuModule = {}
 
 -- Import globals
 local G = require("NavBot.Core.Globals")
+local Common = require("NavBot.Core.Common")
 -- local Node = require("NavBot.Navigation.Node")  -- Temporarily disabled
 -- local Visuals = require("NavBot.Visuals")       -- Temporarily disabled
 
@@ -443,6 +455,10 @@ local function OnDrawMenu()
 		-- Smart Jump (works independently of NavBot enable state)
 		G.Menu.SmartJump.Enable = TimMenu.Checkbox("Smart Jump", G.Menu.SmartJump.Enable)
 		TimMenu.Tooltip("Enable intelligent jumping over obstacles (works even when NavBot is disabled)")
+		TimMenu.NextLine()
+
+		G.Menu.SmartJump.Debug = TimMenu.Checkbox("SmartJump Debug Logs", G.Menu.SmartJump.Debug or false)
+		TimMenu.Tooltip("Print SmartJump decision logs without enabling global Debug Mode or other modules")
 		TimMenu.EndSector()
 	elseif G.Menu.Tab == "Navigation" then
 		-- Movement & Pathfinding Section
@@ -549,7 +565,25 @@ local function OnDrawMenu()
 		-- Visual Settings Section
 		TimMenu.BeginSector("Visual Settings")
 		G.Menu.Visuals.Debug_Mode = TimMenu.Checkbox("Debug Mode", G.Menu.Visuals.Debug_Mode or false)
-		TimMenu.Tooltip("Enable debug visuals and verbose logging for troubleshooting")
+		TimMenu.Tooltip("Enable debug logging (use module filter below to avoid spam)")
+		TimMenu.NextLine()
+
+		local logModules = Common.Log.MODULE_FILTERS
+		G.Menu.Visuals.LogModuleFilter = G.Menu.Visuals.LogModuleFilter or "SmartJump"
+		local filterIndex = 1
+		for i = 1, #logModules do
+			if logModules[i] == G.Menu.Visuals.LogModuleFilter then
+				filterIndex = i
+				break
+			end
+		end
+		local picked = TimMenu.Selector("Debug Log Module", filterIndex, logModules)
+		if logModules[picked] then
+			G.Menu.Visuals.LogModuleFilter = logModules[picked]
+		end
+		TimMenu.Tooltip(
+		"Only this module prints [Debug] lines when Debug Mode is on (SmartJump has its own checkbox on Main)"
+		)
 		TimMenu.NextLine()
 		-- Initialize only if nil (not false)
 		if G.Menu.Visuals.EnableVisuals == nil then
@@ -678,6 +712,499 @@ callbacks.Unregister("Draw", "NavBot.DrawMenu")
 callbacks.Register("Draw", "NavBot.DrawMenu", OnDrawMenu)
 
 return MenuModule
+
+end)
+__bundle_register("NavBot.Core.Common", function(require, _LOADED, __bundle_register, __bundle_modules)
+---@diagnostic disable: duplicate-set-field, undefined-field
+---@class Common
+local Common = {}
+
+--[[ Imports ]]
+-- Use literal require to allow luabundle to treat it as an external/static require
+local libLoaded, Lib = pcall(require, "LNXlib")
+assert(libLoaded, "LNXlib not found, please install it!")
+assert(Lib.GetVersion() >= 1.0, "LNXlib version is too old, please update it!")
+
+Common.Lib = Lib
+Common.Notify = Lib.UI.Notify
+Common.TF2 = Lib.TF2
+Common.Math = Lib.Utils.Math
+Common.Conversion = Lib.Utils.Conversion
+Common.WPlayer = Lib.TF2.WPlayer
+Common.PR = Lib.TF2.PlayerResource
+Common.Helpers = Lib.TF2.Helpers
+Common.FastPlayers = require("NavBot.Utils.FastPlayers")
+
+-- Import G module at file scope
+local G = require("NavBot.Core.Globals")
+
+-- Safe logging system (replaces LNX Logger)
+local function safePrint(msg)
+	local success, err = pcall(print, msg)
+	if not success then
+		-- Fallback: try again
+		pcall(print, "LOG ERROR")
+	end
+end
+
+local Logger = {}
+Logger.__index = Logger
+
+--- Modules available in Visuals → Debug log filter combo.
+Logger.MODULE_FILTERS = {
+	"All",
+	"SmartJump",
+	"MovementDecisions",
+	"NodeSkipper",
+	"StateHandler",
+	"GoalFinder",
+	"AStar",
+	"DoorBuilder",
+	"NavBot",
+	"Navigation",
+	"PathSteering",
+	"Phase2_Normalize",
+	"Phase3_KDTree",
+	"Phase4_Doors",
+	"SetupOrchestrator",
+	"ISWalkableTest",
+}
+
+function Logger.isModuleFilterEnabled(moduleName)
+	local visuals = G.Menu and G.Menu.Visuals
+	if not visuals then
+		return true
+	end
+
+	local filter = visuals.LogModuleFilter or "All"
+	if filter == "All" or filter == "" then
+		return true
+	end
+
+	return moduleName == filter
+end
+
+function Logger.new(moduleName)
+	local self = setmetatable({}, Logger)
+	self.moduleName = moduleName or "NavBot"
+	return self
+end
+
+function Logger:Info(msg, ...)
+	local success, formatted = pcall(string.format, "[Info  %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
+	if success then
+		safePrint(formatted)
+	else
+		safePrint("[Info] " .. self.moduleName .. ": " .. tostring(msg))
+	end
+end
+
+function Logger:Warn(msg, ...)
+	local success, formatted = pcall(string.format, "[Warn  %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
+	if success then
+		safePrint(formatted)
+	else
+		safePrint("[Warn] " .. self.moduleName .. ": " .. tostring(msg))
+	end
+end
+
+function Logger:Debug(msg, ...)
+	local mayPrint = false
+	if self.moduleName == "SmartJump" and G.Menu.SmartJump and G.Menu.SmartJump.Debug then
+		mayPrint = true
+	elseif G.Menu.Visuals and G.Menu.Visuals.Debug_Mode and Logger.isModuleFilterEnabled(self.moduleName) then
+		mayPrint = true
+	end
+	if not mayPrint then
+		return
+	end
+
+	local success, formatted = pcall(string.format, "[Debug %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
+	if success then
+		safePrint(formatted)
+	else
+		safePrint("[Debug] " .. self.moduleName .. ": " .. tostring(msg))
+	end
+end
+
+function Logger:Error(msg, ...)
+	local success, formatted = pcall(string.format, "[Error %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
+	if success then
+		safePrint(formatted)
+	else
+		safePrint("[Error] " .. self.moduleName .. ": " .. tostring(msg))
+	end
+end
+
+Common.Log = Logger
+
+-- JSON support
+local JSON = {}
+function JSON.parse(str)
+	-- Simple JSON parser for basic objects/arrays
+	if not str or str == "" then
+		return nil
+	end
+
+	-- Remove whitespace
+	str = str:gsub("%s+", "")
+
+	-- Handle simple object
+	if str:match("^{.-}$") then
+		local result = {}
+		for k, v in str:gmatch('"([^"]+)":([^,}]+)') do
+			if v:match('^".*"$') then
+				result[k] = v:sub(2, -2) -- Remove quotes
+			elseif v == "true" then
+				result[k] = true
+			elseif v == "false" then
+				result[k] = false
+			elseif tonumber(v) then
+				result[k] = tonumber(v)
+			end
+		end
+		return result
+	end
+
+	return nil
+end
+
+function JSON.stringify(obj)
+	if type(obj) ~= "table" then
+		return tostring(obj)
+	end
+
+	local parts = {}
+	for k, v in pairs(obj) do
+		local key = '"' .. tostring(k) .. '"'
+		local value
+		if type(v) == "string" then
+			value = '"' .. v .. '"'
+		elseif type(v) == "boolean" then
+			value = tostring(v)
+		else
+			value = tostring(v)
+		end
+		table.insert(parts, key .. ":" .. value)
+	end
+	return "{" .. table.concat(parts, ",") .. "}"
+end
+
+Common.JSON = JSON
+
+local vectorDivide = vector.Divide
+local vectorLength = vector.Length
+local vectorDistance = vector.Distance
+
+--- Normalize vector using in-place :Normalize() (fastest method)
+function Common.Normalize(vec)
+	return vectorDivide(vec, vectorLength(vec)) -- Return the normalized vector
+end
+
+-- Distance2d posibly slower then distance 3D due to mroe instructions in lua then single call in cpp lib of dist 3d
+function Common.Distance2D(a, b)
+	return (a - b):Length2D()
+end
+
+--- Angle in degrees between two vectors (XY only)
+function Common.Angle2DDegrees(a, b)
+	local la = a:Length2D()
+	local lb = b:Length2D()
+	if la < 0.001 or lb < 0.001 then
+		return 0
+	end
+	local dot = a:Dot(b) / (la * lb)
+	dot = math.max(-1, math.min(1, dot))
+	return math.deg(math.acos(dot))
+end
+
+--distance3D check proly fastest posible in lua
+function Common.Distance3D(a, b)
+	return vectorDistance(a, b)
+end
+
+--- Cross product of two vectors
+function Common.Cross(a, b)
+	return a:Cross(b)
+end
+
+--- Dot product of two vectors
+function Common.Dot(a, b)
+	return a:Dot(b)
+end
+
+-- Arrow line drawing function (moved from Visuals.lua and ISWalkable.lua)
+function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
+	assert(start_pos and end_pos, "Common.DrawArrowLine: start_pos and end_pos are required")
+	assert(
+		arrowhead_length and arrowhead_width,
+		"Common.DrawArrowLine: arrowhead_length and arrowhead_width are required"
+	)
+
+	-- If invert is true, swap start_pos and end_pos
+	if invert then
+		start_pos, end_pos = end_pos, start_pos
+	end
+
+	-- Calculate direction from start to end
+	local direction = end_pos - start_pos
+	local direction_length = direction:Length()
+
+	-- Skip drawing if positions are identical (valid case when waypoints overlap)
+	if direction_length == 0 then
+		return
+	end
+
+	-- Normalize the direction vector safely
+	local normalized_direction = direction / direction_length
+
+	-- Calculate the arrow base position by moving back from end_pos in the direction of start_pos
+	local arrow_base = end_pos - normalized_direction * arrowhead_length
+
+	-- Calculate the perpendicular vector for the arrow width using cross product
+	-- This works for any direction including vertical traces
+	local up = Vector3(0, 0, 1)
+	local perpendicular = normalized_direction:Cross(up)
+	if perpendicular:Length() < 0.001 then
+		-- Direction is vertical, use arbitrary horizontal perpendicular
+		perpendicular = Vector3(1, 0, 0)
+	end
+	perpendicular = Common.Normalize(perpendicular) * (arrowhead_width / 2)
+
+	-- Convert world positions to screen positions
+	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
+	local w2s_arrow_base = client.WorldToScreen(arrow_base)
+	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
+	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
+
+	-- Only draw if all screen positions are valid
+	if w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2 then
+		-- Set color before drawing
+		draw.Color(255, 255, 255, 255) -- White for arrows
+
+		-- Draw the line from start to the base of the arrow (not all the way to the end)
+		draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
+
+		-- Draw the sides of the arrowhead
+		draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp1[2])
+		draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
+
+		-- Optionally, draw the base of the arrowhead to close it
+		draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
+	end
+end
+
+function Common.VectorToString(vec)
+	if not vec then
+		return "nil"
+	end
+	return string.format("(%.1f, %.1f, %.1f)", vec.x, vec.y, vec.z)
+end
+
+-- Dynamic hull size functions (access via Common for consistency)
+function Common.GetPlayerHull()
+	local pLocal = entities.GetLocalPlayer()
+	if not pLocal then
+		-- Fallback to hardcoded values if no player
+		return {
+			Min = Vector3(-24, -24, 0),
+			Max = Vector3(24, 24, 82),
+		}
+	end
+
+	-- Get dynamic hull size from player
+	return {
+		Min = pLocal:GetPropVector("m_vecMins") or Vector3(-24, -24, 0),
+		Max = pLocal:GetPropVector("m_vecMaxs") or Vector3(24, 24, 82),
+	}
+end
+
+function Common.GetHullMin()
+	return Common.GetPlayerHull().Min
+end
+
+function Common.GetHullMax()
+	return Common.GetPlayerHull().Max
+end
+
+-- Trace hull utilities (centralized for consistency)
+Common.Trace = {}
+
+function Common.Trace.Hull(startPos, endPos, hullMin, hullMax, mask, shouldHitEntity)
+	assert(startPos and endPos, "Trace.Hull: startPos and endPos are required")
+	assert(hullMin and hullMax, "Trace.Hull: hullMin and hullMax are required")
+
+	local mask = mask or MASK_PLAYERSOLID
+	local shouldHitEntity = shouldHitEntity or function(entity)
+		return entity ~= entities.GetLocalPlayer()
+	end
+
+	return engine.TraceHull(startPos, endPos, hullMin, hullMax, mask, shouldHitEntity)
+end
+
+function Common.Trace.PlayerHull(startPos, endPos, shouldHitEntity)
+	local hull = Common.GetPlayerHull()
+	return Common.Trace.Hull(startPos, endPos, hull.Min, hull.Max, MASK_PLAYERSOLID, shouldHitEntity)
+end
+
+-- Drawing utilities (centralized for consistency)
+Common.Drawing = {}
+
+function Common.Drawing.SetColor(r, g, b, a)
+	draw.Color(r, g, b, a)
+end
+
+function Common.Drawing.DrawLine(x1, y1, x2, y2)
+	draw.Line(x1, y1, x2, y2)
+end
+
+function Common.Drawing.WorldToScreen(worldPos)
+	return client.WorldToScreen(worldPos)
+end
+
+function Common.Drawing.Draw3DBox(size, pos)
+	local halfSize = size / 2
+	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
+	local corners = {
+		Vector3(-halfSize, -halfSize, -halfSize),
+		Vector3(halfSize, -halfSize, -halfSize),
+		Vector3(halfSize, halfSize, -halfSize),
+		Vector3(-halfSize, halfSize, -halfSize),
+		Vector3(-halfSize, -halfSize, halfSize),
+		Vector3(halfSize, -halfSize, halfSize),
+		Vector3(halfSize, halfSize, halfSize),
+		Vector3(-halfSize, halfSize, halfSize),
+	}
+
+	local linesToDraw = {
+		{ 1, 2 },
+		{ 2, 3 },
+		{ 3, 4 },
+		{ 4, 1 },
+		{ 5, 6 },
+		{ 6, 7 },
+		{ 7, 8 },
+		{ 8, 5 },
+		{ 1, 5 },
+		{ 2, 6 },
+		{ 3, 7 },
+		{ 4, 8 },
+	}
+
+	local screenPositions = {}
+	for _, cornerPos in ipairs(corners) do
+		local worldPos = pos + cornerPos
+		local screenPos = Common.Drawing.WorldToScreen(worldPos)
+		if screenPos then
+			table.insert(screenPositions, { x = screenPos[1], y = screenPos[2] })
+		end
+	end
+
+	for _, line in ipairs(linesToDraw) do
+		local p1, p2 = screenPositions[line[1]], screenPositions[line[2]]
+		if p1 and p2 then
+			Common.Drawing.DrawLine(p1.x, p1.y, p2.x, p2.y)
+		end
+	end
+end
+
+-- Dynamic values cache (updated periodically to avoid repeated cvar calls)
+Common.Dynamic = {
+	LastUpdate = 0,
+	UpdateInterval = 1.0, -- Update every second
+	Values = {},
+}
+
+function Common.Dynamic.Update()
+	local currentTime = globals.RealTime()
+	if currentTime - Common.Dynamic.LastUpdate < Common.Dynamic.UpdateInterval then
+		return -- Not time to update yet
+	end
+
+	Common.Dynamic.LastUpdate = currentTime
+
+	-- Update dynamic values from cvars and player properties
+	local pLocal = entities.GetLocalPlayer()
+	if pLocal then
+		Common.Dynamic.Values.MaxSpeed = pLocal:GetPropFloat("m_flMaxspeed") or 450
+		Common.Dynamic.Values.StepSize = pLocal:GetPropFloat("localdata", "m_flStepSize") or 18
+		Common.Dynamic.Values.HullMin = pLocal:GetPropVector("m_vecMins") or Vector3(-24, -24, 0)
+		Common.Dynamic.Values.HullMax = pLocal:GetPropVector("m_vecMaxs") or Vector3(24, 24, 82)
+	end
+
+	Common.Dynamic.Values.Gravity = client.GetConVar("sv_gravity") or 800
+	Common.Dynamic.Values.TickInterval = globals.TickInterval()
+end
+
+function Common.Dynamic.GetMaxSpeed()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.MaxSpeed or 450
+end
+
+function Common.Dynamic.GetStepSize()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.StepSize or 18
+end
+
+function Common.Dynamic.GetGravity()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.Gravity or 800
+end
+
+function Common.Dynamic.GetTickInterval()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.TickInterval or (1 / 66.67)
+end
+
+function Common.Dynamic.GetHullMin()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.HullMin or Vector3(-24, -24, 0)
+end
+
+function Common.Dynamic.GetHullMax()
+	Common.Dynamic.Update()
+	return Common.Dynamic.Values.HullMax or Vector3(24, 24, 82)
+end
+
+-- Performance optimization utilities
+Common.Cache = {}
+local cacheStorage = {} -- Separate storage to avoid polluting Cache namespace
+
+function Common.Cache.GetOrCompute(key, computeFunc, ttl)
+	local currentTime = globals.RealTime()
+	local cached = cacheStorage[key]
+
+	if cached and (currentTime - cached.time) < (ttl or 1.0) then
+		return cached.value
+	end
+
+	local value = computeFunc()
+	cacheStorage[key] = { value = value, time = currentTime }
+	return value
+end
+
+function Common.Cache.Clear()
+	cacheStorage = {} -- Clear the storage, not the module table
+end
+
+-- Optimized math operations
+function Common.Math.Clamp(value, min, max)
+	return math.max(min, math.min(max, value))
+end
+
+function Common.Math.DistanceSquared(a, b)
+	local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
+	return dx * dx + dy * dy + dz * dz
+end
+
+-- Debug logging wrapper (deprecated - Logger:Debug now handles menu check automatically)
+function Common.DebugLog(level, ...)
+	if G.Menu.Visuals and G.Menu.Visuals.Debug_Mode then
+		Common.Log[level](...)
+	end
+end
+
+return Common
 
 end)
 __bundle_register("NavBot.Core.Globals", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -1052,6 +1579,7 @@ local Default_Config = {
 		OptimizedISWalkableTest = false,
 		IsNavigableTest = false,
 		Debug_Mode = false,
+		LogModuleFilter = "SmartJump",
 	},
 
 	Movement = {
@@ -1066,6 +1594,131 @@ local Default_Config = {
 }
 
 return Default_Config
+
+end)
+__bundle_register("NavBot.Utils.FastPlayers", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- fastplayers.lua ─────────────────────────────────────────────────────────
+-- FastPlayers: Per-tick cached player lists for NavBot, now using LNXlib's WPlayer directly.
+--
+-- This version uses LNXlib's WPlayer as the player wrapper, removing the old custom WrappedPlayer.
+
+--[[ Imports ]]
+local G = require("NavBot.Core.Globals")
+local libLoaded, Lib = pcall(require, "LNXlib")
+assert(libLoaded, "LNXlib not found, please install it!")
+local WPlayer = Lib.TF2.WPlayer
+
+--[[ Module Declaration ]]
+local FastPlayers = {}
+
+--[[ Local Caches ]]
+local cachedAllPlayers, cachedTeammates, cachedEnemies, cachedLocal
+
+FastPlayers.AllUpdated = false
+FastPlayers.TeammatesUpdated = false
+FastPlayers.EnemiesUpdated = false
+
+--[[ Private: Reset per-tick caches ]]
+local function ResetCaches()
+	cachedAllPlayers = nil
+	cachedTeammates = nil
+	cachedEnemies = nil
+	cachedLocal = nil
+	FastPlayers.AllUpdated = false
+	FastPlayers.TeammatesUpdated = false
+	FastPlayers.EnemiesUpdated = false
+end
+
+--[[ Simplified validity check ]]
+local function isValidPlayer(ent, excludeEnt)
+	return ent and ent:IsValid() and ent:IsAlive() and not ent:IsDormant() and ent ~= excludeEnt
+end
+
+--[[ Public API ]]
+
+--- Returns list of valid, non-dormant players once per tick.
+---@param excludeLocal boolean? exclude local player if true
+---@return table[] -- WPlayer[]
+function FastPlayers.GetAll(excludeLocal)
+	if FastPlayers.AllUpdated then
+		return cachedAllPlayers
+	end
+	-- Determine entity to skip (local player)
+	local skipEnt = excludeLocal and entities.GetLocalPlayer() or nil
+	cachedAllPlayers = {}
+	-- Gather valid players
+	for _, ent in pairs(entities.FindByClass("CTFPlayer") or {}) do
+		if isValidPlayer(ent, skipEnt) then
+			local wp = WPlayer.FromEntity(ent)
+			if wp then
+				table.insert(cachedAllPlayers, wp)
+			end
+		end
+	end
+	FastPlayers.AllUpdated = true
+	return cachedAllPlayers
+end
+
+--- Returns the local player as a WPlayer instance, cached after first wrap.
+---@return table|nil -- WPlayer|nil
+function FastPlayers.GetLocal()
+	if not cachedLocal then
+		local rawLocal = entities.GetLocalPlayer()
+		cachedLocal = rawLocal and WPlayer.FromEntity(rawLocal) or nil
+	end
+	return cachedLocal
+end
+
+--- Returns list of teammates, optionally excluding local player.
+---@param excludeLocal boolean? exclude local player if true
+---@return table[] -- WPlayer[]
+function FastPlayers.GetTeammates(excludeLocal)
+	if not FastPlayers.TeammatesUpdated then
+		if not FastPlayers.AllUpdated then
+			FastPlayers.GetAll(true)
+		end
+		cachedTeammates = {}
+		local localWP = FastPlayers.GetLocal()
+		local ex = excludeLocal and localWP or nil
+		local myTeam = localWP and localWP:GetTeamNumber()
+		if myTeam then
+			for _, wp in ipairs(cachedAllPlayers) do
+				if wp:GetTeamNumber() == myTeam and wp ~= ex then
+					table.insert(cachedTeammates, wp)
+				end
+			end
+		end
+		FastPlayers.TeammatesUpdated = true
+	end
+	return cachedTeammates
+end
+
+--- Returns list of enemies (different team).
+---@return table[] -- WPlayer[]
+function FastPlayers.GetEnemies()
+	if not FastPlayers.EnemiesUpdated then
+		if not FastPlayers.AllUpdated then
+			FastPlayers.GetAll()
+		end
+		cachedEnemies = {}
+		local localWP = FastPlayers.GetLocal()
+		local myTeam = localWP and localWP:GetTeamNumber()
+		if myTeam then
+			for _, wp in ipairs(cachedAllPlayers) do
+				if wp:GetTeamNumber() ~= myTeam then
+					table.insert(cachedEnemies, wp)
+				end
+			end
+		end
+		FastPlayers.EnemiesUpdated = true
+	end
+	return cachedEnemies
+end
+
+-- Reset caches at the start of every CreateMove tick.
+callbacks.Register("CreateMove", "FastPlayers_ResetCaches", ResetCaches)
+
+return FastPlayers
 
 end)
 __bundle_register("NavBot.Utils.Config", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -1096,19 +1749,25 @@ function Config.GetFilePath()
 	return fullPath .. "/config.cfg"
 end
 
-local function checkAllKeysExist(expectedMenu, loadedMenu)
+--- Fill missing keys from defaults (keeps user values for existing keys).
+local function mergeDefaults(expectedMenu, loadedMenu)
+	local didMerge = false
 	for key, value in pairs(expectedMenu) do
 		if loadedMenu[key] == nil then
-			return false
-		end
-		if type(value) == "table" then
-			local result = checkAllKeysExist(value, loadedMenu[key])
-			if not result then
-				return false
+			if type(value) == "table" then
+				loadedMenu[key] = {}
+				mergeDefaults(value, loadedMenu[key])
+			else
+				loadedMenu[key] = value
+			end
+			didMerge = true
+		elseif type(value) == "table" and type(loadedMenu[key]) == "table" then
+			if mergeDefaults(value, loadedMenu[key]) then
+				didMerge = true
 			end
 		end
 	end
-	return true
+	return didMerge
 end
 
 --[[ Configuration Functions ]]
@@ -1138,11 +1797,12 @@ function Config.LoadCFG()
 		local content = file:read("*a")
 		file:close()
 		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
-		if
-			type(loadedCfg) == "table"
-			and checkAllKeysExist(Default_Config, loadedCfg)
-			and not input.IsButtonDown(KEY_LSHIFT)
-		then
+		if type(loadedCfg) == "table" and not input.IsButtonDown(KEY_LSHIFT) then
+			local merged = mergeDefaults(Default_Config, loadedCfg)
+			if merged then
+				printc(255, 200, 0, 255, "Config updated with new defaults; saving.")
+				Config.CreateCFG(loadedCfg)
+			end
 			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
 			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
 			G.Menu = loadedCfg
@@ -1789,585 +2449,6 @@ function json.decode(str, pos, nullval, ...)
 end
 
 return json
-
-end)
-__bundle_register("NavBot.Core.Common", function(require, _LOADED, __bundle_register, __bundle_modules)
----@diagnostic disable: duplicate-set-field, undefined-field
----@class Common
-local Common = {}
-
---[[ Imports ]]
--- Use literal require to allow luabundle to treat it as an external/static require
-local libLoaded, Lib = pcall(require, "LNXlib")
-assert(libLoaded, "LNXlib not found, please install it!")
-assert(Lib.GetVersion() >= 1.0, "LNXlib version is too old, please update it!")
-
-Common.Lib = Lib
-Common.Notify = Lib.UI.Notify
-Common.TF2 = Lib.TF2
-Common.Math = Lib.Utils.Math
-Common.Conversion = Lib.Utils.Conversion
-Common.WPlayer = Lib.TF2.WPlayer
-Common.PR = Lib.TF2.PlayerResource
-Common.Helpers = Lib.TF2.Helpers
-Common.FastPlayers = require("NavBot.Utils.FastPlayers")
-
--- Import G module at file scope
-local G = require("NavBot.Core.Globals")
-
--- Safe logging system (replaces LNX Logger)
-local function safePrint(msg)
-	local success, err = pcall(print, msg)
-	if not success then
-		-- Fallback: try again
-		pcall(print, "LOG ERROR")
-	end
-end
-
-local Logger = {}
-Logger.__index = Logger
-
-function Logger.new(moduleName)
-	local self = setmetatable({}, Logger)
-	self.moduleName = moduleName or "NavBot"
-	return self
-end
-
-function Logger:Info(msg, ...)
-	local success, formatted = pcall(string.format, "[Info  %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
-	if success then
-		safePrint(formatted)
-	else
-		safePrint("[Info] " .. self.moduleName .. ": " .. tostring(msg))
-	end
-end
-
-function Logger:Warn(msg, ...)
-	local success, formatted = pcall(string.format, "[Warn  %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
-	if success then
-		safePrint(formatted)
-	else
-		safePrint("[Warn] " .. self.moduleName .. ": " .. tostring(msg))
-	end
-end
-
-function Logger:Debug(msg, ...)
-	-- Only print debug messages if debug is enabled in menu
-	if not (G.Menu.Visuals and G.Menu.Visuals.Debug_Mode) then
-		return -- Skip debug output when debug is disabled
-	end
-
-	local success, formatted = pcall(string.format, "[Debug %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
-	if success then
-		safePrint(formatted)
-	else
-		safePrint("[Debug] " .. self.moduleName .. ": " .. tostring(msg))
-	end
-end
-
-function Logger:Error(msg, ...)
-	local success, formatted = pcall(string.format, "[Error %s] %s: " .. msg, os.date("%H:%M:%S"), self.moduleName, ...)
-	if success then
-		safePrint(formatted)
-	else
-		safePrint("[Error] " .. self.moduleName .. ": " .. tostring(msg))
-	end
-end
-
-Common.Log = Logger
-
--- JSON support
-local JSON = {}
-function JSON.parse(str)
-	-- Simple JSON parser for basic objects/arrays
-	if not str or str == "" then
-		return nil
-	end
-
-	-- Remove whitespace
-	str = str:gsub("%s+", "")
-
-	-- Handle simple object
-	if str:match("^{.-}$") then
-		local result = {}
-		for k, v in str:gmatch('"([^"]+)":([^,}]+)') do
-			if v:match('^".*"$') then
-				result[k] = v:sub(2, -2) -- Remove quotes
-			elseif v == "true" then
-				result[k] = true
-			elseif v == "false" then
-				result[k] = false
-			elseif tonumber(v) then
-				result[k] = tonumber(v)
-			end
-		end
-		return result
-	end
-
-	return nil
-end
-
-function JSON.stringify(obj)
-	if type(obj) ~= "table" then
-		return tostring(obj)
-	end
-
-	local parts = {}
-	for k, v in pairs(obj) do
-		local key = '"' .. tostring(k) .. '"'
-		local value
-		if type(v) == "string" then
-			value = '"' .. v .. '"'
-		elseif type(v) == "boolean" then
-			value = tostring(v)
-		else
-			value = tostring(v)
-		end
-		table.insert(parts, key .. ":" .. value)
-	end
-	return "{" .. table.concat(parts, ",") .. "}"
-end
-
-Common.JSON = JSON
-
-local vectorDivide = vector.Divide
-local vectorLength = vector.Length
-local vectorDistance = vector.Distance
-
---- Normalize vector using in-place :Normalize() (fastest method)
-function Common.Normalize(vec)
-	return vectorDivide(vec, vectorLength(vec)) -- Return the normalized vector
-end
-
--- Distance2d posibly slower then distance 3D due to mroe instructions in lua then single call in cpp lib of dist 3d
-function Common.Distance2D(a, b)
-	return (a - b):Length2D()
-end
-
---- Angle in degrees between two vectors (XY only)
-function Common.Angle2DDegrees(a, b)
-	local la = a:Length2D()
-	local lb = b:Length2D()
-	if la < 0.001 or lb < 0.001 then
-		return 0
-	end
-	local dot = a:Dot(b) / (la * lb)
-	dot = math.max(-1, math.min(1, dot))
-	return math.deg(math.acos(dot))
-end
-
---distance3D check proly fastest posible in lua
-function Common.Distance3D(a, b)
-	return vectorDistance(a, b)
-end
-
---- Cross product of two vectors
-function Common.Cross(a, b)
-	return a:Cross(b)
-end
-
---- Dot product of two vectors
-function Common.Dot(a, b)
-	return a:Dot(b)
-end
-
--- Arrow line drawing function (moved from Visuals.lua and ISWalkable.lua)
-function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
-	assert(start_pos and end_pos, "Common.DrawArrowLine: start_pos and end_pos are required")
-	assert(
-		arrowhead_length and arrowhead_width,
-		"Common.DrawArrowLine: arrowhead_length and arrowhead_width are required"
-	)
-
-	-- If invert is true, swap start_pos and end_pos
-	if invert then
-		start_pos, end_pos = end_pos, start_pos
-	end
-
-	-- Calculate direction from start to end
-	local direction = end_pos - start_pos
-	local direction_length = direction:Length()
-
-	-- Skip drawing if positions are identical (valid case when waypoints overlap)
-	if direction_length == 0 then
-		return
-	end
-
-	-- Normalize the direction vector safely
-	local normalized_direction = direction / direction_length
-
-	-- Calculate the arrow base position by moving back from end_pos in the direction of start_pos
-	local arrow_base = end_pos - normalized_direction * arrowhead_length
-
-	-- Calculate the perpendicular vector for the arrow width using cross product
-	-- This works for any direction including vertical traces
-	local up = Vector3(0, 0, 1)
-	local perpendicular = normalized_direction:Cross(up)
-	if perpendicular:Length() < 0.001 then
-		-- Direction is vertical, use arbitrary horizontal perpendicular
-		perpendicular = Vector3(1, 0, 0)
-	end
-	perpendicular = Common.Normalize(perpendicular) * (arrowhead_width / 2)
-
-	-- Convert world positions to screen positions
-	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-	local w2s_arrow_base = client.WorldToScreen(arrow_base)
-	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
-	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
-
-	-- Only draw if all screen positions are valid
-	if w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2 then
-		-- Set color before drawing
-		draw.Color(255, 255, 255, 255) -- White for arrows
-
-		-- Draw the line from start to the base of the arrow (not all the way to the end)
-		draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
-
-		-- Draw the sides of the arrowhead
-		draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp1[2])
-		draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
-
-		-- Optionally, draw the base of the arrowhead to close it
-		draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
-	end
-end
-
-function Common.VectorToString(vec)
-	if not vec then
-		return "nil"
-	end
-	return string.format("(%.1f, %.1f, %.1f)", vec.x, vec.y, vec.z)
-end
-
--- Dynamic hull size functions (access via Common for consistency)
-function Common.GetPlayerHull()
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal then
-		-- Fallback to hardcoded values if no player
-		return {
-			Min = Vector3(-24, -24, 0),
-			Max = Vector3(24, 24, 82),
-		}
-	end
-
-	-- Get dynamic hull size from player
-	return {
-		Min = pLocal:GetPropVector("m_vecMins") or Vector3(-24, -24, 0),
-		Max = pLocal:GetPropVector("m_vecMaxs") or Vector3(24, 24, 82),
-	}
-end
-
-function Common.GetHullMin()
-	return Common.GetPlayerHull().Min
-end
-
-function Common.GetHullMax()
-	return Common.GetPlayerHull().Max
-end
-
--- Trace hull utilities (centralized for consistency)
-Common.Trace = {}
-
-function Common.Trace.Hull(startPos, endPos, hullMin, hullMax, mask, shouldHitEntity)
-	assert(startPos and endPos, "Trace.Hull: startPos and endPos are required")
-	assert(hullMin and hullMax, "Trace.Hull: hullMin and hullMax are required")
-
-	local mask = mask or MASK_PLAYERSOLID
-	local shouldHitEntity = shouldHitEntity or function(entity)
-		return entity ~= entities.GetLocalPlayer()
-	end
-
-	return engine.TraceHull(startPos, endPos, hullMin, hullMax, mask, shouldHitEntity)
-end
-
-function Common.Trace.PlayerHull(startPos, endPos, shouldHitEntity)
-	local hull = Common.GetPlayerHull()
-	return Common.Trace.Hull(startPos, endPos, hull.Min, hull.Max, MASK_PLAYERSOLID, shouldHitEntity)
-end
-
--- Drawing utilities (centralized for consistency)
-Common.Drawing = {}
-
-function Common.Drawing.SetColor(r, g, b, a)
-	draw.Color(r, g, b, a)
-end
-
-function Common.Drawing.DrawLine(x1, y1, x2, y2)
-	draw.Line(x1, y1, x2, y2)
-end
-
-function Common.Drawing.WorldToScreen(worldPos)
-	return client.WorldToScreen(worldPos)
-end
-
-function Common.Drawing.Draw3DBox(size, pos)
-	local halfSize = size / 2
-	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
-	local corners = {
-		Vector3(-halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, -halfSize, halfSize),
-		Vector3(halfSize, -halfSize, halfSize),
-		Vector3(halfSize, halfSize, halfSize),
-		Vector3(-halfSize, halfSize, halfSize),
-	}
-
-	local linesToDraw = {
-		{ 1, 2 },
-		{ 2, 3 },
-		{ 3, 4 },
-		{ 4, 1 },
-		{ 5, 6 },
-		{ 6, 7 },
-		{ 7, 8 },
-		{ 8, 5 },
-		{ 1, 5 },
-		{ 2, 6 },
-		{ 3, 7 },
-		{ 4, 8 },
-	}
-
-	local screenPositions = {}
-	for _, cornerPos in ipairs(corners) do
-		local worldPos = pos + cornerPos
-		local screenPos = Common.Drawing.WorldToScreen(worldPos)
-		if screenPos then
-			table.insert(screenPositions, { x = screenPos[1], y = screenPos[2] })
-		end
-	end
-
-	for _, line in ipairs(linesToDraw) do
-		local p1, p2 = screenPositions[line[1]], screenPositions[line[2]]
-		if p1 and p2 then
-			Common.Drawing.DrawLine(p1.x, p1.y, p2.x, p2.y)
-		end
-	end
-end
-
--- Dynamic values cache (updated periodically to avoid repeated cvar calls)
-Common.Dynamic = {
-	LastUpdate = 0,
-	UpdateInterval = 1.0, -- Update every second
-	Values = {},
-}
-
-function Common.Dynamic.Update()
-	local currentTime = globals.RealTime()
-	if currentTime - Common.Dynamic.LastUpdate < Common.Dynamic.UpdateInterval then
-		return -- Not time to update yet
-	end
-
-	Common.Dynamic.LastUpdate = currentTime
-
-	-- Update dynamic values from cvars and player properties
-	local pLocal = entities.GetLocalPlayer()
-	if pLocal then
-		Common.Dynamic.Values.MaxSpeed = pLocal:GetPropFloat("m_flMaxspeed") or 450
-		Common.Dynamic.Values.StepSize = pLocal:GetPropFloat("localdata", "m_flStepSize") or 18
-		Common.Dynamic.Values.HullMin = pLocal:GetPropVector("m_vecMins") or Vector3(-24, -24, 0)
-		Common.Dynamic.Values.HullMax = pLocal:GetPropVector("m_vecMaxs") or Vector3(24, 24, 82)
-	end
-
-	Common.Dynamic.Values.Gravity = client.GetConVar("sv_gravity") or 800
-	Common.Dynamic.Values.TickInterval = globals.TickInterval()
-end
-
-function Common.Dynamic.GetMaxSpeed()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.MaxSpeed or 450
-end
-
-function Common.Dynamic.GetStepSize()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.StepSize or 18
-end
-
-function Common.Dynamic.GetGravity()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.Gravity or 800
-end
-
-function Common.Dynamic.GetTickInterval()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.TickInterval or (1 / 66.67)
-end
-
-function Common.Dynamic.GetHullMin()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.HullMin or Vector3(-24, -24, 0)
-end
-
-function Common.Dynamic.GetHullMax()
-	Common.Dynamic.Update()
-	return Common.Dynamic.Values.HullMax or Vector3(24, 24, 82)
-end
-
--- Performance optimization utilities
-Common.Cache = {}
-local cacheStorage = {} -- Separate storage to avoid polluting Cache namespace
-
-function Common.Cache.GetOrCompute(key, computeFunc, ttl)
-	local currentTime = globals.RealTime()
-	local cached = cacheStorage[key]
-
-	if cached and (currentTime - cached.time) < (ttl or 1.0) then
-		return cached.value
-	end
-
-	local value = computeFunc()
-	cacheStorage[key] = { value = value, time = currentTime }
-	return value
-end
-
-function Common.Cache.Clear()
-	cacheStorage = {} -- Clear the storage, not the module table
-end
-
--- Optimized math operations
-function Common.Math.Clamp(value, min, max)
-	return math.max(min, math.min(max, value))
-end
-
-function Common.Math.DistanceSquared(a, b)
-	local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
-	return dx * dx + dy * dy + dz * dz
-end
-
--- Debug logging wrapper (deprecated - Logger:Debug now handles menu check automatically)
-function Common.DebugLog(level, ...)
-	if G.Menu.Visuals and G.Menu.Visuals.Debug_Mode then
-		Common.Log[level](...)
-	end
-end
-
-return Common
-
-end)
-__bundle_register("NavBot.Utils.FastPlayers", function(require, _LOADED, __bundle_register, __bundle_modules)
--- fastplayers.lua ─────────────────────────────────────────────────────────
--- FastPlayers: Per-tick cached player lists for NavBot, now using LNXlib's WPlayer directly.
---
--- This version uses LNXlib's WPlayer as the player wrapper, removing the old custom WrappedPlayer.
-
---[[ Imports ]]
-local G = require("NavBot.Core.Globals")
-local libLoaded, Lib = pcall(require, "LNXlib")
-assert(libLoaded, "LNXlib not found, please install it!")
-local WPlayer = Lib.TF2.WPlayer
-
---[[ Module Declaration ]]
-local FastPlayers = {}
-
---[[ Local Caches ]]
-local cachedAllPlayers, cachedTeammates, cachedEnemies, cachedLocal
-
-FastPlayers.AllUpdated = false
-FastPlayers.TeammatesUpdated = false
-FastPlayers.EnemiesUpdated = false
-
---[[ Private: Reset per-tick caches ]]
-local function ResetCaches()
-	cachedAllPlayers = nil
-	cachedTeammates = nil
-	cachedEnemies = nil
-	cachedLocal = nil
-	FastPlayers.AllUpdated = false
-	FastPlayers.TeammatesUpdated = false
-	FastPlayers.EnemiesUpdated = false
-end
-
---[[ Simplified validity check ]]
-local function isValidPlayer(ent, excludeEnt)
-	return ent and ent:IsValid() and ent:IsAlive() and not ent:IsDormant() and ent ~= excludeEnt
-end
-
---[[ Public API ]]
-
---- Returns list of valid, non-dormant players once per tick.
----@param excludeLocal boolean? exclude local player if true
----@return table[] -- WPlayer[]
-function FastPlayers.GetAll(excludeLocal)
-	if FastPlayers.AllUpdated then
-		return cachedAllPlayers
-	end
-	-- Determine entity to skip (local player)
-	local skipEnt = excludeLocal and entities.GetLocalPlayer() or nil
-	cachedAllPlayers = {}
-	-- Gather valid players
-	for _, ent in pairs(entities.FindByClass("CTFPlayer") or {}) do
-		if isValidPlayer(ent, skipEnt) then
-			local wp = WPlayer.FromEntity(ent)
-			if wp then
-				table.insert(cachedAllPlayers, wp)
-			end
-		end
-	end
-	FastPlayers.AllUpdated = true
-	return cachedAllPlayers
-end
-
---- Returns the local player as a WPlayer instance, cached after first wrap.
----@return table|nil -- WPlayer|nil
-function FastPlayers.GetLocal()
-	if not cachedLocal then
-		local rawLocal = entities.GetLocalPlayer()
-		cachedLocal = rawLocal and WPlayer.FromEntity(rawLocal) or nil
-	end
-	return cachedLocal
-end
-
---- Returns list of teammates, optionally excluding local player.
----@param excludeLocal boolean? exclude local player if true
----@return table[] -- WPlayer[]
-function FastPlayers.GetTeammates(excludeLocal)
-	if not FastPlayers.TeammatesUpdated then
-		if not FastPlayers.AllUpdated then
-			FastPlayers.GetAll(true)
-		end
-		cachedTeammates = {}
-		local localWP = FastPlayers.GetLocal()
-		local ex = excludeLocal and localWP or nil
-		local myTeam = localWP and localWP:GetTeamNumber()
-		if myTeam then
-			for _, wp in ipairs(cachedAllPlayers) do
-				if wp:GetTeamNumber() == myTeam and wp ~= ex then
-					table.insert(cachedTeammates, wp)
-				end
-			end
-		end
-		FastPlayers.TeammatesUpdated = true
-	end
-	return cachedTeammates
-end
-
---- Returns list of enemies (different team).
----@return table[] -- WPlayer[]
-function FastPlayers.GetEnemies()
-	if not FastPlayers.EnemiesUpdated then
-		if not FastPlayers.AllUpdated then
-			FastPlayers.GetAll()
-		end
-		cachedEnemies = {}
-		local localWP = FastPlayers.GetLocal()
-		local myTeam = localWP and localWP:GetTeamNumber()
-		if myTeam then
-			for _, wp in ipairs(cachedAllPlayers) do
-				if wp:GetTeamNumber() ~= myTeam then
-					table.insert(cachedEnemies, wp)
-				end
-			end
-		end
-		FastPlayers.EnemiesUpdated = true
-	end
-	return cachedEnemies
-end
-
--- Reset caches at the start of every CreateMove tick.
-callbacks.Register("CreateMove", "FastPlayers_ResetCaches", ResetCaches)
-
-return FastPlayers
 
 end)
 __bundle_register("NavBot.Visuals", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -4113,13 +4194,6 @@ function DoorBuilder.BuildDoorsForConnections()
 												if ConnectionUtils.GetNodeId(tConn) == nodeId then
 													hasReverse = true
 													revDir = tDirId
-													if G.Menu.Visuals and G.Menu.Visuals.Debug_Mode then
-														Log:Debug(
-															"Connection %s->%s: Found reverse (bidirectional)",
-															nodeId,
-															targetId
-														)
-													end
 													break
 												end
 											end
@@ -4130,11 +4204,7 @@ function DoorBuilder.BuildDoorsForConnections()
 									end
 								end
 
-								if not hasReverse then
-									if G.Menu.Visuals and G.Menu.Visuals.Debug_Mode then
-										Log:Debug("Connection %s->%s: No reverse found (one-way)", nodeId, targetId)
-									end
-								end
+								-- one-way links are normal; summary counts are logged at end of build
 
 								-- Create SHARED doors (use canonical ordering for IDs)
 								local door = DoorGeometry.CreateDoorForAreas(node, targetNode, dirId)
@@ -8236,9 +8306,33 @@ local SJC = G.SmartJump.Constants
 
 local MIN_STEP_HEIGHT = 18
 local MAX_CLEAR_HEIGHT = 72
-local MAX_PATH_SIM_TARGETS = 12
+local MAX_PATH_SIM_SEGMENTS = 16
+local MIN_POLY_POINT_DIST = 8
+local ARRIVAL_DIST = 1.5
 
 local SmartJump = {}
+
+local SJ_DEBUG_INTERVAL = 22
+
+local function sjDebugThrottled(key, msg, ...)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		if not (G.Menu.Visuals and G.Menu.Visuals.Debug_Mode) then
+			return
+		end
+		if not Common.Log.isModuleFilterEnabled("SmartJump") then
+			return
+		end
+	end
+
+	G.SmartJump._debugLast = G.SmartJump._debugLast or {}
+	local tick = globals.TickCount()
+	local last = G.SmartJump._debugLast[key] or 0
+	if tick - last < SJ_DEBUG_INTERVAL then
+		return
+	end
+	G.SmartJump._debugLast[key] = tick
+	Log:Debug(msg, ...)
+end
 
 local function getPlayerHitbox(player)
 	return { player:GetMins(), player:GetMaxs() }
@@ -8257,7 +8351,7 @@ end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return (pFlags & FL_ONGROUND) == FL_ONGROUND
+	return (pFlags & FL_ONGROUND) ~= 0
 end
 
 local function getTouchDistance()
@@ -8302,79 +8396,93 @@ local function isBotPathfollowing(cmd)
 	if isManualOverride(cmd) then
 		return false
 	end
-	if G.currentState ~= G.States.MOVING and G.currentState ~= G.States.FOLLOWING then
+	if
+		G.currentState ~= G.States.MOVING
+		and G.currentState ~= G.States.FOLLOWING
+		and G.currentState ~= G.States.STUCK
+	then
 		return false
 	end
 	return true
 end
 
 local function getManualWishDir(cmd)
-	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
-	if moveIntent:Length() < 1 then
+	local forward = cmd:GetForwardMove()
+	local side = cmd:GetSideMove()
+	if forward == 0 and side == 0 then
 		return nil
 	end
+	local moveIntent = Vector3(forward, -side, 0)
 	local viewAngles = engine.GetViewAngles()
 	return Common.Normalize(rotateMoveByView(moveIntent, viewAngles.yaw))
 end
 
-local function getPathNodeTarget(simPos, pathIndex)
-	local path = G.Navigation.path
-	local node = path and path[pathIndex]
-	if not node or not node.pos then
-		return nil
+local function getActiveWishDir(cmd)
+	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
+		return Common.Normalize(Vector3(G.BotIntendedWishDir.x, G.BotIntendedWishDir.y, 0))
 	end
-
-	local nextNode = path[pathIndex + 1]
-	if nextNode and not Node.IsDoorNode(node) then
-		return PathSteering.getSteeringPoint(simPos, node, nextNode) or node.pos
-	end
-
-	return node.pos
+	return getManualWishDir(cmd)
 end
 
---- Waypoints when active; otherwise path nodes (portal steering points).
-local function buildPathSimTargets(origin)
-	local targets = {}
+--- Fixed corner polyline the bot walks (no per-tick retarget noise).
+local function addPolyPoint(points, pos)
+	if not pos then
+		return
+	end
+	if #points > 0 then
+		if Common.Distance2D(points[#points], pos) < MIN_POLY_POINT_DIST then
+			return
+		end
+	end
+	points[#points + 1] = pos
+end
+
+local function buildWalkPolyline(origin)
+	local points = {}
 
 	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
 		local startIdx = G.Navigation.currentWaypointIndex or 1
 		for i = startIdx, #G.Navigation.waypoints do
 			local wp = G.Navigation.waypoints[i]
-			if wp and wp.pos then
-				targets[#targets + 1] = wp.pos
-			end
-			if #targets >= MAX_PATH_SIM_TARGETS then
-				return targets
+			addPolyPoint(points, wp and wp.pos)
+			if #points >= MAX_PATH_SIM_SEGMENTS then
+				return points
 			end
 		end
-		return targets
+		return points
 	end
 
 	local path = G.Navigation.path
-	if not path then
-		return targets
+	if not path or #path == 0 then
+		return points
 	end
 
-	local limit = math.min(#path, MAX_PATH_SIM_TARGETS)
-	for i = 1, limit do
-		local pt = getPathNodeTarget(origin, i)
-		if pt then
-			targets[#targets + 1] = pt
+	local n1, n2 = path[1], path[2]
+	if n1 and n1.pos then
+		if n2 and not Node.IsDoorNode(n1) then
+			addPolyPoint(points, PathSteering.getSteeringPoint(origin, n1, n2) or n1.pos)
+		else
+			addPolyPoint(points, n1.pos)
 		end
 	end
 
-	return targets
-end
+	for i = 2, #path do
+		local node = path[i]
+		local nextNode = path[i + 1]
+		if not node or not node.pos then
+			break
+		end
+		if nextNode and not Node.IsDoorNode(node) then
+			addPolyPoint(points, PathSteering.getSteeringPoint(node.pos, node, nextNode) or node.pos)
+		else
+			addPolyPoint(points, node.pos)
+		end
+		if #points >= MAX_PATH_SIM_SEGMENTS then
+			break
+		end
+	end
 
-local function refreshPathTarget(simPos, targets, targetIndex)
-	local pos = targets[targetIndex]
-	if not pos then
-		return nil
-	end
-	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
-		return pos
-	end
-	return getPathNodeTarget(simPos, targetIndex) or pos
+	return points
 end
 
 --- Up 72 → one tick forward step → down. Corners: slide forward then down with startsolid checks.
@@ -8452,17 +8560,56 @@ local function isNearPayload(position)
 	end
 
 	for _, payload in pairs(G.World.payloads) do
-		if payload:IsValid() then
+		if payload and payload:IsValid() then
 			local payloadPos = payload:GetAbsOrigin()
-			if (position - payloadPos):Length() < 200 then
-				return true
-			end
-			local groundPos = Vector3(payloadPos.x, payloadPos.y, payloadPos.z - 80)
-			if (position - groundPos):Length() < 150 then
+			if (position - payloadPos):Length() < 64 then
 				return true
 			end
 		end
 	end
+	return false
+end
+
+--- Real position + wishdir: wall in front with a clear ledge (doors/steps), not polyline-only.
+local function shouldJumpAtLiveWall(cmd, pLocal)
+	if not isPlayerOnGround(pLocal) then
+		return false
+	end
+
+	local wishDir = getActiveWishDir(cmd)
+	if not wishDir then
+		return false
+	end
+
+	local origin = pLocal:GetAbsOrigin()
+	if isNearPayload(origin) then
+		return false
+	end
+
+	local hitbox = getPlayerHitbox(pLocal)
+	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
+	local stepLen = math.max(oneTickStepLength(maxSpeed) * 2, 12)
+	local step = Vector3(0, 0, 18)
+	local hullMin, hullMax = hitbox[1], hitbox[2]
+
+	local groundTrace = engine.TraceHull(origin + step, origin, hullMin, hullMax, MASK_PLAYERSOLID)
+	local feet = groundTrace.endpos
+	local wallTrace = engine.TraceHull(feet + step, feet + step + wishDir * stepLen, hullMin, hullMax, MASK_PLAYERSOLID)
+
+	if wallTrace.fraction >= 0.99 then
+		sjDebugThrottled("live_no_wall", "live: no wall (frac=%.2f)", wallTrace.fraction)
+		return false
+	end
+
+	local clearNow, obstacleHeight = canClearObstacle(wallTrace.endpos, wishDir, hitbox, maxSpeed, wallTrace)
+	if clearNow then
+		G.SmartJump.PredPos = wallTrace.endpos
+		G.SmartJump.HitObstacle = true
+		sjDebugThrottled("live_jump", "live: jump OK lip=%.0f frac=%.2f", obstacleHeight or 0, wallTrace.fraction)
+		return true
+	end
+
+	sjDebugThrottled("live_blocked", "live: wall frac=%.2f but canClear=false", wallTrace.fraction)
 	return false
 end
 
@@ -8495,26 +8642,13 @@ local function tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, ma
 	return false
 end
 
-local function simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
-	local toTarget = Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0)
-	local dist = toTarget:Length2D()
-	if dist < 0.5 then
-		return simPos, simVel, false, nil
-	end
-
-	local wishDir = toTarget / dist
-	return GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
-end
-
---- Path mode: chain targets (current → next node …) until jump-peek ticks or obstacle.
-local function shouldLateJumpPathMode(pLocal)
+--- Same wishdir + hull step as MovementController.walkTo, along fixed polyline corners.
+---@param checkJump boolean When false, only fills SimulationPath (visualization).
+local function simulatePathPolyline(pLocal, checkJump)
 	local origin = pLocal:GetAbsOrigin()
-	if isNearPayload(origin) then
-		return false
-	end
-
-	local targets = buildPathSimTargets(origin)
-	if #targets == 0 then
+	local segments = buildWalkPolyline(origin)
+	if #segments == 0 then
+		G.SmartJump.SimulationPath = { origin }
 		return false
 	end
 
@@ -8526,43 +8660,73 @@ local function shouldLateJumpPathMode(pLocal)
 
 	local simPos = origin
 	local simVel = Vector3(0, 0, 0)
-	local targetIndex = 1
-	local targetPos = targets[targetIndex]
+	local segIndex = 1
+	local dest = segments[segIndex]
 
 	G.SmartJump.SimulationPath = { origin }
+	if not checkJump then
+		G.SmartJump.PredPos = nil
+		G.SmartJump.HitObstacle = false
+		G.SmartJump.JumpPeekPos = nil
+	end
 
 	for _ = 1, peakTicks do
-		if not targetPos then
+		if not dest then
 			break
 		end
 
-		local newPos, newVel, hitWall, wallTrace = simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
+		local horizSpeed = simVel:Length2D()
+		local coastTicks = GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
+		local wishDir = GroundMovement.computeWishDirToTarget(simPos, simVel, dest, coastTicks, true)
+
+		if not wishDir then
+			if Common.Distance2D(simPos, dest) <= math.max(touch, ARRIVAL_DIST) then
+				segIndex = segIndex + 1
+				dest = segments[segIndex]
+			end
+			if not dest then
+				break
+			end
+			wishDir = GroundMovement.computeWishDirToTarget(simPos, simVel, dest, coastTicks, true)
+		end
+
+		if not wishDir then
+			break
+		end
+
+		local newPos, newVel, hitWall, wallTrace =
+			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+
 		if not newPos then
 			break
 		end
 
 		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
-		local wishDir = Common.Normalize(Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0))
-		if wishDir then
-			if hitWall then
-				if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
-					return true
-				end
-				return false
+		if checkJump and hitWall then
+			if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
+				return true
 			end
+			return false
 		end
 
 		simPos = newPos
 		simVel = newVel
 
-		if Common.Distance2D(simPos, targetPos) <= touch then
-			targetIndex = targetIndex + 1
-			targetPos = refreshPathTarget(simPos, targets, targetIndex)
+		if Common.Distance2D(simPos, dest) <= touch then
+			segIndex = segIndex + 1
+			dest = segments[segIndex]
 		end
 	end
 
 	return false
+end
+
+local function shouldLateJumpPathMode(pLocal)
+	if isNearPayload(pLocal:GetAbsOrigin()) then
+		return false
+	end
+	return simulatePathPolyline(pLocal, true)
 end
 
 --- Manual / no path: single wishdir along cmd or bot intent.
@@ -8588,12 +8752,16 @@ local function shouldLateJumpManual(cmd, pLocal)
 	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
 
 	local simPos = origin
-	local simVel = Vector3(wishDir.x * maxSpeed, wishDir.y * maxSpeed, 0)
+	local simVel = Vector3(0, 0, 0)
+	local farDest = origin + wishDir * 512
 	G.SmartJump.SimulationPath = { origin }
 
 	for _ = 1, peakTicks + 4 do
+		local coastTicks = GroundMovement.getCoastTicks(simVel:Length2D(), maxSpeed)
+		local stepWish = GroundMovement.computeWishDirToTarget(simPos, simVel, farDest, coastTicks, true) or wishDir
+
 		local newPos, newVel, hitWall, wallTrace =
-			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+			GroundMovement.simulateGroundStepHull(simPos, simVel, stepWish, maxSpeed, hitbox[1], hitbox[2], true)
 
 		if not newPos then
 			break
@@ -8602,7 +8770,7 @@ local function shouldLateJumpManual(cmd, pLocal)
 		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
 		if hitWall then
-			if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
+			if tryLateJumpAtObstacle(simPos, newPos, newVel, stepWish, hitbox, maxSpeed, wallTrace) then
 				return true
 			end
 			return false
@@ -8616,19 +8784,40 @@ local function shouldLateJumpManual(cmd, pLocal)
 end
 
 local function shouldLateJump(cmd, pLocal)
-	if not pLocal or not isPlayerOnGround(pLocal) then
+	if not pLocal then
+		return false
+	end
+	if not isPlayerOnGround(pLocal) then
+		sjDebugThrottled("airborne", "skip: not on ground (state=%s)", tostring(SJ.jumpState))
 		return false
 	end
 
+	if shouldJumpAtLiveWall(cmd, pLocal) then
+		return true
+	end
+
 	if isBotPathfollowing(cmd) then
-		return shouldLateJumpPathMode(pLocal)
+		local pathResult = shouldLateJumpPathMode(pLocal)
+		if not pathResult then
+			sjDebugThrottled(
+				"path_no_jump",
+				"path sim: no jump trigger (segments=%d)",
+				#buildWalkPolyline(pLocal:GetAbsOrigin())
+			)
+		end
+		return pathResult
+	end
+
+	if isManualOverride(cmd) then
+		sjDebugThrottled("manual_override", "skip: manual movement override")
+		return false
 	end
 
 	return shouldLateJumpManual(cmd, pLocal)
 end
 
 function SmartJump.Main(cmd)
-	if not G.Menu.SmartJump.Enable then
+	if not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
 		SJ.RequestEmergencyJump = false
@@ -8659,8 +8848,26 @@ function SmartJump.Main(cmd)
 	if SJ.jumpState == SJC.STATE_IDLE then
 		if onGround and (hasWishDir or shouldJump) then
 			if shouldJump or shouldLateJump(cmd, pLocal) then
+				sjDebugThrottled(
+					"jump_start",
+					"START jump state=%s wish=%s path=%s",
+					tostring(G.currentState),
+					tostring(G.BotIntendedWishDir ~= nil),
+					tostring(isBotPathfollowing(cmd))
+				)
 				SJ.jumpState = SJC.STATE_PREPARE_JUMP
+			else
+				sjDebugThrottled(
+					"idle_no_trigger",
+					"idle: no trigger onGround=%s hasWish=%s state=%s enabled=%s",
+					tostring(onGround),
+					tostring(hasWishDir),
+					tostring(G.currentState),
+					tostring(G.Menu.Main.EnableWalking)
+				)
 			end
+		else
+			sjDebugThrottled("idle_wait", "idle: wait onGround=%s hasWish=%s", tostring(onGround), tostring(hasWishDir))
 		end
 	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
@@ -8690,8 +8897,6 @@ function SmartJump.Main(cmd)
 
 		if shouldUnduck then
 			SJ.jumpState = SJC.STATE_DESCENDING
-		elseif onGround then
-			SJ.jumpState = SJC.STATE_IDLE
 		end
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
@@ -8727,6 +8932,11 @@ local function onDrawSmartJump()
 		return
 	end
 
+	local pLocal = entities.GetLocalPlayer()
+	if pLocal and pLocal:IsAlive() and isBotPathfollowing(nil) then
+		simulatePathPolyline(pLocal, false)
+	end
+
 	if G.SmartJump.PredPos then
 		local screenPos = client.WorldToScreen(G.SmartJump.PredPos)
 		if screenPos then
@@ -8742,6 +8952,26 @@ local function onDrawSmartJump()
 			if a and b then
 				draw.Color(0, 150, 255, 180)
 				draw.Line(a[1], a[2], b[1], b[2])
+			end
+		end
+	end
+
+	local origin = pLocal and pLocal:GetAbsOrigin()
+	if origin then
+		local corners = buildWalkPolyline(origin)
+		for i = 1, #corners do
+			local s = client.WorldToScreen(corners[i])
+			if s then
+				draw.Color(255, 200, 0, 200)
+				draw.FilledRect(s[1] - 3, s[2] - 3, s[1] + 3, s[2] + 3)
+			end
+			if i > 1 then
+				local a = client.WorldToScreen(corners[i - 1])
+				local b = s
+				if a and b then
+					draw.Color(255, 200, 0, 120)
+					draw.Line(a[1], a[2], b[1], b[2])
+				end
 			end
 		end
 	end
@@ -9316,11 +9546,11 @@ function GroundMovement.getMaxSpeed(player)
 end
 
 function GroundMovement.isOnGround(player)
-	if player and player.IsOnGround and player:IsOnGround() then
-		return true
+	if not player then
+		return false
 	end
-	local flags = player and player:GetPropInt("m_fFlags") or 0
-	return (flags & 1) ~= 0
+	local flags = player:GetPropInt("m_fFlags") or 0
+	return (flags & FL_ONGROUND) ~= 0
 end
 
 return GroundMovement
@@ -9384,7 +9614,6 @@ local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local Node = require("NavBot.Navigation.Node")
 local Constants = require("NavBot.Utils.Constants")
 local MovementController = require("NavBot.Bot.MovementController")
-local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
 local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
@@ -9562,6 +9791,11 @@ function MovementDecisions.checkStuckState()
 				end
 			end
 
+			-- Don't treat CTAP / jump ascent as stuck (velocity stays low on ground)
+			local sj = G.SmartJump
+			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+				G.Navigation.lowVelocityTicks = 0
+			else
 			-- Velocity-based stuck detection
 			local velocity = pLocal:EstimateAbsVelocity()
 			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
@@ -9574,7 +9808,7 @@ function MovementDecisions.checkStuckState()
 					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
 					if G.Navigation.lowVelocityTicks > 66 then
 						Log:Warn(
-							"STUCK: Low velocity (%d) for %d ticks, entering STUCK state",
+							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
 							speed2D,
 							G.Navigation.lowVelocityTicks
 						)
@@ -9584,6 +9818,7 @@ function MovementDecisions.checkStuckState()
 				else
 					G.Navigation.lowVelocityTicks = 0
 				end
+			end
 			end
 		end
 	end
@@ -9620,11 +9855,6 @@ function MovementDecisions.handleDebugLogging()
 	end
 end
 
--- Decision: Handle SmartJump execution
-function MovementDecisions.handleSmartJump(userCmd)
-	SmartJump.Main(userCmd)
-end
-
 -- Movement Execution: Always called at the end
 function MovementDecisions.executeMovement(userCmd)
 	local targetPos = MovementDecisions.getCurrentTarget()
@@ -9642,47 +9872,48 @@ function MovementDecisions.executeMovement(userCmd)
 	end
 end
 
+--- Set G.BotIntendedWishDir from current path target (SmartJump reads this same tick).
+---@return Vector3|nil targetPos
+function MovementDecisions.updateWalkIntent(_userCmd)
+	local targetPos = MovementDecisions.getCurrentTarget()
+	G.BotIntendedWishDir = nil
+	G.BotIsMoving = false
+
+	if not (targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity) then
+		return targetPos
+	end
+
+	local LocalOrigin = G.pLocal.Origin
+	local direction = targetPos - LocalOrigin
+	direction.z = 0
+	if direction:Length2D() > 0 then
+		G.BotMovementDirection = Common.Normalize(direction)
+	else
+		G.BotMovementDirection = Vector3(0, 0, 0)
+	end
+
+	local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
+	if wishdir then
+		G.BotIntendedWishDir = wishdir
+		G.BotIsMoving = true
+	end
+	G.Navigation.currentTargetPos = targetPos
+	return targetPos
+end
+
 -- Main composition function: Run all decisions then always execute movement
 function MovementDecisions.handleMovingState(userCmd)
-	-- Early validation
 	if not G.Navigation.path or #G.Navigation.path == 0 then
 		Log:Warn("No path available, returning to IDLE state")
 		G.currentState = G.States.IDLE
 		return
 	end
 
-	local targetPos = MovementDecisions.getCurrentTarget()
-	G.BotIntendedWishDir = nil
-	G.BotIsMoving = false
-
-	if targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity then
-		local LocalOrigin = G.pLocal.Origin
-		local direction = targetPos - LocalOrigin
-		direction.z = 0
-		if direction:Length2D() > 0 then
-			G.BotMovementDirection = Common.Normalize(direction)
-		else
-			G.BotMovementDirection = Vector3(0, 0, 0)
-		end
-
-		-- PID / walk simulation intent toward steering point (portal), not area center
-		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
-		if wishdir then
-			G.BotIntendedWishDir = wishdir
-			G.BotIsMoving = true
-		end
-		G.Navigation.currentTargetPos = targetPos
-	end
-
+	local targetPos = MovementDecisions.updateWalkIntent(userCmd)
 	MovementController.handleCameraRotation(userCmd, targetPos)
-
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
-
-	-- SmartJump uses intended wishdir before walkTo writes cmd
-	MovementDecisions.handleSmartJump(userCmd)
-
 	MovementDecisions.executeMovement(userCmd)
 end
 
@@ -9817,7 +10048,12 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	if isDoorNode(path[1]) or isDoorNode(path[2]) or isDoorNode(skipTarget) then
-		Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		G.__lastForwardSkipDoorLogTick = G.__lastForwardSkipDoorLogTick or 0
+		local now = globals.TickCount()
+		if now - G.__lastForwardSkipDoorLogTick > 66 then
+			G.__lastForwardSkipDoorLogTick = now
+			Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		end
 		return false
 	end
 
@@ -11535,6 +11771,11 @@ function StateHandler.handleStuckState(userCmd)
 			local speed2D = 0
 			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
 				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
+			end
+
+			local sj = G.SmartJump
+			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+				return
 			end
 
 			-- MAIN TRIGGER: Velocity < 50 = STUCK

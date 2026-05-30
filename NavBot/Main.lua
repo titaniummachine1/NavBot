@@ -100,16 +100,27 @@ local function onCreateMove(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
 	elseif G.currentState == G.States.STUCK then
-		-- Only run stuck logic if walking is enabled (manual override mode = no stuck logic)
 		if G.Menu.Main.EnableWalking then
+			if G.Navigation.path and #G.Navigation.path > 0 then
+				MovementDecisions.updateWalkIntent(userCmd)
+				MovementDecisions.executeMovement(userCmd)
+			end
 			StateHandler.handleStuckState(userCmd)
 		else
-			-- Manual mode: just transition back to MOVING, skipping still works
 			G.currentState = G.States.MOVING
 		end
 	end
 
-	-- Work management
+	-- SmartJump runs last so duck/jump buttons are not overwritten by walkTo
+	if G.Menu.Main.Enable and G.Menu.SmartJump and G.Menu.SmartJump.Enable then
+		local shouldRunJump = G.currentState == G.States.MOVING
+			or G.currentState == G.States.FOLLOWING
+			or G.currentState == G.States.STUCK
+		if shouldRunJump then
+			SmartJump.Main(userCmd)
+		end
+	end
+
 	WorkManager.processWorks()
 end
 
@@ -298,7 +309,7 @@ callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")
 callbacks.Unregister("Draw", "NavBot.ProfilerDraw")
 
-callbacks.Register("CreateMove", "ZNavBot.CreateMove", onCreateMove) -- Z prefix ensures it runs after SmartJump
+callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed

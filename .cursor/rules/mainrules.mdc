@@ -57,7 +57,7 @@ This project values simplicity, readability, and consistency above strict adhere
 
 21. **Lmaobox API via MCP (required):** Before any Lmaobox/TF2 API use, call **`user-lmaobox-context`**: `smart_search` to find symbols, then `get_smart_context` for full docs. See `.cursor/rules/lmaobox-mcp.mdc`. Fallback: `lmaobox_lua_documentation.md` in repo root only if MCP is down.
 
-22. **Correct Bitwise Flag Checking:** When checking player state flags using raw integers (like `m_fFlags`), **use the bitwise AND operator (`&`) combined with the documented global flag constant**. The correct check is `(flags & FLAG_CONSTANT) ~= 0`. **Do NOT** compare the result to `1` (e.g., `flags & FLAG_CONSTANT == 1`), as this is often incorrect. Ensure the `FLAG_CONSTANT` (e.g., `FL_ONGROUND`, `FL_DUCKING`) is the correct, documented global constant for the flag you are checking (Refer to Rule #21). Using dedicated API functions (e.g., `player:IsOnGround()`) is an acceptable alternative, especially if the flag constant is not readily documented or the function enhances clarity.
+22. **Correct Bitwise Flag Checking:** When checking player state flags using raw integers (like `m_fFlags`), **use the bitwise AND operator (`&`) combined with the documented global flag constant**. The correct check is `(flags & FLAG_CONSTANT) ~= 0`. **Do NOT** compare the result to `1` (e.g., `flags & FLAG_CONSTANT == 1`), as this is often incorrect. Ensure the `FLAG_CONSTANT` (e.g., `FL_ONGROUND`, `FL_DUCKING`) is the correct, documented global constant for the flag you are checking (Refer to Rule #21). **Do not use `player:IsOnGround()`** — it is not a valid Lmaobox API; use `m_fFlags` only.
 
 ---
 

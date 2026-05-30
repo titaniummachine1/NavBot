@@ -11,7 +11,6 @@ local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local Node = require("NavBot.Navigation.Node")
 local Constants = require("NavBot.Utils.Constants")
 local MovementController = require("NavBot.Bot.MovementController")
-local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
 local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
@@ -189,6 +188,11 @@ function MovementDecisions.checkStuckState()
 				end
 			end
 
+			-- Don't treat CTAP / jump ascent as stuck (velocity stays low on ground)
+			local sj = G.SmartJump
+			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+				G.Navigation.lowVelocityTicks = 0
+			else
 			-- Velocity-based stuck detection
 			local velocity = pLocal:EstimateAbsVelocity()
 			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
@@ -201,7 +205,7 @@ function MovementDecisions.checkStuckState()
 					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
 					if G.Navigation.lowVelocityTicks > 66 then
 						Log:Warn(
-							"STUCK: Low velocity (%d) for %d ticks, entering STUCK state",
+							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
 							speed2D,
 							G.Navigation.lowVelocityTicks
 						)
@@ -211,6 +215,7 @@ function MovementDecisions.checkStuckState()
 				else
 					G.Navigation.lowVelocityTicks = 0
 				end
+			end
 			end
 		end
 	end
@@ -247,11 +252,6 @@ function MovementDecisions.handleDebugLogging()
 	end
 end
 
--- Decision: Handle SmartJump execution
-function MovementDecisions.handleSmartJump(userCmd)
-	SmartJump.Main(userCmd)
-end
-
 -- Movement Execution: Always called at the end
 function MovementDecisions.executeMovement(userCmd)
 	local targetPos = MovementDecisions.getCurrentTarget()
@@ -269,47 +269,48 @@ function MovementDecisions.executeMovement(userCmd)
 	end
 end
 
+--- Set G.BotIntendedWishDir from current path target (SmartJump reads this same tick).
+---@return Vector3|nil targetPos
+function MovementDecisions.updateWalkIntent(_userCmd)
+	local targetPos = MovementDecisions.getCurrentTarget()
+	G.BotIntendedWishDir = nil
+	G.BotIsMoving = false
+
+	if not (targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity) then
+		return targetPos
+	end
+
+	local LocalOrigin = G.pLocal.Origin
+	local direction = targetPos - LocalOrigin
+	direction.z = 0
+	if direction:Length2D() > 0 then
+		G.BotMovementDirection = Common.Normalize(direction)
+	else
+		G.BotMovementDirection = Vector3(0, 0, 0)
+	end
+
+	local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
+	if wishdir then
+		G.BotIntendedWishDir = wishdir
+		G.BotIsMoving = true
+	end
+	G.Navigation.currentTargetPos = targetPos
+	return targetPos
+end
+
 -- Main composition function: Run all decisions then always execute movement
 function MovementDecisions.handleMovingState(userCmd)
-	-- Early validation
 	if not G.Navigation.path or #G.Navigation.path == 0 then
 		Log:Warn("No path available, returning to IDLE state")
 		G.currentState = G.States.IDLE
 		return
 	end
 
-	local targetPos = MovementDecisions.getCurrentTarget()
-	G.BotIntendedWishDir = nil
-	G.BotIsMoving = false
-
-	if targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity then
-		local LocalOrigin = G.pLocal.Origin
-		local direction = targetPos - LocalOrigin
-		direction.z = 0
-		if direction:Length2D() > 0 then
-			G.BotMovementDirection = Common.Normalize(direction)
-		else
-			G.BotMovementDirection = Vector3(0, 0, 0)
-		end
-
-		-- PID / walk simulation intent toward steering point (portal), not area center
-		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
-		if wishdir then
-			G.BotIntendedWishDir = wishdir
-			G.BotIsMoving = true
-		end
-		G.Navigation.currentTargetPos = targetPos
-	end
-
+	local targetPos = MovementDecisions.updateWalkIntent(userCmd)
 	MovementController.handleCameraRotation(userCmd, targetPos)
-
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
-
-	-- SmartJump uses intended wishdir before walkTo writes cmd
-	MovementDecisions.handleSmartJump(userCmd)
-
 	MovementDecisions.executeMovement(userCmd)
 end
 

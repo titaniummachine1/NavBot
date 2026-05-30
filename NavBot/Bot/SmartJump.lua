@@ -12,9 +12,33 @@ local SJC = G.SmartJump.Constants
 
 local MIN_STEP_HEIGHT = 18
 local MAX_CLEAR_HEIGHT = 72
-local MAX_PATH_SIM_TARGETS = 12
+local MAX_PATH_SIM_SEGMENTS = 16
+local MIN_POLY_POINT_DIST = 8
+local ARRIVAL_DIST = 1.5
 
 local SmartJump = {}
+
+local SJ_DEBUG_INTERVAL = 22
+
+local function sjDebugThrottled(key, msg, ...)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		if not (G.Menu.Visuals and G.Menu.Visuals.Debug_Mode) then
+			return
+		end
+		if not Common.Log.isModuleFilterEnabled("SmartJump") then
+			return
+		end
+	end
+
+	G.SmartJump._debugLast = G.SmartJump._debugLast or {}
+	local tick = globals.TickCount()
+	local last = G.SmartJump._debugLast[key] or 0
+	if tick - last < SJ_DEBUG_INTERVAL then
+		return
+	end
+	G.SmartJump._debugLast[key] = tick
+	Log:Debug(msg, ...)
+end
 
 local function getPlayerHitbox(player)
 	return { player:GetMins(), player:GetMaxs() }
@@ -33,7 +57,7 @@ end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return (pFlags & FL_ONGROUND) == FL_ONGROUND
+	return (pFlags & FL_ONGROUND) ~= 0
 end
 
 local function getTouchDistance()
@@ -78,79 +102,93 @@ local function isBotPathfollowing(cmd)
 	if isManualOverride(cmd) then
 		return false
 	end
-	if G.currentState ~= G.States.MOVING and G.currentState ~= G.States.FOLLOWING then
+	if
+		G.currentState ~= G.States.MOVING
+		and G.currentState ~= G.States.FOLLOWING
+		and G.currentState ~= G.States.STUCK
+	then
 		return false
 	end
 	return true
 end
 
 local function getManualWishDir(cmd)
-	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
-	if moveIntent:Length() < 1 then
+	local forward = cmd:GetForwardMove()
+	local side = cmd:GetSideMove()
+	if forward == 0 and side == 0 then
 		return nil
 	end
+	local moveIntent = Vector3(forward, -side, 0)
 	local viewAngles = engine.GetViewAngles()
 	return Common.Normalize(rotateMoveByView(moveIntent, viewAngles.yaw))
 end
 
-local function getPathNodeTarget(simPos, pathIndex)
-	local path = G.Navigation.path
-	local node = path and path[pathIndex]
-	if not node or not node.pos then
-		return nil
+local function getActiveWishDir(cmd)
+	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
+		return Common.Normalize(Vector3(G.BotIntendedWishDir.x, G.BotIntendedWishDir.y, 0))
 	end
-
-	local nextNode = path[pathIndex + 1]
-	if nextNode and not Node.IsDoorNode(node) then
-		return PathSteering.getSteeringPoint(simPos, node, nextNode) or node.pos
-	end
-
-	return node.pos
+	return getManualWishDir(cmd)
 end
 
---- Waypoints when active; otherwise path nodes (portal steering points).
-local function buildPathSimTargets(origin)
-	local targets = {}
+--- Fixed corner polyline the bot walks (no per-tick retarget noise).
+local function addPolyPoint(points, pos)
+	if not pos then
+		return
+	end
+	if #points > 0 then
+		if Common.Distance2D(points[#points], pos) < MIN_POLY_POINT_DIST then
+			return
+		end
+	end
+	points[#points + 1] = pos
+end
+
+local function buildWalkPolyline(origin)
+	local points = {}
 
 	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
 		local startIdx = G.Navigation.currentWaypointIndex or 1
 		for i = startIdx, #G.Navigation.waypoints do
 			local wp = G.Navigation.waypoints[i]
-			if wp and wp.pos then
-				targets[#targets + 1] = wp.pos
-			end
-			if #targets >= MAX_PATH_SIM_TARGETS then
-				return targets
+			addPolyPoint(points, wp and wp.pos)
+			if #points >= MAX_PATH_SIM_SEGMENTS then
+				return points
 			end
 		end
-		return targets
+		return points
 	end
 
 	local path = G.Navigation.path
-	if not path then
-		return targets
+	if not path or #path == 0 then
+		return points
 	end
 
-	local limit = math.min(#path, MAX_PATH_SIM_TARGETS)
-	for i = 1, limit do
-		local pt = getPathNodeTarget(origin, i)
-		if pt then
-			targets[#targets + 1] = pt
+	local n1, n2 = path[1], path[2]
+	if n1 and n1.pos then
+		if n2 and not Node.IsDoorNode(n1) then
+			addPolyPoint(points, PathSteering.getSteeringPoint(origin, n1, n2) or n1.pos)
+		else
+			addPolyPoint(points, n1.pos)
 		end
 	end
 
-	return targets
-end
+	for i = 2, #path do
+		local node = path[i]
+		local nextNode = path[i + 1]
+		if not node or not node.pos then
+			break
+		end
+		if nextNode and not Node.IsDoorNode(node) then
+			addPolyPoint(points, PathSteering.getSteeringPoint(node.pos, node, nextNode) or node.pos)
+		else
+			addPolyPoint(points, node.pos)
+		end
+		if #points >= MAX_PATH_SIM_SEGMENTS then
+			break
+		end
+	end
 
-local function refreshPathTarget(simPos, targets, targetIndex)
-	local pos = targets[targetIndex]
-	if not pos then
-		return nil
-	end
-	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
-		return pos
-	end
-	return getPathNodeTarget(simPos, targetIndex) or pos
+	return points
 end
 
 --- Up 72 → one tick forward step → down. Corners: slide forward then down with startsolid checks.
@@ -228,17 +266,56 @@ local function isNearPayload(position)
 	end
 
 	for _, payload in pairs(G.World.payloads) do
-		if payload:IsValid() then
+		if payload and payload:IsValid() then
 			local payloadPos = payload:GetAbsOrigin()
-			if (position - payloadPos):Length() < 200 then
-				return true
-			end
-			local groundPos = Vector3(payloadPos.x, payloadPos.y, payloadPos.z - 80)
-			if (position - groundPos):Length() < 150 then
+			if (position - payloadPos):Length() < 64 then
 				return true
 			end
 		end
 	end
+	return false
+end
+
+--- Real position + wishdir: wall in front with a clear ledge (doors/steps), not polyline-only.
+local function shouldJumpAtLiveWall(cmd, pLocal)
+	if not isPlayerOnGround(pLocal) then
+		return false
+	end
+
+	local wishDir = getActiveWishDir(cmd)
+	if not wishDir then
+		return false
+	end
+
+	local origin = pLocal:GetAbsOrigin()
+	if isNearPayload(origin) then
+		return false
+	end
+
+	local hitbox = getPlayerHitbox(pLocal)
+	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
+	local stepLen = math.max(oneTickStepLength(maxSpeed) * 2, 12)
+	local step = Vector3(0, 0, 18)
+	local hullMin, hullMax = hitbox[1], hitbox[2]
+
+	local groundTrace = engine.TraceHull(origin + step, origin, hullMin, hullMax, MASK_PLAYERSOLID)
+	local feet = groundTrace.endpos
+	local wallTrace = engine.TraceHull(feet + step, feet + step + wishDir * stepLen, hullMin, hullMax, MASK_PLAYERSOLID)
+
+	if wallTrace.fraction >= 0.99 then
+		sjDebugThrottled("live_no_wall", "live: no wall (frac=%.2f)", wallTrace.fraction)
+		return false
+	end
+
+	local clearNow, obstacleHeight = canClearObstacle(wallTrace.endpos, wishDir, hitbox, maxSpeed, wallTrace)
+	if clearNow then
+		G.SmartJump.PredPos = wallTrace.endpos
+		G.SmartJump.HitObstacle = true
+		sjDebugThrottled("live_jump", "live: jump OK lip=%.0f frac=%.2f", obstacleHeight or 0, wallTrace.fraction)
+		return true
+	end
+
+	sjDebugThrottled("live_blocked", "live: wall frac=%.2f but canClear=false", wallTrace.fraction)
 	return false
 end
 
@@ -271,26 +348,13 @@ local function tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, ma
 	return false
 end
 
-local function simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
-	local toTarget = Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0)
-	local dist = toTarget:Length2D()
-	if dist < 0.5 then
-		return simPos, simVel, false, nil
-	end
-
-	local wishDir = toTarget / dist
-	return GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
-end
-
---- Path mode: chain targets (current → next node …) until jump-peek ticks or obstacle.
-local function shouldLateJumpPathMode(pLocal)
+--- Same wishdir + hull step as MovementController.walkTo, along fixed polyline corners.
+---@param checkJump boolean When false, only fills SimulationPath (visualization).
+local function simulatePathPolyline(pLocal, checkJump)
 	local origin = pLocal:GetAbsOrigin()
-	if isNearPayload(origin) then
-		return false
-	end
-
-	local targets = buildPathSimTargets(origin)
-	if #targets == 0 then
+	local segments = buildWalkPolyline(origin)
+	if #segments == 0 then
+		G.SmartJump.SimulationPath = { origin }
 		return false
 	end
 
@@ -302,43 +366,73 @@ local function shouldLateJumpPathMode(pLocal)
 
 	local simPos = origin
 	local simVel = Vector3(0, 0, 0)
-	local targetIndex = 1
-	local targetPos = targets[targetIndex]
+	local segIndex = 1
+	local dest = segments[segIndex]
 
 	G.SmartJump.SimulationPath = { origin }
+	if not checkJump then
+		G.SmartJump.PredPos = nil
+		G.SmartJump.HitObstacle = false
+		G.SmartJump.JumpPeekPos = nil
+	end
 
 	for _ = 1, peakTicks do
-		if not targetPos then
+		if not dest then
 			break
 		end
 
-		local newPos, newVel, hitWall, wallTrace = simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
+		local horizSpeed = simVel:Length2D()
+		local coastTicks = GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
+		local wishDir = GroundMovement.computeWishDirToTarget(simPos, simVel, dest, coastTicks, true)
+
+		if not wishDir then
+			if Common.Distance2D(simPos, dest) <= math.max(touch, ARRIVAL_DIST) then
+				segIndex = segIndex + 1
+				dest = segments[segIndex]
+			end
+			if not dest then
+				break
+			end
+			wishDir = GroundMovement.computeWishDirToTarget(simPos, simVel, dest, coastTicks, true)
+		end
+
+		if not wishDir then
+			break
+		end
+
+		local newPos, newVel, hitWall, wallTrace =
+			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+
 		if not newPos then
 			break
 		end
 
 		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
-		local wishDir = Common.Normalize(Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0))
-		if wishDir then
-			if hitWall then
-				if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
-					return true
-				end
-				return false
+		if checkJump and hitWall then
+			if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
+				return true
 			end
+			return false
 		end
 
 		simPos = newPos
 		simVel = newVel
 
-		if Common.Distance2D(simPos, targetPos) <= touch then
-			targetIndex = targetIndex + 1
-			targetPos = refreshPathTarget(simPos, targets, targetIndex)
+		if Common.Distance2D(simPos, dest) <= touch then
+			segIndex = segIndex + 1
+			dest = segments[segIndex]
 		end
 	end
 
 	return false
+end
+
+local function shouldLateJumpPathMode(pLocal)
+	if isNearPayload(pLocal:GetAbsOrigin()) then
+		return false
+	end
+	return simulatePathPolyline(pLocal, true)
 end
 
 --- Manual / no path: single wishdir along cmd or bot intent.
@@ -364,12 +458,16 @@ local function shouldLateJumpManual(cmd, pLocal)
 	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
 
 	local simPos = origin
-	local simVel = Vector3(wishDir.x * maxSpeed, wishDir.y * maxSpeed, 0)
+	local simVel = Vector3(0, 0, 0)
+	local farDest = origin + wishDir * 512
 	G.SmartJump.SimulationPath = { origin }
 
 	for _ = 1, peakTicks + 4 do
+		local coastTicks = GroundMovement.getCoastTicks(simVel:Length2D(), maxSpeed)
+		local stepWish = GroundMovement.computeWishDirToTarget(simPos, simVel, farDest, coastTicks, true) or wishDir
+
 		local newPos, newVel, hitWall, wallTrace =
-			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+			GroundMovement.simulateGroundStepHull(simPos, simVel, stepWish, maxSpeed, hitbox[1], hitbox[2], true)
 
 		if not newPos then
 			break
@@ -378,7 +476,7 @@ local function shouldLateJumpManual(cmd, pLocal)
 		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
 		if hitWall then
-			if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
+			if tryLateJumpAtObstacle(simPos, newPos, newVel, stepWish, hitbox, maxSpeed, wallTrace) then
 				return true
 			end
 			return false
@@ -392,19 +490,40 @@ local function shouldLateJumpManual(cmd, pLocal)
 end
 
 local function shouldLateJump(cmd, pLocal)
-	if not pLocal or not isPlayerOnGround(pLocal) then
+	if not pLocal then
+		return false
+	end
+	if not isPlayerOnGround(pLocal) then
+		sjDebugThrottled("airborne", "skip: not on ground (state=%s)", tostring(SJ.jumpState))
 		return false
 	end
 
+	if shouldJumpAtLiveWall(cmd, pLocal) then
+		return true
+	end
+
 	if isBotPathfollowing(cmd) then
-		return shouldLateJumpPathMode(pLocal)
+		local pathResult = shouldLateJumpPathMode(pLocal)
+		if not pathResult then
+			sjDebugThrottled(
+				"path_no_jump",
+				"path sim: no jump trigger (segments=%d)",
+				#buildWalkPolyline(pLocal:GetAbsOrigin())
+			)
+		end
+		return pathResult
+	end
+
+	if isManualOverride(cmd) then
+		sjDebugThrottled("manual_override", "skip: manual movement override")
+		return false
 	end
 
 	return shouldLateJumpManual(cmd, pLocal)
 end
 
 function SmartJump.Main(cmd)
-	if not G.Menu.SmartJump.Enable then
+	if not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
 		SJ.RequestEmergencyJump = false
@@ -435,8 +554,26 @@ function SmartJump.Main(cmd)
 	if SJ.jumpState == SJC.STATE_IDLE then
 		if onGround and (hasWishDir or shouldJump) then
 			if shouldJump or shouldLateJump(cmd, pLocal) then
+				sjDebugThrottled(
+					"jump_start",
+					"START jump state=%s wish=%s path=%s",
+					tostring(G.currentState),
+					tostring(G.BotIntendedWishDir ~= nil),
+					tostring(isBotPathfollowing(cmd))
+				)
 				SJ.jumpState = SJC.STATE_PREPARE_JUMP
+			else
+				sjDebugThrottled(
+					"idle_no_trigger",
+					"idle: no trigger onGround=%s hasWish=%s state=%s enabled=%s",
+					tostring(onGround),
+					tostring(hasWishDir),
+					tostring(G.currentState),
+					tostring(G.Menu.Main.EnableWalking)
+				)
 			end
+		else
+			sjDebugThrottled("idle_wait", "idle: wait onGround=%s hasWish=%s", tostring(onGround), tostring(hasWishDir))
 		end
 	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
@@ -466,8 +603,6 @@ function SmartJump.Main(cmd)
 
 		if shouldUnduck then
 			SJ.jumpState = SJC.STATE_DESCENDING
-		elseif onGround then
-			SJ.jumpState = SJC.STATE_IDLE
 		end
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
@@ -503,6 +638,11 @@ local function onDrawSmartJump()
 		return
 	end
 
+	local pLocal = entities.GetLocalPlayer()
+	if pLocal and pLocal:IsAlive() and isBotPathfollowing(nil) then
+		simulatePathPolyline(pLocal, false)
+	end
+
 	if G.SmartJump.PredPos then
 		local screenPos = client.WorldToScreen(G.SmartJump.PredPos)
 		if screenPos then
@@ -518,6 +658,26 @@ local function onDrawSmartJump()
 			if a and b then
 				draw.Color(0, 150, 255, 180)
 				draw.Line(a[1], a[2], b[1], b[2])
+			end
+		end
+	end
+
+	local origin = pLocal and pLocal:GetAbsOrigin()
+	if origin then
+		local corners = buildWalkPolyline(origin)
+		for i = 1, #corners do
+			local s = client.WorldToScreen(corners[i])
+			if s then
+				draw.Color(255, 200, 0, 200)
+				draw.FilledRect(s[1] - 3, s[2] - 3, s[1] + 3, s[2] + 3)
+			end
+			if i > 1 then
+				local a = client.WorldToScreen(corners[i - 1])
+				local b = s
+				if a and b then
+					draw.Color(255, 200, 0, 120)
+					draw.Line(a[1], a[2], b[1], b[2])
+				end
 			end
 		end
 	end

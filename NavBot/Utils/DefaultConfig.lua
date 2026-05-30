@@ -51,6 +51,7 @@ local Default_Config = {
 		OptimizedISWalkableTest = false,
 		IsNavigableTest = false,
 		Debug_Mode = false,
+		LogModuleFilter = "SmartJump",
 	},
 
 	Movement = {

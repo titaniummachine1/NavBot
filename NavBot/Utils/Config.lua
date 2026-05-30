@@ -25,19 +25,25 @@ function Config.GetFilePath()
 	return fullPath .. "/config.cfg"
 end
 
-local function checkAllKeysExist(expectedMenu, loadedMenu)
+--- Fill missing keys from defaults (keeps user values for existing keys).
+local function mergeDefaults(expectedMenu, loadedMenu)
+	local didMerge = false
 	for key, value in pairs(expectedMenu) do
 		if loadedMenu[key] == nil then
-			return false
-		end
-		if type(value) == "table" then
-			local result = checkAllKeysExist(value, loadedMenu[key])
-			if not result then
-				return false
+			if type(value) == "table" then
+				loadedMenu[key] = {}
+				mergeDefaults(value, loadedMenu[key])
+			else
+				loadedMenu[key] = value
+			end
+			didMerge = true
+		elseif type(value) == "table" and type(loadedMenu[key]) == "table" then
+			if mergeDefaults(value, loadedMenu[key]) then
+				didMerge = true
 			end
 		end
 	end
-	return true
+	return didMerge
 end
 
 --[[ Configuration Functions ]]
@@ -67,11 +73,12 @@ function Config.LoadCFG()
 		local content = file:read("*a")
 		file:close()
 		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
-		if
-			type(loadedCfg) == "table"
-			and checkAllKeysExist(Default_Config, loadedCfg)
-			and not input.IsButtonDown(KEY_LSHIFT)
-		then
+		if type(loadedCfg) == "table" and not input.IsButtonDown(KEY_LSHIFT) then
+			local merged = mergeDefaults(Default_Config, loadedCfg)
+			if merged then
+				printc(255, 200, 0, 255, "Config updated with new defaults; saving.")
+				Config.CreateCFG(loadedCfg)
+			end
 			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
 			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
 			G.Menu = loadedCfg

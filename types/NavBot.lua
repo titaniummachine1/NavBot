@@ -3,7 +3,7 @@
 
 ---@class NavMenuSmartJump
 ---@field Enable boolean
----@field Debug boolean
+---@field Debug boolean SmartJump-only logs without global debug
 
 ---@class NavMenuMain
 ---@field Enable boolean
@@ -40,6 +40,7 @@
 ---@field OptimizedISWalkableTest boolean
 ---@field IsNavigableTest boolean
 ---@field Debug_Mode boolean
+---@field LogModuleFilter string
 
 ---@class NavMenuMovement
 ---@field lookatpath boolean

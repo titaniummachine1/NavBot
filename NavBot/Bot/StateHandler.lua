@@ -247,6 +247,11 @@ function StateHandler.handleStuckState(userCmd)
 				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
 			end
 
+			local sj = G.SmartJump
+			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+				return
+			end
+
 			-- MAIN TRIGGER: Velocity < 50 = STUCK
 			if speed2D < 50 then
 				Log:Warn("STUCK DETECTED: velocity " .. tostring(speed2D) .. " < 50 - adding penalties and repathing")
