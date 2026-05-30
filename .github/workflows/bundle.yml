@@ -1,4 +1,4 @@
-name: Auto Release
+name: Bundle NavBot
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  release:
+  bundle:
     runs-on: ubuntu-latest
     
     steps:
@@ -76,27 +76,25 @@ jobs:
       run: |
         node bundle.js
         
-    - name: Create release
-      uses: softprops/action-gh-release@v1
+    - name: Upload NavBot.lua
+      uses: actions/upload-artifact@v3
       with:
-        tag_name: v${{ steps.version.outputs.version }}
-        name: NavBot v${{ steps.version.outputs.version }}
-        body: |
-          ## NavBot v${{ steps.version.outputs.version }}
-          
-          **Changes:** ${{ github.event.head_commit.message }}
-          
-          **Version bump:** ${{ steps.version.outputs.bump_type }}
-          
-          ### Installation
-          1. Download `NavBot.lua` from the assets below
-          2. Place in your LMAOBox Lua folder
-          3. Load in LMAOBox
-          
-          **Commit:** [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-        files: |
-          NavBot.lua
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: NavBot-v${{ steps.version.outputs.version }}
+        path: NavBot.lua
+        retention-days: 30
+        
+    - name: Create simple release notes
+      run: |
+        echo "## NavBot v${{ steps.version.outputs.version }}" > release_notes.md
+        echo "" >> release_notes.md
+        echo "**Changes:** ${{ github.event.head_commit.message }}" >> release_notes.md
+        echo "**Version bump:** ${{ steps.version.outputs.bump_type }}" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "Download NavBot.lua from the artifacts section above." >> release_notes.md
+        
+    - name: Upload release notes
+      uses: actions/upload-artifact@v3
+      with:
+        name: Release-Notes-v${{ steps.version.outputs.version }}
+        path: release_notes.md
+        retention-days: 30
