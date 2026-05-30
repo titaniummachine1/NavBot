@@ -1,8 +1,10 @@
 --##########################################################################
---  Phase3_KDTree.lua  ·  Build spatial index for fast nearest-neighbor queries
+--  Phase3_KDTree.lua  ·  Spatial index: XY KD-tree + area grid
 --##########################################################################
 
 local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local Phase3_KDTree = {}
 
@@ -12,11 +14,23 @@ local Log = Common.Log.new("Phase3_KDTree")
 --  LOCAL HELPERS
 --##########################################################################
 
--- Simple 3D KD-tree implementation for fast nearest-neighbor search
--- Builds from nodes in G.Navigation.nodes (called after basic setup complete)
+local function getSplitCoord(point, axis)
+	local node = point.node
+	if node and node._minX then
+		return (node._minX + node._maxX) * 0.5
+	end
+	return point.pos.x
+end
+
+local function getSplitCoordY(point)
+	local node = point.node
+	if node and node._minY then
+		return (node._minY + node._maxY) * 0.5
+	end
+	return point.pos.y
+end
 
 local function buildKDTree(nodes)
-	-- Collect all non-door nodes into array
 	local points = {}
 	for id, node in pairs(nodes) do
 		if not node.isDoor and node.pos then
@@ -33,25 +47,25 @@ local function buildKDTree(nodes)
 		return nil
 	end
 
-	-- Build tree recursively
 	local function build(pointList, depth)
 		if #pointList == 0 then
 			return nil
 		end
 
-		-- Axis cycling: 0=x, 1=y, 2=z
-		local axis = depth % 3
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
+		-- XY only — nav areas are ground partitions; Z handled by containment
+		local axis = depth % 2
 
-		-- Sort by current axis
 		table.sort(pointList, function(a, b)
-			return a.pos[axisName] < b.pos[axisName]
+			if axis == 0 then
+				return getSplitCoord(a, axis) < getSplitCoord(b, axis)
+			end
+			return getSplitCoordY(a) < getSplitCoordY(b)
 		end)
 
 		local medianIdx = math.floor(#pointList / 2) + 1
 		local median = pointList[medianIdx]
+		local splitValue = axis == 0 and getSplitCoord(median, axis) or getSplitCoordY(median)
 
-		-- Split into left/right
 		local leftPoints = {}
 		local rightPoints = {}
 		for i = 1, #pointList do
@@ -65,6 +79,7 @@ local function buildKDTree(nodes)
 		return {
 			point = median,
 			axis = axis,
+			split = splitValue,
 			left = build(leftPoints, depth + 1),
 			right = build(rightPoints, depth + 1),
 		}
@@ -73,19 +88,34 @@ local function buildKDTree(nodes)
 	return build(points, 0)
 end
 
+local function distSqForPoint(pos, point)
+	return AreaSpatial.DistSqPointToAABB(pos, point.node)
+end
+
 --##########################################################################
 --  PUBLIC API
 --##########################################################################
 
---- Build KD-tree spatial index for all area nodes
---- Called after basic setup (nodes in global) but before door generation
---- @return table KD-tree root node
+function Phase3_KDTree.DistSqPointToAABB(pos, node)
+	return AreaSpatial.DistSqPointToAABB(pos, node)
+end
+
+--- Build KD-tree and XY area grid for spatial queries
+--- @param nodes table
+--- @return table|nil tree
 function Phase3_KDTree.Execute(nodes)
 	assert(type(nodes) == "table", "Phase3_KDTree.Execute: nodes must be table")
 
-	Log:Info("Building KD-tree spatial index")
+	Log:Info("Building spatial indexes (KD-tree + area grid)")
 
 	local tree = buildKDTree(nodes)
+	local grid = AreaSpatial.BuildGrid(nodes)
+
+	if grid then
+		G.Navigation.areaGrid = grid
+		Log:Info("Area grid: %d cells", grid._cellCount or 0)
+	end
+
 	if tree then
 		Log:Info("Phase 3 complete: KD-tree built")
 	else
@@ -95,10 +125,7 @@ function Phase3_KDTree.Execute(nodes)
 	return tree
 end
 
---- Find nearest neighbor using KD-tree
---- @param tree table KD-tree root
---- @param pos Vector3 query position
---- @return table|nil nearest point {pos, id, node}
+--- Find nearest area by point-to-AABB distance (not center distance).
 function Phase3_KDTree.FindNearest(tree, pos)
 	if not tree or not pos then
 		return nil
@@ -107,22 +134,22 @@ function Phase3_KDTree.FindNearest(tree, pos)
 	local bestDistSq = math.huge
 	local best = nil
 
-	local function search(node, depth)
+	local function search(node)
 		if not node then
 			return
 		end
 
-		local axis = node.axis
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
-		local diff = pos[axisName] - node.point.pos[axisName]
-		local distSq = (node.point.pos - pos):LengthSqr()
-
+		local distSq = distSqForPoint(pos, node.point)
 		if distSq < bestDistSq then
 			bestDistSq = distSq
 			best = node.point
 		end
 
-		-- Choose branch
+		local diff = pos.x - node.split
+		if node.axis == 1 then
+			diff = pos.y - node.split
+		end
+
 		local first, second
 		if diff < 0 then
 			first, second = node.left, node.right
@@ -130,38 +157,30 @@ function Phase3_KDTree.FindNearest(tree, pos)
 			first, second = node.right, node.left
 		end
 
-		search(first, depth + 1)
+		search(first)
 
-		-- Check if we need to search other side
 		if diff * diff < bestDistSq then
-			search(second, depth + 1)
+			search(second)
 		end
 	end
 
-	search(tree, 0)
+	search(tree)
 	return best
 end
 
---- Find K nearest neighbors using KD-tree
---- @param tree table KD-tree root
---- @param pos Vector3 query position
---- @param k number maximum number of neighbors to find
---- @return table array of nearest points {pos, id, node}, sorted by distance
+--- Find K nearest areas ranked by point-to-AABB distance.
 function Phase3_KDTree.FindKNearest(tree, pos, k)
 	if not tree or not pos or k <= 0 then
 		return {}
 	end
 
-	-- Max-heap to track K best candidates (farthest at top for easy eviction)
 	local candidates = {}
 	local count = 0
 
 	local function addCandidate(point, distSq)
 		if count < k then
-			-- Add to heap
 			count = count + 1
 			candidates[count] = { point = point, distSq = distSq }
-			-- Bubble up to maintain max-heap property
 			local i = count
 			while i > 1 do
 				local parent = math.floor(i / 2)
@@ -172,9 +191,7 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 				i = parent
 			end
 		elseif distSq < candidates[1].distSq then
-			-- Replace farthest
 			candidates[1] = { point = point, distSq = distSq }
-			-- Heapify down
 			local i = 1
 			while true do
 				local left = i * 2
@@ -196,19 +213,18 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 		end
 	end
 
-	local function search(node, depth)
+	local function search(node)
 		if not node then
 			return
 		end
 
-		local axis = node.axis
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
-		local diff = pos[axisName] - node.point.pos[axisName]
-		local distSq = (node.point.pos - pos):LengthSqr()
+		addCandidate(node.point, distSqForPoint(pos, node.point))
 
-		addCandidate(node.point, distSq)
+		local diff = pos.x - node.split
+		if node.axis == 1 then
+			diff = pos.y - node.split
+		end
 
-		-- Choose branch
 		local first, second
 		if diff < 0 then
 			first, second = node.left, node.right
@@ -216,24 +232,20 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 			first, second = node.right, node.left
 		end
 
-		search(first, depth + 1)
+		search(first)
 
-		-- Check if we need to search other side
-		-- Search other side if: (1) we don't have K candidates yet, or (2) hyperplane could have closer points
 		local worstDistSq = count > 0 and candidates[1].distSq or math.huge
 		if diff * diff < worstDistSq then
-			search(second, depth + 1)
+			search(second)
 		end
 	end
 
-	search(tree, 0)
+	search(tree)
 
-	-- Sort by distance (ascending) for return
 	table.sort(candidates, function(a, b)
 		return a.distSq < b.distSq
 	end)
 
-	-- Return just the points
 	local result = {}
 	for i = 1, count do
 		result[i] = candidates[i].point

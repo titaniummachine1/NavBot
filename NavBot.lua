@@ -331,7 +331,7 @@ end
 
 --[[ Initialization ]]
 
--- Ensure SmartJump callback runs BEFORE NavBot's callback
+callbacks.Unregister("CreateMove", "SmartJump.Standalone")
 callbacks.Unregister("CreateMove", "ZNavBot.CreateMove")
 callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")
@@ -729,6 +729,8 @@ G.Navigation = {
 	goalPos = nil, -- Current goal world position
 	goalNodeId = nil, -- Closest node to the goal position
 	navMeshUpdated = false, -- Set when navmesh is rebuilt
+	kdTree = nil, -- XY KD-tree (AABB-distance queries)
+	areaGrid = nil, -- Uniform grid for exact area-at-position lookup
 	-- Node skipping system
 	lastSkipCheckTick = 0, -- Last tick when we performed skip check
 	nextNodeCloser = false, -- Flag indicating if next node is closer
@@ -748,7 +750,7 @@ G.SmartJump = G.SmartJump
 			GRAVITY = 800, -- Gravity per second squared
 			JUMP_FORCE = 271, -- Initial vertical boost for a duck jump
 			MAX_JUMP_HEIGHT = Vector3(0, 0, 72), -- Maximum jump height vector
-			MAX_WALKABLE_ANGLE = 45, -- Maximum angle considered walkable
+			MAX_WALKABLE_ANGLE = 55, -- Maximum angle considered walkable (trace landing)
 
 			-- State definitions
 			STATE_IDLE = "STATE_IDLE",
@@ -780,7 +782,8 @@ G.SmartJump = G.SmartJump
 
 -- Bot movement tracking (for SmartJump integration)
 G.BotIsMoving = false -- Track if bot is actively moving
-G.BotMovementDirection = Vector3(0, 0, 0) -- Bot's intended movement direction
+G.BotMovementDirection = Vector3(0, 0, 0) -- Horizontal direction toward current nav target
+G.BotIntendedWishDir = nil -- World wishdir from walk simulation (before cmd is written)
 
 -- Memory management and cache tracking
 G.Cache = {
@@ -3564,6 +3567,7 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local SetupOrchestrator = require("NavBot.Navigation.Setup.SetupOrchestrator")
 local Phase3_KDTree = require("NavBot.Navigation.Setup.Phase3_KDTree")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
 local ConnectionBuilder = require("NavBot.Navigation.ConnectionBuilder")
 
@@ -3610,51 +3614,70 @@ function Node.GetNodeByID(id)
 	return G.Navigation.nodes and G.Navigation.nodes[id] or nil
 end
 
--- Height check: calculate relative height using node normal (for stairs/slopes)
--- Get Z at position on node's plane, then check height difference
-local function getZOnPlane(px, py, nw, ne, sw)
-	local v1 = ne - nw
-	local v2 = sw - nw
-	local normal = Common.Cross(v1, v2)
-	if normal.z == 0 then
-		return nw.z
+-- When multiple areas overlap (stairs), pick closest floor height
+local function pickBestContainingArea(pos, candidates)
+	local bestNode, bestZErr = nil, math.huge
+
+	for i = 1, #candidates do
+		local node = candidates[i]
+		if not node.isDoor and AreaSpatial.IsWithinArea(pos, node) then
+			local floorZ = node._floorZ or node.pos.z
+			local zErr = math.abs(pos.z - floorZ)
+			if zErr < bestZErr then
+				bestZErr = zErr
+				bestNode = node
+			end
+		end
 	end
-	return nw.z - (normal.x * (px - nw.x) + normal.y * (py - nw.y)) / normal.z
+
+	return bestNode
 end
 
--- Check if position is within area's horizontal bounds (X/Y) with height limit
--- Uses precomputed bounds from Phase2_Normalize for speed
-local function isWithinAreaBounds(pos, node)
-	if not node._minX or not node.pos then
-		return false
-	end
-
-	-- Fast horizontal bounds check using precomputed values (>= for border inclusion)
-	local inHorizontalBounds = pos.x >= node._minX
-		and pos.x <= node._maxX
-		and pos.y >= node._minY
-		and pos.y <= node._maxY
-	if not inHorizontalBounds then
-		return false
-	end
-
-	local groundZ = getZOnPlane(pos.x, pos.y, node.nw, node.ne, node.sw)
-	local heightAbovePlane = pos.z - groundZ
-
-	-- Allow up to 72 units above plane, up to 5 units below plane
-	if heightAbovePlane > 72 or heightAbovePlane < -5 then
-		return false
-	end
-
-	return true
-end
-
-function Node.GetClosestNode(pos)
-	if not G.Navigation.nodes then
+--- Exact area at pos, or nil if not inside any area (never guesses nearest).
+function Node.GetAreaAtPosition(pos)
+	if not G.Navigation.nodes or not pos then
 		return nil
 	end
 
-	-- Pure KD-tree search for maximum speed - just return closest by center
+	local grid = G.Navigation.areaGrid
+	if not grid then
+		return nil
+	end
+
+	return pickBestContainingArea(pos, AreaSpatial.QueryGridCell(grid, pos))
+end
+
+--- Nearest area by AABB distance (for path start/goal when off-mesh). Not for "where am I".
+function Node.GetClosestNode(pos)
+	if not G.Navigation.nodes or not pos then
+		return nil
+	end
+
+	local grid = G.Navigation.areaGrid
+	if grid then
+		local cellCandidates = AreaSpatial.QueryGridCell(grid, pos)
+		local contained = pickBestContainingArea(pos, cellCandidates)
+		if contained then
+			return contained
+		end
+
+		local fromCell = AreaSpatial.FindNearestInList(pos, cellCandidates)
+		if fromCell then
+			return fromCell
+		end
+
+		local neighborCandidates = AreaSpatial.QueryGridNeighbors(grid, pos)
+		contained = pickBestContainingArea(pos, neighborCandidates)
+		if contained then
+			return contained
+		end
+
+		local fromNeighbors = AreaSpatial.FindNearestInList(pos, neighborCandidates)
+		if fromNeighbors then
+			return fromNeighbors
+		end
+	end
+
 	if G.Navigation.kdTree then
 		local nearest = Phase3_KDTree.FindNearest(G.Navigation.kdTree, pos)
 		if nearest then
@@ -3662,81 +3685,7 @@ function Node.GetClosestNode(pos)
 		end
 	end
 
-	-- Fallback: Brute force scan
-	local closestNode, closestDist = nil, math.huge
-	for _, node in pairs(G.Navigation.nodes) do
-		if not node.isDoor then
-			local dist = (node.pos - pos):Length()
-			if dist < closestDist then
-				closestNode, closestDist = node, dist
-			end
-		end
-	end
-
-	return closestNode
-end
-
--- Get minimum distance from position to area (checks center + all 4 corners)
-local function getMinDistanceToArea(pos, node)
-	if not node.pos or not node.nw or not node.ne or not node.sw or not node.se then
-		return math.huge
-	end
-
-	-- Calculate distance to center + all 4 corners
-	local distCenter = (node.pos - pos):Length()
-	local distNW = (node.nw - pos):Length()
-	local distNE = (node.ne - pos):Length()
-	local distSW = (node.sw - pos):Length()
-	local distSE = (node.se - pos):Length()
-
-	-- Return minimum distance
-	return math.min(distCenter, distNW, distNE, distSW, distSE)
-end
-
--- Get area at position - accurate containment check
--- Uses KD-tree to find nearest candidates, checks up to 10 for containment
-function Node.GetAreaAtPosition(pos)
-	if not G.Navigation.nodes then
-		return nil
-	end
-
-	-- Use KD-tree for efficient nearest neighbor search
-	if G.Navigation.kdTree then
-		-- Get 10 nearest candidates by center distance
-		local nearest = Phase3_KDTree.FindKNearest(G.Navigation.kdTree, pos, 10)
-
-		-- Check each candidate for containment using precomputed bounds
-		for _, candidate in ipairs(nearest) do
-			if isWithinAreaBounds(pos, candidate.node) then
-				Log:Debug("GetAreaAtPosition: Found containing area %s", candidate.id)
-				return candidate.node
-			end
-		end
-
-		-- No containing area found in top 10, return closest by center
-		if nearest[1] then
-			Log:Debug("GetAreaAtPosition: No containing area in top 10, using closest %s", nearest[1].id)
-			return nearest[1].node
-		end
-	end
-
-	-- Fallback: Brute force scan with multi-point distance
-	local closestNode, closestMinDist = nil, math.huge
-	for _, node in pairs(G.Navigation.nodes) do
-		if not node.isDoor then
-			-- Check containment first
-			if isWithinAreaBounds(pos, node) then
-				return node
-			end
-			-- Track closest for fallback
-			local minDist = getMinDistanceToArea(pos, node)
-			if minDist < closestMinDist then
-				closestNode, closestMinDist = node, minDist
-			end
-		end
-	end
-
-	return closestNode
+	return nil
 end
 
 -- Connection utilities
@@ -3810,7 +3759,6 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 				local targetNode = nodes[targetId]
 
 				if targetNode then
-					-- Simple adjacency - just return connected nodes
 					local cost = (node.pos - targetNode.pos):Length()
 					table.insert(neighbors, {
 						node = targetNode,
@@ -3824,7 +3772,6 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 	return neighbors
 end
 
--- Optimized version for when only nodes are needed (no cost data)
 function Node.GetAdjacentNodesOnly(node, nodes)
 	if not node or not node.c or not nodes then
 		return {}
@@ -3833,7 +3780,6 @@ function Node.GetAdjacentNodesOnly(node, nodes)
 	local adjacent = {}
 	local count = 0
 
-	-- FIX: Use pairs() for named directional keys, not ipairs()
 	for _, dir in pairs(node.c) do
 		local connections = dir.connections
 		if connections then
@@ -3850,8 +3796,6 @@ function Node.GetAdjacentNodesOnly(node, nodes)
 
 	return adjacent
 end
-
--- CleanupConnections removed - AccessibilityChecker was disabled (used area centers, not edges)
 
 function Node.NormalizeConnections()
 	ConnectionBuilder.NormalizeConnections()
@@ -4743,12 +4687,214 @@ end
 return ConnectionUtils
 
 end)
+__bundle_register("NavBot.Navigation.AreaSpatial", function(require, _LOADED, __bundle_register, __bundle_modules)
+--##########################################################################
+--  AreaSpatial.lua  ·  AABB distance, containment, and grid indexing
+--##########################################################################
+--
+--  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps only tilt
+--  the floor plane. Containment = horizontal AABB + vertical band above floor.
+
+local AreaSpatial = {}
+
+local GRID_CELL_SIZE = 256
+
+-- Upright player slack relative to area floor (matches G.Misc.NodeTouchHeight ≈ 82)
+AreaSpatial.Z_PAD_BELOW = 8
+AreaSpatial.Z_PAD_ABOVE = 82
+
+local Z_PAD_BELOW = AreaSpatial.Z_PAD_BELOW
+local Z_PAD_ABOVE = AreaSpatial.Z_PAD_ABOVE
+
+--- Precompute floor Z and vertical query band on a normalized node.
+function AreaSpatial.PrecomputeVerticalBounds(node)
+	if not node.nw then
+		return
+	end
+
+	local floorZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	node._floorZ = floorZ
+	node._minZ = floorZ - Z_PAD_BELOW
+	node._maxZ = floorZ + Z_PAD_ABOVE
+end
+
+--- Horizontal axis-aligned footprint + vertical band (82 up, 8 down from floor).
+function AreaSpatial.IsWithinArea(pos, node)
+	if not node or not node._minX then
+		return false
+	end
+
+	if pos.x < node._minX or pos.x > node._maxX then
+		return false
+	end
+	if pos.y < node._minY or pos.y > node._maxY then
+		return false
+	end
+
+	local floorZ = node._floorZ
+	if not floorZ then
+		return true
+	end
+
+	local heightAboveFloor = pos.z - floorZ
+	return heightAboveFloor <= Z_PAD_ABOVE and heightAboveFloor >= -Z_PAD_BELOW
+end
+
+--- Squared distance from a point to the XY footprint + Z query band (0 if inside).
+function AreaSpatial.DistSqPointToAABB(pos, node)
+	if not node or not node._minX then
+		return math.huge
+	end
+
+	local dx, dy, dz = 0, 0, 0
+	if pos.x < node._minX then
+		dx = node._minX - pos.x
+	elseif pos.x > node._maxX then
+		dx = pos.x - node._maxX
+	end
+	if pos.y < node._minY then
+		dy = node._minY - pos.y
+	elseif pos.y > node._maxY then
+		dy = pos.y - node._maxY
+	end
+	if node._minZ and node._maxZ then
+		if pos.z < node._minZ then
+			dz = node._minZ - pos.z
+		elseif pos.z > node._maxZ then
+			dz = pos.z - node._maxZ
+		end
+	end
+
+	return dx * dx + dy * dy + dz * dz
+end
+
+local function cellCoord(value)
+	return math.floor(value / GRID_CELL_SIZE)
+end
+
+local function cellKey(gx, gy)
+	return gx .. "," .. gy
+end
+
+function AreaSpatial.BuildGrid(nodes)
+	local grid = {}
+	local cellCount = 0
+
+	for _, node in pairs(nodes) do
+		if not node.isDoor and node._minX and node._maxX then
+			local gx0 = cellCoord(node._minX)
+			local gx1 = cellCoord(node._maxX)
+			local gy0 = cellCoord(node._minY)
+			local gy1 = cellCoord(node._maxY)
+
+			for gx = gx0, gx1 do
+				for gy = gy0, gy1 do
+					local key = cellKey(gx, gy)
+					local bucket = grid[key]
+					if not bucket then
+						bucket = {}
+						grid[key] = bucket
+						cellCount = cellCount + 1
+					end
+					bucket[#bucket + 1] = node
+				end
+			end
+		end
+	end
+
+	grid._cellSize = GRID_CELL_SIZE
+	grid._cellCount = cellCount
+	return grid
+end
+
+local function appendBucket(bucket, seen, candidates, count)
+	if not bucket then
+		return count
+	end
+	for i = 1, #bucket do
+		local node = bucket[i]
+		local id = node.id
+		if id and not seen[id] then
+			seen[id] = true
+			count = count + 1
+			candidates[count] = node
+		end
+	end
+	return count
+end
+
+--- All areas whose XY AABB overlaps pos's grid cell.
+--- Complete for containment: if pos is inside an area's XY box, that area is indexed here.
+function AreaSpatial.QueryGridCell(grid, pos)
+	if not grid or not pos then
+		return {}
+	end
+
+	local bucket = grid[cellKey(cellCoord(pos.x), cellCoord(pos.y))]
+	if not bucket then
+		return {}
+	end
+
+	local candidates = {}
+	for i = 1, #bucket do
+		candidates[i] = bucket[i]
+	end
+	return candidates
+end
+
+--- 3×3 cells — for nearest-area queries when pos is outside all areas.
+function AreaSpatial.QueryGridNeighbors(grid, pos)
+	if not grid or not pos then
+		return {}
+	end
+
+	local gx = cellCoord(pos.x)
+	local gy = cellCoord(pos.y)
+	local seen = {}
+	local candidates = {}
+	local count = 0
+
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			count = appendBucket(grid[cellKey(gx + dx, gy + dy)], seen, candidates, count)
+		end
+	end
+
+	return candidates
+end
+
+function AreaSpatial.FindNearestInList(pos, candidates)
+	local bestNode, bestDistSq = nil, math.huge
+
+	for i = 1, #candidates do
+		local node = candidates[i]
+		if not node.isDoor then
+			local distSq = AreaSpatial.DistSqPointToAABB(pos, node)
+			if distSq < bestDistSq then
+				bestDistSq = distSq
+				bestNode = node
+			end
+		end
+	end
+
+	return bestNode
+end
+
+function AreaSpatial.GetGridCellSize()
+	return GRID_CELL_SIZE
+end
+
+return AreaSpatial
+
+end)
 __bundle_register("NavBot.Navigation.Setup.Phase3_KDTree", function(require, _LOADED, __bundle_register, __bundle_modules)
 --##########################################################################
---  Phase3_KDTree.lua  ·  Build spatial index for fast nearest-neighbor queries
+--  Phase3_KDTree.lua  ·  Spatial index: XY KD-tree + area grid
 --##########################################################################
 
 local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local Phase3_KDTree = {}
 
@@ -4758,11 +4904,23 @@ local Log = Common.Log.new("Phase3_KDTree")
 --  LOCAL HELPERS
 --##########################################################################
 
--- Simple 3D KD-tree implementation for fast nearest-neighbor search
--- Builds from nodes in G.Navigation.nodes (called after basic setup complete)
+local function getSplitCoord(point, axis)
+	local node = point.node
+	if node and node._minX then
+		return (node._minX + node._maxX) * 0.5
+	end
+	return point.pos.x
+end
+
+local function getSplitCoordY(point)
+	local node = point.node
+	if node and node._minY then
+		return (node._minY + node._maxY) * 0.5
+	end
+	return point.pos.y
+end
 
 local function buildKDTree(nodes)
-	-- Collect all non-door nodes into array
 	local points = {}
 	for id, node in pairs(nodes) do
 		if not node.isDoor and node.pos then
@@ -4779,25 +4937,25 @@ local function buildKDTree(nodes)
 		return nil
 	end
 
-	-- Build tree recursively
 	local function build(pointList, depth)
 		if #pointList == 0 then
 			return nil
 		end
 
-		-- Axis cycling: 0=x, 1=y, 2=z
-		local axis = depth % 3
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
+		-- XY only — nav areas are ground partitions; Z handled by containment
+		local axis = depth % 2
 
-		-- Sort by current axis
 		table.sort(pointList, function(a, b)
-			return a.pos[axisName] < b.pos[axisName]
+			if axis == 0 then
+				return getSplitCoord(a, axis) < getSplitCoord(b, axis)
+			end
+			return getSplitCoordY(a) < getSplitCoordY(b)
 		end)
 
 		local medianIdx = math.floor(#pointList / 2) + 1
 		local median = pointList[medianIdx]
+		local splitValue = axis == 0 and getSplitCoord(median, axis) or getSplitCoordY(median)
 
-		-- Split into left/right
 		local leftPoints = {}
 		local rightPoints = {}
 		for i = 1, #pointList do
@@ -4811,6 +4969,7 @@ local function buildKDTree(nodes)
 		return {
 			point = median,
 			axis = axis,
+			split = splitValue,
 			left = build(leftPoints, depth + 1),
 			right = build(rightPoints, depth + 1),
 		}
@@ -4819,19 +4978,34 @@ local function buildKDTree(nodes)
 	return build(points, 0)
 end
 
+local function distSqForPoint(pos, point)
+	return AreaSpatial.DistSqPointToAABB(pos, point.node)
+end
+
 --##########################################################################
 --  PUBLIC API
 --##########################################################################
 
---- Build KD-tree spatial index for all area nodes
---- Called after basic setup (nodes in global) but before door generation
---- @return table KD-tree root node
+function Phase3_KDTree.DistSqPointToAABB(pos, node)
+	return AreaSpatial.DistSqPointToAABB(pos, node)
+end
+
+--- Build KD-tree and XY area grid for spatial queries
+--- @param nodes table
+--- @return table|nil tree
 function Phase3_KDTree.Execute(nodes)
 	assert(type(nodes) == "table", "Phase3_KDTree.Execute: nodes must be table")
 
-	Log:Info("Building KD-tree spatial index")
+	Log:Info("Building spatial indexes (KD-tree + area grid)")
 
 	local tree = buildKDTree(nodes)
+	local grid = AreaSpatial.BuildGrid(nodes)
+
+	if grid then
+		G.Navigation.areaGrid = grid
+		Log:Info("Area grid: %d cells", grid._cellCount or 0)
+	end
+
 	if tree then
 		Log:Info("Phase 3 complete: KD-tree built")
 	else
@@ -4841,10 +5015,7 @@ function Phase3_KDTree.Execute(nodes)
 	return tree
 end
 
---- Find nearest neighbor using KD-tree
---- @param tree table KD-tree root
---- @param pos Vector3 query position
---- @return table|nil nearest point {pos, id, node}
+--- Find nearest area by point-to-AABB distance (not center distance).
 function Phase3_KDTree.FindNearest(tree, pos)
 	if not tree or not pos then
 		return nil
@@ -4853,22 +5024,22 @@ function Phase3_KDTree.FindNearest(tree, pos)
 	local bestDistSq = math.huge
 	local best = nil
 
-	local function search(node, depth)
+	local function search(node)
 		if not node then
 			return
 		end
 
-		local axis = node.axis
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
-		local diff = pos[axisName] - node.point.pos[axisName]
-		local distSq = (node.point.pos - pos):LengthSqr()
-
+		local distSq = distSqForPoint(pos, node.point)
 		if distSq < bestDistSq then
 			bestDistSq = distSq
 			best = node.point
 		end
 
-		-- Choose branch
+		local diff = pos.x - node.split
+		if node.axis == 1 then
+			diff = pos.y - node.split
+		end
+
 		local first, second
 		if diff < 0 then
 			first, second = node.left, node.right
@@ -4876,38 +5047,30 @@ function Phase3_KDTree.FindNearest(tree, pos)
 			first, second = node.right, node.left
 		end
 
-		search(first, depth + 1)
+		search(first)
 
-		-- Check if we need to search other side
 		if diff * diff < bestDistSq then
-			search(second, depth + 1)
+			search(second)
 		end
 	end
 
-	search(tree, 0)
+	search(tree)
 	return best
 end
 
---- Find K nearest neighbors using KD-tree
---- @param tree table KD-tree root
---- @param pos Vector3 query position
---- @param k number maximum number of neighbors to find
---- @return table array of nearest points {pos, id, node}, sorted by distance
+--- Find K nearest areas ranked by point-to-AABB distance.
 function Phase3_KDTree.FindKNearest(tree, pos, k)
 	if not tree or not pos or k <= 0 then
 		return {}
 	end
 
-	-- Max-heap to track K best candidates (farthest at top for easy eviction)
 	local candidates = {}
 	local count = 0
 
 	local function addCandidate(point, distSq)
 		if count < k then
-			-- Add to heap
 			count = count + 1
 			candidates[count] = { point = point, distSq = distSq }
-			-- Bubble up to maintain max-heap property
 			local i = count
 			while i > 1 do
 				local parent = math.floor(i / 2)
@@ -4918,9 +5081,7 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 				i = parent
 			end
 		elseif distSq < candidates[1].distSq then
-			-- Replace farthest
 			candidates[1] = { point = point, distSq = distSq }
-			-- Heapify down
 			local i = 1
 			while true do
 				local left = i * 2
@@ -4942,19 +5103,18 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 		end
 	end
 
-	local function search(node, depth)
+	local function search(node)
 		if not node then
 			return
 		end
 
-		local axis = node.axis
-		local axisName = (axis == 0) and "x" or (axis == 1) and "y" or "z"
-		local diff = pos[axisName] - node.point.pos[axisName]
-		local distSq = (node.point.pos - pos):LengthSqr()
+		addCandidate(node.point, distSqForPoint(pos, node.point))
 
-		addCandidate(node.point, distSq)
+		local diff = pos.x - node.split
+		if node.axis == 1 then
+			diff = pos.y - node.split
+		end
 
-		-- Choose branch
 		local first, second
 		if diff < 0 then
 			first, second = node.left, node.right
@@ -4962,24 +5122,20 @@ function Phase3_KDTree.FindKNearest(tree, pos, k)
 			first, second = node.right, node.left
 		end
 
-		search(first, depth + 1)
+		search(first)
 
-		-- Check if we need to search other side
-		-- Search other side if: (1) we don't have K candidates yet, or (2) hyperplane could have closer points
 		local worstDistSq = count > 0 and candidates[1].distSq or math.huge
 		if diff * diff < worstDistSq then
-			search(second, depth + 1)
+			search(second)
 		end
 	end
 
-	search(tree, 0)
+	search(tree)
 
-	-- Sort by distance (ascending) for return
 	table.sort(candidates, function(a, b)
 		return a.distSq < b.distSq
 	end)
 
-	-- Return just the points
 	local result = {}
 	for i = 1, count do
 		result[i] = candidates[i].point
@@ -5537,6 +5693,7 @@ __bundle_register("NavBot.Navigation.Setup.Phase2_Normalize", function(require, 
 
 local Common = require("NavBot.Core.Common")
 local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local Phase2_Normalize = {}
 
@@ -5556,6 +5713,12 @@ local function precomputeNodeBounds(node)
 	node._maxX = math.max(node.nw.x, node.ne.x, node.sw.x, node.se.x)
 	node._minY = math.min(node.nw.y, node.ne.y, node.sw.y, node.se.y)
 	node._maxY = math.max(node.nw.y, node.ne.y, node.sw.y, node.se.y)
+
+	AreaSpatial.PrecomputeVerticalBounds(node)
+
+	-- Extents used to tune KD-tree candidate counts for large areas
+	node._extentX = node._maxX - node._minX
+	node._extentY = node._maxY - node._minY
 end
 
 --##########################################################################
@@ -7863,183 +8026,99 @@ end)
 __bundle_register("NavBot.Bot.SmartJump", function(require, _LOADED, __bundle_register, __bundle_modules)
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
+
 local Log = Common.Log.new("SmartJump")
 
 Log.Level = 0
 local SJ = G.SmartJump
 local SJC = G.SmartJump.Constants
 
--- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
+local STEP_Z = 18
+local STEP_VEC = Vector3(0, 0, STEP_Z)
+local FORWARD_PROBE = 1
+local FORWARD_SLIDE = 24
+local MIN_STEP_HEIGHT = 18
+local MAX_CLEAR_HEIGHT = 72
 
--- ============================================================================
--- HELPER FUNCTIONS
--- ============================================================================
+local SmartJump = {}
 
-local function GetPlayerHitbox(player)
-	local mins = player:GetMins()
-	local maxs = player:GetMaxs()
-	return {
-		mins,
-		maxs,
-	}
+local function getPlayerHitbox(player)
+	return { player:GetMins(), player:GetMaxs() }
 end
 
-local function RotateVectorByYaw(vector, yaw)
+local function rotateMoveByView(moveIntent, yaw)
 	local rad = math.rad(yaw)
 	local cos, sin = math.cos(rad), math.sin(rad)
-	return Vector3(cos * vector.x - sin * vector.y, sin * vector.x + cos * vector.y, vector.z)
+	return Vector3(cos * moveIntent.x - sin * moveIntent.y, sin * moveIntent.x + cos * moveIntent.y, 0)
 end
 
 local function isSurfaceWalkable(normal)
-	local vUp = Vector3(0, 0, 1)
-	local angle = math.deg(math.acos(normal:Dot(vUp)))
-	return angle < 55
+	local angle = math.deg(math.acos(normal:Dot(Vector3(0, 0, 1))))
+	return angle < SJC.MAX_WALKABLE_ANGLE
 end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return pFlags & FL_ONGROUND == FL_ONGROUND
+	return (pFlags & FL_ONGROUND) == FL_ONGROUND
 end
 
-local function isPlayerDucking(player)
-	return player:GetPropInt("m_fFlags") & FL_DUCKING == FL_DUCKING
+--- Bot simulated wishdir first; else manual cmd move rotated by view (same basis as walkTo).
+local function getWishDir(cmd)
+	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
+		local dir = G.BotIntendedWishDir
+		dir.z = 0
+		return Common.Normalize(dir)
+	end
+
+	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
+	if moveIntent:Length() < 1 then
+		return nil
+	end
+
+	local viewAngles = engine.GetViewAngles()
+	return Common.Normalize(rotateMoveByView(moveIntent, viewAngles.yaw))
 end
 
-local SmartJump = {}
-
--- ============================================================================
--- OBSTACLE DETECTION AND JUMP CALCULATION
--- ============================================================================
-
-local function CheckJumpable(hitPos, moveDirection, hitbox)
-	if not moveDirection then
+--- Into wall 1u, up 72, forward (slide corners), down — can we land on top?
+local function canClearObstacle(hitPos, wishDir, hitbox)
+	if not wishDir or not hitPos then
 		return false, 0
 	end
 
-	local checkPos = hitPos + moveDirection * 1
-	local abovePos = checkPos + SJC.MAX_JUMP_HEIGHT
+	local probe = hitPos + wishDir * FORWARD_PROBE
+	local headTarget = probe + SJC.MAX_JUMP_HEIGHT
 
-	-- Perform the trace and get detailed results
-	local trace = engine.TraceHull(abovePos, checkPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-
-	if isSurfaceWalkable(trace.plane) then
-		-- FIXED: Calculate obstacle height from actual trace distance, not hardcoded 72
-		local traceLength = (abovePos - checkPos):Length()
-		local obstacleHeight = traceLength * (1 - trace.fraction)
-
-		-- FIXED: Ensure obstacle height is reasonable
-		if trace.fraction == 0 then
-			-- Trace hit immediately, this might be a wall we're standing against
-			return false, 0
-		end
-
-		if obstacleHeight <= 0 or obstacleHeight > 100 then
-			-- Invalid obstacle height
-			return false, 0
-		end
-
-		if obstacleHeight > 18 then
-			G.SmartJump.LastObstacleHeight = hitPos.z + obstacleHeight
-
-			-- Calculate minimum ticks needed to clear this obstacle
-			-- Use quadratic formula to find time to reach obstacle height
-			local jumpVel = SJC.JUMP_FORCE
-			local gravity = SJC.GRAVITY
-			local tickInterval = globals.TickInterval()
-
-			local a = 0.5 * gravity
-			local b = -jumpVel
-			local c = obstacleHeight
-			local discriminant = b * b - 4 * a * c
-
-			local minTicksNeeded = 0
-			if discriminant >= 0 then
-				local t1 = (-b - math.sqrt(discriminant)) / (2 * a)
-				local t2 = (-b + math.sqrt(discriminant)) / (2 * a)
-				local t = math.min(t1 > 0 and t1 or math.huge, t2 > 0 and t2 or math.huge)
-				if t ~= math.huge then
-					minTicksNeeded = math.ceil(t / tickInterval)
-				end
-			else
-				-- FIXED: For negative discriminant, use approximation
-				-- Estimate time based on obstacle height vs max jump height
-				local maxJumpHeight = 72
-				local timeToMaxHeight = math.sqrt(2 * maxJumpHeight / gravity)
-				local fraction = obstacleHeight / maxJumpHeight
-				local estimatedTime = timeToMaxHeight * fraction
-				minTicksNeeded = math.ceil(estimatedTime / tickInterval)
-			end
-
-			G.SmartJump.JumpPeekPos = trace.endpos
-			return true, minTicksNeeded
-		end
+	local upTrace = engine.TraceHull(probe, headTarget, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if upTrace.startsolid then
+		return false, 0
 	end
-	return false, 0
+	local headPos = upTrace.endpos
+
+	local fwdEnd = headPos + wishDir * FORWARD_SLIDE
+	local fwdTrace = engine.TraceHull(headPos, fwdEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	local fwdPos = fwdTrace.endpos
+
+	local downTrace = engine.TraceHull(fwdPos, fwdPos - SJC.MAX_JUMP_HEIGHT, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if downTrace.startsolid or downTrace.fraction >= 1 then
+		return false, 0
+	end
+	if not isSurfaceWalkable(downTrace.plane) then
+		return false, 0
+	end
+
+	local lipZ = downTrace.endpos.z
+	local obstacleHeight = lipZ - hitPos.z
+	if obstacleHeight < MIN_STEP_HEIGHT or obstacleHeight > MAX_CLEAR_HEIGHT then
+		return false, 0
+	end
+
+	G.SmartJump.LastObstacleHeight = lipZ
+	G.SmartJump.JumpPeekPos = downTrace.endpos
+	return true, obstacleHeight
 end
-
--- ============================================================================
--- MOVEMENT SIMULATION
--- ============================================================================
-
-local function SimulateMovementTick(startPos, velocity, pLocal)
-	local upVector = Vector3(0, 0, 1)
-	local stepVector = Vector3(0, 0, 18)
-	local hitbox = GetPlayerHitbox(pLocal)
-	local deltaTime = globals.TickInterval()
-	local moveDirection = Common.Normalize(velocity)
-	local targetPos = startPos + velocity * deltaTime
-
-	local startPostrace = engine.TraceHull(startPos + stepVector, startPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	local downpstartPos = startPostrace.endpos
-	local uptrace = engine.TraceHull(targetPos + stepVector, targetPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	local downpostarget = uptrace.endpos
-	local wallTrace =
-		engine.TraceHull(downpstartPos + stepVector, downpostarget + stepVector, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-
-	if wallTrace.fraction ~= 0 then
-		targetPos = wallTrace.endpos
-	end
-
-	local Groundtrace = engine.TraceHull(targetPos, targetPos - stepVector * 2, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	if Groundtrace.fraction < 1 then
-		targetPos = Groundtrace.endpos
-	else
-		return nil, false, velocity, false, 0
-	end
-
-	Groundtrace = engine.TraceHull(targetPos, targetPos - stepVector, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	if Groundtrace.fraction < 1 then
-		targetPos = Groundtrace.endpos
-	else
-		return nil, false, velocity, false, 0
-	end
-
-	local hitObstacle = wallTrace.fraction < 1
-	local canJump = false
-	local minJumpTicks = 0
-
-	if hitObstacle then
-		canJump, minJumpTicks = CheckJumpable(targetPos, moveDirection, hitbox)
-		local wallNormal = wallTrace.plane
-		local wallAngle = math.deg(math.acos(wallNormal:Dot(upVector)))
-
-		-- FIXED: Apply sliding logic only for steep walls (>55 degrees)
-		-- This matches the swing prediction behavior - only slide on steep walls
-		if wallAngle > 55 then
-			-- The wall is too steep, we'll collide
-			local dot = velocity:Dot(wallNormal)
-			velocity = velocity - wallNormal * dot
-		end
-	end
-
-	return targetPos, hitObstacle, velocity, canJump, minJumpTicks
-end
--- ============================================================================
--- SMART JUMP DETECTION
--- ============================================================================
 
 local function isNearPayload(position)
-	-- Check if position is near any payload cart
 	if not G.World.payloads then
 		return false
 	end
@@ -8047,17 +8126,11 @@ local function isNearPayload(position)
 	for _, payload in pairs(G.World.payloads) do
 		if payload:IsValid() then
 			local payloadPos = payload:GetAbsOrigin()
-
-			-- Check distance to entity center
-			local distToCenter = (position - payloadPos):Length()
-			if distToCenter < 200 then
+			if (position - payloadPos):Length() < 200 then
 				return true
 			end
-
-			-- Also check distance to ground-level position (offset -80 like in GoalFinder)
 			local groundPos = Vector3(payloadPos.x, payloadPos.y, payloadPos.z - 80)
-			local distToGround = (position - groundPos):Length()
-			if distToGround < 150 then
+			if (position - groundPos):Length() < 150 then
 				return true
 			end
 		end
@@ -8065,238 +8138,184 @@ local function isNearPayload(position)
 	return false
 end
 
-local function SmartJumpDetection(cmd, pLocal)
-	if not pLocal or (not isPlayerOnGround(pLocal)) then
+--- Walk along wishdir with ground physics; jump only on last tick that can still clear (late jump).
+local function shouldLateJump(cmd, pLocal)
+	if not pLocal or not isPlayerOnGround(pLocal) then
 		return false
 	end
 
-	local pLocalPos = pLocal:GetAbsOrigin()
-
-	-- Early exit: don't jump if already near payload
-	if isNearPayload(pLocalPos) then
+	local wishDir = getWishDir(cmd)
+	if not wishDir then
 		return false
 	end
 
-	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
-	local viewAngles = engine.GetViewAngles()
-
-	if moveIntent:Length() == 0 and G.BotIsMoving and G.BotMovementDirection then
-		local forward = viewAngles:Forward()
-		local right = viewAngles:Right()
-		moveIntent = Vector3(G.BotMovementDirection:Dot(forward) * 450, (-G.BotMovementDirection:Dot(right)) * 450, 0)
+	local origin = pLocal:GetAbsOrigin()
+	if isNearPayload(origin) then
+		return false
 	end
 
-	local rotatedMoveIntent = RotateVectorByYaw(moveIntent, viewAngles.yaw)
+	local hitbox = getPlayerHitbox(pLocal)
+	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
+	local vel = pLocal:EstimateAbsVelocity() or Vector3(0, 0, 0)
+	vel.z = 0
+	local horizSpeed = math.max(vel:Length2D(), maxSpeed * 0.85)
+	vel = Vector3(wishDir.x * horizSpeed, wishDir.y * horizSpeed, 0)
 
-	-- FIXED: Ensure we always have minimum move direction for simulation
-	-- Even if move intent is very small, we need direction to detect obstacles
-	local moveDir = Common.Normalize(rotatedMoveIntent)
-	local moveLength = rotatedMoveIntent:Length()
-
-	-- Always use minimum move speed for simulation (450 units/second)
-	local minMoveSpeed = 450
-	local simulationSpeed = math.max(moveLength, minMoveSpeed)
-
-	-- If no movement intent at all, use forward direction
-	if moveLength <= 1 then
-		local forward = viewAngles:Forward()
-		moveDir = forward
-		simulationSpeed = minMoveSpeed
-	end
-
-	local currentVel = pLocal:EstimateAbsVelocity()
-	local horizontalSpeed = currentVel:Length()
-
-	-- Use simulation speed if we have movement intent, otherwise use current velocity
-	if horizontalSpeed <= 1 then
-		horizontalSpeed = simulationSpeed
-	end
-
-	local initialVelocity = moveDir * horizontalSpeed
-
-	-- Calculate actual jump peak timing using TF2 physics
-	-- Jump velocity impulse: immediately sets Z velocity to JUMP_FORCE
-	-- Gravity: 800 units/second²
-	-- Find time to reach peak: t = JUMP_FORCE / GRAVITY
-	local jumpVel = SJC.JUMP_FORCE
-	local gravity = SJC.GRAVITY
 	local tickInterval = globals.TickInterval()
+	if tickInterval <= 0 then
+		tickInterval = 1 / 66.67
+	end
 
-	-- Time to reach jump peak: t = v/g
-	local timeToPeak = jumpVel / gravity -- 271/800 = 0.33875 seconds
-	local jumpPeakTicks = math.ceil(timeToPeak / tickInterval) -- ~23 ticks
+	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
+	local maxWalkTicks = peakTicks + 8
 
-	local totalSimulationTicks = jumpPeakTicks
+	local simPos = origin
+	local simVel = vel
+	G.SmartJump.SimulationPath = { origin }
 
-	local currentPos = pLocalPos
-	local currentVelocity = initialVelocity
-
-	G.SmartJump.SimulationPath = {
-		currentPos,
-	}
-
-	for tick = 1, totalSimulationTicks do
-		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
-			SimulateMovementTick(currentPos, currentVelocity, pLocal)
+	for _ = 1, maxWalkTicks do
+		local newPos, newVel, hitWall = GroundMovement.simulateGroundStepHull(
+			simPos,
+			simVel,
+			wishDir,
+			maxSpeed,
+			hitbox[1],
+			hitbox[2],
+			true
+		)
 
 		if not newPos then
 			break
 		end
 
-		table.insert(G.SmartJump.SimulationPath, newPos)
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
-		if hitObstacle and canJump then
-			--print(tick, minJumpTicks)
-
-			if tick <= minJumpTicks then
-				-- Check if we're trying to jump onto or near payload
-				if isNearPayload(newPos) or isNearPayload(currentPos) then
-					Log:Debug("SmartJump: Skipping jump - near payload cart")
-					return false
-				end
-
-				G.SmartJump.PredPos = newPos
-				G.SmartJump.HitObstacle = true
-				Log:Debug("SmartJump: Jumping at tick %d (needed: %d)", tick, minJumpTicks)
-				return true
-			else
-				Log:Debug("SmartJump: Obstacle detected at tick %d (need tick %d) -> Waiting", tick, minJumpTicks)
+		if hitWall then
+			local clearNow, _height = canClearObstacle(newPos, wishDir, hitbox)
+			if not clearNow then
 				return false
 			end
-		end
 
-		currentPos = newPos
-		currentVelocity = newVelocity
+			local nextPos, nextVel, hitNext = GroundMovement.simulateGroundStepHull(
+				newPos,
+				newVel,
+				wishDir,
+				maxSpeed,
+				hitbox[1],
+				hitbox[2],
+				true
+			)
+
+			if not nextPos then
+				if isNearPayload(newPos) then
+					return false
+				end
+				G.SmartJump.PredPos = newPos
+				G.SmartJump.HitObstacle = true
+				return true
+			end
+
+			if not hitNext then
+				-- Not flush with wall yet — keep walking toward it
+				simPos = nextPos
+				simVel = nextVel
+			else
+				local clearNext = canClearObstacle(nextPos, wishDir, hitbox)
+				if not clearNext then
+					if isNearPayload(newPos) then
+						return false
+					end
+					G.SmartJump.PredPos = newPos
+					G.SmartJump.HitObstacle = true
+					Log:Debug("SmartJump: late jump at obstacle")
+					return true
+				end
+				simPos = nextPos
+				simVel = nextVel
+			end
+		else
+			simPos = newPos
+			simVel = newVel
+		end
 	end
+
 	return false
 end
--- ============================================================================
--- MAIN SMART JUMP LOGIC
--- ============================================================================
 
 function SmartJump.Main(cmd)
 	if not G.Menu.SmartJump.Enable then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
-		SJ.ObstacleDetected = false
 		SJ.RequestEmergencyJump = false
 		return
 	end
 
 	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or (not pLocal:IsAlive()) or pLocal:IsDormant() then
+	if not pLocal or not pLocal:IsAlive() or pLocal:IsDormant() then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
-		SJ.ObstacleDetected = false
 		SJ.RequestEmergencyJump = false
-		return false
+		return
 	end
 
 	local onGround = isPlayerOnGround(pLocal)
-	local ducking = isPlayerDucking(pLocal)
 	local shouldJump = false
 
 	if G.SmartJump.RequestEmergencyJump then
 		shouldJump = true
 		G.SmartJump.RequestEmergencyJump = false
-		G.SmartJump.LastSmartJumpAttempt = globals.TickCount()
 		SJ.jumpState = SJC.STATE_PREPARE_JUMP
-		Log:Info("SmartJump: Processing emergency jump request")
 	end
 
-	local hasMovementIntent = false
-	local moveDir = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
-	if moveDir:Length() > 0 or G.BotIsMoving and G.BotMovementDirection and G.BotMovementDirection:Length() > 0 then
-		hasMovementIntent = true
-	end
-
-	if onGround and ducking and hasMovementIntent and SJ.jumpState == SJC.STATE_IDLE then
-		local obstacleDetected = SmartJumpDetection(cmd, pLocal)
-		if obstacleDetected then
-			SJ.jumpState = SJC.STATE_PREPARE_JUMP
-			Log:Debug("SmartJump: Crouched movement with obstacle detected, initiating jump")
-		else
-			Log:Debug("SmartJump: Crouched movement but no obstacle detected, staying idle")
-		end
-	end
+	local hasWishDir = getWishDir(cmd) ~= nil
 
 	if SJ.jumpState == SJC.STATE_IDLE then
-		if onGround and hasMovementIntent then
-			local smartJumpDetected = SmartJumpDetection(cmd, pLocal)
-			if smartJumpDetected or shouldJump then
+		if onGround and (hasWishDir or shouldJump) then
+			if shouldJump or shouldLateJump(cmd, pLocal) then
 				SJ.jumpState = SJC.STATE_PREPARE_JUMP
-				Log:Debug("SmartJump: IDLE -> PREPARE_JUMP (obstacle detected)")
 			end
 		end
 	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
 		cmd:SetButtons(cmd.buttons & ~IN_JUMP)
 		SJ.jumpState = SJC.STATE_CTAP
-		Log:Debug("SmartJump: PREPARE_JUMP -> CTAP (ducking)")
 	elseif SJ.jumpState == SJC.STATE_CTAP then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
 		cmd:SetButtons(cmd.buttons | IN_JUMP)
 		SJ.jumpState = SJC.STATE_ASCENDING
-		Log:Debug("SmartJump: CTAP -> ASCENDING (unduck + jump)")
 	elseif SJ.jumpState == SJC.STATE_ASCENDING then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
 		local velocity = pLocal:EstimateAbsVelocity()
 		local currentPos = pLocal:GetAbsOrigin()
+		local shouldUnduck = velocity.z <= 0
 
-		-- Check if we should unduck (improve duck grab logic)
-		local shouldUnduck = velocity.z <= 0 -- Always unduck when falling
-
-		-- If Duck_Grab is enabled and we have obstacle height info, do improved check
 		if not shouldUnduck and G.Menu.Main.Duck_Grab and G.SmartJump.LastObstacleHeight then
-			local playerHeight = currentPos.z
-
-			-- Only consider unducking if we're above the obstacle
-			if playerHeight > G.SmartJump.LastObstacleHeight then
-				-- IMPROVED: Trace down from player position + obstacle height + 1
+			if currentPos.z > G.SmartJump.LastObstacleHeight then
 				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
 				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
-				local hitbox = GetPlayerHitbox(pLocal)
-				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-
-				-- If trace hits something, obstacle is still there - safe to unduck
+				local hitbox = getPlayerHitbox(pLocal)
+				local obstacleTrace =
+					engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
 				if obstacleTrace.fraction < 1 then
 					shouldUnduck = true
-					Log:Debug(
-						"SmartJump: Unducking - obstacle confirmed at height %.1f",
-						G.SmartJump.LastObstacleHeight
-					)
-				else
-					Log:Debug(
-						"SmartJump: Staying ducked - no obstacle detected at height %.1f",
-						G.SmartJump.LastObstacleHeight
-					)
 				end
 			end
 		end
 
 		if shouldUnduck then
 			SJ.jumpState = SJC.STATE_DESCENDING
-			Log:Debug("SmartJump: ASCENDING -> DESCENDING (improved duck grab check)")
+		elseif onGround then
+			SJ.jumpState = SJC.STATE_IDLE
 		end
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
 
-		if hasMovementIntent then
-			local bhopJump = SmartJumpDetection(cmd, pLocal)
-			if bhopJump then
-				cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-				cmd:SetButtons(cmd.buttons | IN_JUMP)
-				SJ.jumpState = SJC.STATE_PREPARE_JUMP
-				Log:Debug("SmartJump: DESCENDING -> PREPARE_JUMP (bhop with obstacle)")
-			end
-
-			if onGround then
-				SJ.jumpState = SJC.STATE_IDLE
-				Log:Debug("SmartJump: DESCENDING -> IDLE (landed)")
-			end
+		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
+			cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+			cmd:SetButtons(cmd.buttons | IN_JUMP)
+			SJ.jumpState = SJC.STATE_PREPARE_JUMP
 		elseif onGround then
 			SJ.jumpState = SJC.STATE_IDLE
-			Log:Debug("SmartJump: DESCENDING -> IDLE (no movement intent)")
 		end
 	end
 
@@ -8304,43 +8323,24 @@ function SmartJump.Main(cmd)
 		SJ.stateStartTime = globals.TickCount()
 	elseif globals.TickCount() - SJ.stateStartTime > 132 then
 		SJ.jumpState = SJC.STATE_IDLE
-		SJ.stateStartTime = nil
 	end
 
-	local currentState = SJ.jumpState
-	if SJ.lastState ~= currentState then
+	if SJ.lastState ~= SJ.jumpState then
 		SJ.stateStartTime = globals.TickCount()
-		SJ.lastState = currentState
+		SJ.lastState = SJ.jumpState
 	end
 
 	G.SmartJump.ShouldJump = shouldJump
-	return shouldJump
 end
 
--- ============================================================================
--- VISUALIZATION AND CALLBACKS
--- ============================================================================
-
-local function OnCreateMoveStandalone(cmd)
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or (not pLocal:IsAlive()) then
+local function onDrawSmartJump()
+	if not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
 		return
 	end
-	SmartJump.Main(cmd)
-end
-
-local function OnDrawSmartJump()
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
-		return
-	end
-
-	-- Check if SmartJump visuals are enabled in menu
 	if not (G.Menu.Visuals and G.Menu.Visuals.showSmartJump) then
 		return
 	end
 
-	local vHitbox = GetPlayerHitbox(pLocal)
 	if G.SmartJump.PredPos then
 		local screenPos = client.WorldToScreen(G.SmartJump.PredPos)
 		if screenPos then
@@ -8349,89 +8349,303 @@ local function OnDrawSmartJump()
 		end
 	end
 
-	if G.SmartJump.JumpPeekPos then
-		local screenpeekpos = client.WorldToScreen(G.SmartJump.JumpPeekPos)
-		if screenpeekpos then
-			draw.Color(0, 255, 0, 255)
-			draw.FilledRect(screenpeekpos[1] - 5, screenpeekpos[2] - 5, screenpeekpos[1] + 5, screenpeekpos[2] + 5)
-		end
-
-		local minPoint = vHitbox[1] + G.SmartJump.JumpPeekPos
-		local maxPoint = vHitbox[2] + G.SmartJump.JumpPeekPos
-		local vertices = {
-			Vector3(minPoint.x, minPoint.y, minPoint.z),
-			Vector3(minPoint.x, maxPoint.y, minPoint.z),
-			Vector3(maxPoint.x, maxPoint.y, minPoint.z),
-			Vector3(maxPoint.x, minPoint.y, minPoint.z),
-			Vector3(minPoint.x, minPoint.y, maxPoint.z),
-			Vector3(minPoint.x, maxPoint.y, maxPoint.z),
-			Vector3(maxPoint.x, maxPoint.y, maxPoint.z),
-			Vector3(maxPoint.x, minPoint.y, maxPoint.z),
-		}
-
-		for i, vertex in ipairs(vertices) do
-			vertices[i] = client.WorldToScreen(vertex)
-		end
-
-		if
-			vertices[1]
-			and vertices[2]
-			and vertices[3]
-			and vertices[4]
-			and vertices[5]
-			and vertices[6]
-			and vertices[7]
-			and vertices[8]
-		then
-			draw.Color(0, 255, 255, 255)
-			draw.Line(vertices[1][1], vertices[1][2], vertices[2][1], vertices[2][2])
-			draw.Line(vertices[2][1], vertices[2][2], vertices[3][1], vertices[3][2])
-			draw.Line(vertices[3][1], vertices[3][2], vertices[4][1], vertices[4][2])
-			draw.Line(vertices[4][1], vertices[4][2], vertices[1][1], vertices[1][2])
-			draw.Line(vertices[5][1], vertices[5][2], vertices[6][1], vertices[6][2])
-			draw.Line(vertices[6][1], vertices[6][2], vertices[7][1], vertices[7][2])
-			draw.Line(vertices[7][1], vertices[7][2], vertices[8][1], vertices[8][2])
-			draw.Line(vertices[8][1], vertices[8][2], vertices[5][1], vertices[5][2])
-			draw.Line(vertices[1][1], vertices[1][2], vertices[5][1], vertices[5][2])
-			draw.Line(vertices[2][1], vertices[2][2], vertices[6][1], vertices[6][2])
-			draw.Line(vertices[3][1], vertices[3][2], vertices[7][1], vertices[7][2])
-			draw.Line(vertices[4][1], vertices[4][2], vertices[8][1], vertices[8][2])
-		end
-	end
-
 	if G.SmartJump.SimulationPath and #G.SmartJump.SimulationPath > 1 then
 		for i = 1, #G.SmartJump.SimulationPath - 1 do
-			local currentPos = G.SmartJump.SimulationPath[i]
-			local nextPos = G.SmartJump.SimulationPath[i + 1]
-			local currentScreen = client.WorldToScreen(currentPos)
-			local nextScreen = client.WorldToScreen(nextPos)
-			if currentScreen and nextScreen then
-				local alpha = math.floor(100 + i / #G.SmartJump.SimulationPath * 155)
-				draw.Color(0, 150, 255, alpha)
-				draw.Line(currentScreen[1], currentScreen[2], nextScreen[1], nextScreen[2])
+			local a = client.WorldToScreen(G.SmartJump.SimulationPath[i])
+			local b = client.WorldToScreen(G.SmartJump.SimulationPath[i + 1])
+			if a and b then
+				draw.Color(0, 150, 255, 180)
+				draw.Line(a[1], a[2], b[1], b[2])
 			end
 		end
 	end
 
 	if G.SmartJump.JumpPeekPos then
-		local landingScreen = client.WorldToScreen(G.SmartJump.JumpPeekPos)
-		if landingScreen then
-			draw.Color(0, 255, 255, 255)
-			draw.FilledRect(landingScreen[1] - 4, landingScreen[2] - 4, landingScreen[1] + 4, landingScreen[2] + 4)
+		local s = client.WorldToScreen(G.SmartJump.JumpPeekPos)
+		if s then
+			draw.Color(0, 255, 0, 255)
+			draw.FilledRect(s[1] - 4, s[2] - 4, s[1] + 4, s[2] + 4)
 		end
 	end
 end
 
--- ============================================================================
--- MODULE INITIALIZATION
--- ============================================================================
-
-callbacks.Unregister("CreateMove", "SmartJump.Standalone")
-callbacks.Register("CreateMove", "SmartJump.Standalone", OnCreateMoveStandalone)
 callbacks.Unregister("Draw", "SmartJump.Visual")
-callbacks.Register("Draw", "SmartJump.Visual", OnDrawSmartJump)
+callbacks.Register("Draw", "SmartJump.Visual", onDrawSmartJump)
 
 return SmartJump
+
+end)
+__bundle_register("NavBot.Bot.GroundMovement", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Ground movement physics (from Auto_Trickstab SimulateDash / CalculateOptimalWishdir)
+Friction + sv_accelerate ground model for optimal wish direction each tick.
+]]
+
+local GroundMovement = {}
+
+local TWO_PI = 2 * math.pi
+local DEG_TO_RAD = math.pi / 180
+
+local DEFAULT_FRICTION = 4
+local DEFAULT_ACCELERATE = 10
+local DEFAULT_STOP_SPEED = 100
+local DEFAULT_MAX_SPEED = 320
+local DEFAULT_CMD_SPEED = 450
+
+local function getTickInterval()
+	local tick = globals.TickInterval()
+	if tick <= 0 then
+		return 1 / 66.67
+	end
+	return tick
+end
+
+local function getFriction()
+	local ok, val = pcall(client.GetConVar, "sv_friction")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_FRICTION
+end
+
+local function getAccelerate()
+	local ok, val = pcall(client.GetConVar, "sv_accelerate")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_ACCELERATE
+end
+
+local function horizontalDir(from, to)
+	local dir = Vector3(to.x - from.x, to.y - from.y, 0)
+	local len = dir:Length2D()
+	if len < 0.001 then
+		return nil, 0
+	end
+	return dir / len, len
+end
+
+---@param velocity Vector3
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyFriction(velocity, onGround)
+	if not velocity or not onGround then
+		return velocity or Vector3(0, 0, 0)
+	end
+
+	local speed = velocity:Length()
+	if speed < DEFAULT_STOP_SPEED then
+		return Vector3(0, 0, 0)
+	end
+
+	local tick = getTickInterval()
+	local friction = getFriction() * tick
+	local control = speed < DEFAULT_STOP_SPEED and DEFAULT_STOP_SPEED or speed
+	local drop = control * friction
+	local newSpeed = speed - drop
+
+	if newSpeed < 0 then
+		newSpeed = 0
+	end
+
+	if newSpeed < speed then
+		return velocity * (newSpeed / speed)
+	end
+
+	return velocity
+end
+
+--- One tick of ground acceleration along wishdir (TF2 ProcessMovement style).
+---@param velocity Vector3
+---@param wishdir Vector3
+---@param maxSpeed number
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyGroundAccel(velocity, wishdir, maxSpeed, onGround)
+	if not onGround or not wishdir then
+		return velocity
+	end
+
+	local tick = getTickInterval()
+	local accel = getAccelerate()
+	local vel = Vector3(velocity.x, velocity.y, velocity.z)
+
+	local currentSpeed = vel:Dot(wishdir)
+	local addSpeed = maxSpeed - currentSpeed
+	if addSpeed > 0 then
+		local accelSpeed = math.min(accel * maxSpeed * tick, addSpeed)
+		vel = vel + wishdir * accelSpeed
+	end
+
+	local horizSpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+	if horizSpeed > maxSpeed then
+		local scale = maxSpeed / horizSpeed
+		vel = Vector3(vel.x * scale, vel.y * scale, vel.z)
+	end
+
+	return vel
+end
+
+--- Coast with friction only (no input), like CalculateOptimalWishdir pass 1.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param ticks number
+---@param onGround boolean
+---@return Vector3 pos, Vector3 vel
+function GroundMovement.predictCoast(startPos, startVel, ticks, onGround)
+	local tick = getTickInterval()
+	local pos = Vector3(startPos.x, startPos.y, startPos.z)
+	local vel = Vector3(startVel.x, startVel.y, startVel.z)
+
+	for _ = 1, ticks do
+		pos = pos + vel * tick
+		vel = GroundMovement.applyFriction(vel, onGround)
+	end
+
+	return pos, vel
+end
+
+--- Wish direction after coasting: where we should accelerate after friction bleeds velocity.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param dest Vector3
+---@param coastTicks number|nil
+---@param onGround boolean
+---@return Vector3|nil wishdir
+function GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
+	coastTicks = coastTicks or 1
+	onGround = onGround ~= false
+
+	local coastPos, _coastVel
+	if coastTicks > 0 and onGround then
+		coastPos, _coastVel = GroundMovement.predictCoast(startPos, startVel, coastTicks, onGround)
+	else
+		coastPos = startPos
+	end
+
+	local wishdir, dist = horizontalDir(coastPos, dest)
+	if not wishdir then
+		return nil
+	end
+
+	-- Already at target after coast
+	if dist < 1.5 then
+		return nil
+	end
+
+	return wishdir
+end
+
+--- How many ticks to coast before aiming (more speed → slightly more lookahead).
+function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
+	if not maxSpeed or maxSpeed <= 0 then
+		return 1
+	end
+	local ratio = horizSpeed / maxSpeed
+	if ratio < 0.25 then
+		return 0
+	end
+	if ratio < 0.6 then
+		return 1
+	end
+	return 2
+end
+
+--- Convert world wish direction into forward/side move (view-relative).
+---@param cmd UserCmd
+---@param wishdir Vector3
+---@param cmdSpeed number|nil
+function GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
+	cmdSpeed = cmdSpeed or DEFAULT_CMD_SPEED
+
+	local targetYaw = (math.atan(wishdir.y, wishdir.x) + TWO_PI) % TWO_PI
+	local _, currentYaw = cmd:GetViewAngles()
+	currentYaw = currentYaw * DEG_TO_RAD
+
+	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
+
+	cmd:SetForwardMove(math.cos(yawDiff) * cmdSpeed)
+	cmd:SetSideMove(math.sin(-yawDiff) * cmdSpeed)
+end
+
+--- Simulate one tick forward with friction + accel; returns post-tick position.
+function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+	return pos + vel * tick, vel
+end
+
+local STEP_HEIGHT = Vector3(0, 0, 18)
+
+--- One ground physics tick with hull collision (for SmartJump prediction).
+---@return Vector3|nil newPos
+---@return Vector3 newVel
+---@return boolean hitWall
+---@return table|nil wallTrace
+function GroundMovement.simulateGroundStepHull(pos, vel, wishdir, maxSpeed, hullMin, hullMax, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+
+	local targetPos = pos + vel * tick
+	local step = STEP_HEIGHT
+
+	local startTrace = engine.TraceHull(pos + step, pos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local startOnGround = startTrace.endpos
+
+	local upTrace = engine.TraceHull(targetPos + step, targetPos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local targetRaised = upTrace.endpos
+
+	local wallTrace = engine.TraceHull(startOnGround + step, targetRaised + step, hullMin, hullMax, MASK_PLAYERSOLID)
+	local newPos = targetRaised
+	if wallTrace.fraction > 0 then
+		newPos = wallTrace.endpos
+	end
+
+	local groundTrace = engine.TraceHull(newPos, newPos - step * 2, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	groundTrace = engine.TraceHull(newPos, newPos - step, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	local hitWall = wallTrace.fraction < 1
+	if hitWall then
+		local wallNormal = wallTrace.plane
+		local up = Vector3(0, 0, 1)
+		local wallAngle = math.deg(math.acos(wallNormal:Dot(up)))
+		if wallAngle > 55 then
+			local dot = vel:Dot(wallNormal)
+			vel = vel - wallNormal * dot
+		end
+	end
+
+	return newPos, vel, hitWall, wallTrace
+end
+
+function GroundMovement.getMaxSpeed(player)
+	local cap = player and player:GetPropFloat("m_flMaxspeed")
+	if cap and cap > 0 then
+		return cap
+	end
+	return DEFAULT_MAX_SPEED
+end
+
+function GroundMovement.isOnGround(player)
+	if player and player.IsOnGround and player:IsOnGround() then
+		return true
+	end
+	local flags = player and player:GetPropInt("m_fFlags") or 0
+	return (flags & 1) ~= 0
+end
+
+return GroundMovement
 
 end)
 __bundle_register("NavBot.Bot.HealthLogic", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -8734,29 +8948,38 @@ function MovementDecisions.handleMovingState(userCmd)
 		return
 	end
 
-	-- Update movement direction for SmartJump
 	local targetPos = MovementDecisions.getCurrentTarget()
-	if targetPos then
+	G.BotIntendedWishDir = nil
+	G.BotIsMoving = false
+
+	if targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity then
 		local LocalOrigin = G.pLocal.Origin
 		local direction = targetPos - LocalOrigin
-		G.BotMovementDirection = direction:Length() > 0 and Common.Normalize(direction) or Vector3(0, 0, 0)
-		G.BotIsMoving = true
+		direction.z = 0
+		if direction:Length2D() > 0 then
+			G.BotMovementDirection = Common.Normalize(direction)
+		else
+			G.BotMovementDirection = Vector3(0, 0, 0)
+		end
+
+		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
+		if wishdir then
+			G.BotIntendedWishDir = wishdir
+			G.BotIsMoving = true
+		end
 		G.Navigation.currentTargetPos = targetPos
 	end
 
-	-- Handle camera rotation
 	MovementController.handleCameraRotation(userCmd, targetPos)
 
-	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
 
-	-- ALWAYS execute movement at the end, regardless of decision outcomes
-	MovementDecisions.executeMovement(userCmd)
-
-	-- Handle SmartJump after walkTo
+	-- SmartJump uses intended wishdir before walkTo writes cmd
 	MovementDecisions.handleSmartJump(userCmd)
+
+	MovementDecisions.executeMovement(userCmd)
 end
 
 return MovementDecisions
@@ -9168,11 +9391,37 @@ Movement Controller - TF2 ground physics walk (Auto_Trickstab friction + accel m
 local G = require("NavBot.Core.Globals")
 local Common = require("NavBot.Core.Common")
 local GroundMovement = require("NavBot.Bot.GroundMovement")
--- Common: camera helper only
 
 local MovementController = {}
 
 local ARRIVAL_DIST = 1.5
+
+--- Same wishdir walkTo would use (coast + accel model); nil if at destination.
+function MovementController.computeWishDir(player, dest)
+	if not (player and dest) then
+		return nil
+	end
+
+	local pos = player:GetAbsOrigin()
+	if not pos then
+		return nil
+	end
+
+	local toDest = dest - pos
+	toDest.z = 0
+	if toDest:Length2D() < ARRIVAL_DIST then
+		return nil
+	end
+
+	local onGround = GroundMovement.isOnGround(player)
+	local maxSpeed = GroundMovement.getMaxSpeed(player)
+	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
+	vel.z = 0
+
+	local horizSpeed = vel:Length2D()
+	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
+	return GroundMovement.computeWishDirToTarget(pos, vel, dest, coastTicks, onGround)
+end
 
 --- Walk toward dest using simulated friction/coast wish direction + optimal ground accel input.
 function MovementController.walkTo(cmd, player, dest)
@@ -9237,226 +9486,6 @@ function MovementController.handleCameraRotation(userCmd, targetPos)
 end
 
 return MovementController
-
-end)
-__bundle_register("NavBot.Bot.GroundMovement", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-Ground movement physics (from Auto_Trickstab SimulateDash / CalculateOptimalWishdir)
-Friction + sv_accelerate ground model for optimal wish direction each tick.
-]]
-
-local GroundMovement = {}
-
-local TWO_PI = 2 * math.pi
-local DEG_TO_RAD = math.pi / 180
-
-local DEFAULT_FRICTION = 4
-local DEFAULT_ACCELERATE = 10
-local DEFAULT_STOP_SPEED = 100
-local DEFAULT_MAX_SPEED = 320
-local DEFAULT_CMD_SPEED = 450
-
-local function getTickInterval()
-	local tick = globals.TickInterval()
-	if tick <= 0 then
-		return 1 / 66.67
-	end
-	return tick
-end
-
-local function getFriction()
-	local ok, val = pcall(client.GetConVar, "sv_friction")
-	if ok and val and val > 0 then
-		return val
-	end
-	return DEFAULT_FRICTION
-end
-
-local function getAccelerate()
-	local ok, val = pcall(client.GetConVar, "sv_accelerate")
-	if ok and val and val > 0 then
-		return val
-	end
-	return DEFAULT_ACCELERATE
-end
-
-local function horizontalDir(from, to)
-	local dir = Vector3(to.x - from.x, to.y - from.y, 0)
-	local len = dir:Length2D()
-	if len < 0.001 then
-		return nil, 0
-	end
-	return dir / len, len
-end
-
----@param velocity Vector3
----@param onGround boolean
----@return Vector3
-function GroundMovement.applyFriction(velocity, onGround)
-	if not velocity or not onGround then
-		return velocity or Vector3(0, 0, 0)
-	end
-
-	local speed = velocity:Length()
-	if speed < DEFAULT_STOP_SPEED then
-		return Vector3(0, 0, 0)
-	end
-
-	local tick = getTickInterval()
-	local friction = getFriction() * tick
-	local control = speed < DEFAULT_STOP_SPEED and DEFAULT_STOP_SPEED or speed
-	local drop = control * friction
-	local newSpeed = speed - drop
-
-	if newSpeed < 0 then
-		newSpeed = 0
-	end
-
-	if newSpeed < speed then
-		return velocity * (newSpeed / speed)
-	end
-
-	return velocity
-end
-
---- One tick of ground acceleration along wishdir (TF2 ProcessMovement style).
----@param velocity Vector3
----@param wishdir Vector3
----@param maxSpeed number
----@param onGround boolean
----@return Vector3
-function GroundMovement.applyGroundAccel(velocity, wishdir, maxSpeed, onGround)
-	if not onGround or not wishdir then
-		return velocity
-	end
-
-	local tick = getTickInterval()
-	local accel = getAccelerate()
-	local vel = Vector3(velocity.x, velocity.y, velocity.z)
-
-	local currentSpeed = vel:Dot(wishdir)
-	local addSpeed = maxSpeed - currentSpeed
-	if addSpeed > 0 then
-		local accelSpeed = math.min(accel * maxSpeed * tick, addSpeed)
-		vel = vel + wishdir * accelSpeed
-	end
-
-	local horizSpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
-	if horizSpeed > maxSpeed then
-		local scale = maxSpeed / horizSpeed
-		vel = Vector3(vel.x * scale, vel.y * scale, vel.z)
-	end
-
-	return vel
-end
-
---- Coast with friction only (no input), like CalculateOptimalWishdir pass 1.
----@param startPos Vector3
----@param startVel Vector3
----@param ticks number
----@param onGround boolean
----@return Vector3 pos, Vector3 vel
-function GroundMovement.predictCoast(startPos, startVel, ticks, onGround)
-	local tick = getTickInterval()
-	local pos = Vector3(startPos.x, startPos.y, startPos.z)
-	local vel = Vector3(startVel.x, startVel.y, startVel.z)
-
-	for _ = 1, ticks do
-		pos = pos + vel * tick
-		vel = GroundMovement.applyFriction(vel, onGround)
-	end
-
-	return pos, vel
-end
-
---- Wish direction after coasting: where we should accelerate after friction bleeds velocity.
----@param startPos Vector3
----@param startVel Vector3
----@param dest Vector3
----@param coastTicks number|nil
----@param onGround boolean
----@return Vector3|nil wishdir
-function GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
-	coastTicks = coastTicks or 1
-	onGround = onGround ~= false
-
-	local coastPos, _coastVel
-	if coastTicks > 0 and onGround then
-		coastPos, _coastVel = GroundMovement.predictCoast(startPos, startVel, coastTicks, onGround)
-	else
-		coastPos = startPos
-	end
-
-	local wishdir, dist = horizontalDir(coastPos, dest)
-	if not wishdir then
-		return nil
-	end
-
-	-- Already at target after coast
-	if dist < 1.5 then
-		return nil
-	end
-
-	return wishdir
-end
-
---- How many ticks to coast before aiming (more speed → slightly more lookahead).
-function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
-	if not maxSpeed or maxSpeed <= 0 then
-		return 1
-	end
-	local ratio = horizSpeed / maxSpeed
-	if ratio < 0.25 then
-		return 0
-	end
-	if ratio < 0.6 then
-		return 1
-	end
-	return 2
-end
-
---- Convert world wish direction into forward/side move (view-relative).
----@param cmd UserCmd
----@param wishdir Vector3
----@param cmdSpeed number|nil
-function GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
-	cmdSpeed = cmdSpeed or DEFAULT_CMD_SPEED
-
-	local targetYaw = (math.atan(wishdir.y, wishdir.x) + TWO_PI) % TWO_PI
-	local _, currentYaw = cmd:GetViewAngles()
-	currentYaw = currentYaw * DEG_TO_RAD
-
-	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
-
-	cmd:SetForwardMove(math.cos(yawDiff) * cmdSpeed)
-	cmd:SetSideMove(math.sin(-yawDiff) * cmdSpeed)
-end
-
---- Simulate one tick forward with friction + accel; returns post-tick position.
-function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround)
-	local tick = getTickInterval()
-	vel = GroundMovement.applyFriction(vel, onGround)
-	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
-	return pos + vel * tick, vel
-end
-
-function GroundMovement.getMaxSpeed(player)
-	local cap = player and player:GetPropFloat("m_flMaxspeed")
-	if cap and cap > 0 then
-		return cap
-	end
-	return DEFAULT_MAX_SPEED
-end
-
-function GroundMovement.isOnGround(player)
-	if player and player.IsOnGround and player:IsOnGround() then
-		return true
-	end
-	local flags = player and player:GetPropInt("m_fFlags") or 0
-	return (flags & 1) ~= 0
-end
-
-return GroundMovement
 
 end)
 __bundle_register("NavBot.Navigation", function(require, _LOADED, __bundle_register, __bundle_modules)

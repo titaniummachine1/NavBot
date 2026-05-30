@@ -6,6 +6,7 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local SetupOrchestrator = require("NavBot.Navigation.Setup.SetupOrchestrator")
 local Phase3_KDTree = require("NavBot.Navigation.Setup.Phase3_KDTree")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
 local ConnectionBuilder = require("NavBot.Navigation.ConnectionBuilder")
 
@@ -52,51 +53,70 @@ function Node.GetNodeByID(id)
 	return G.Navigation.nodes and G.Navigation.nodes[id] or nil
 end
 
--- Height check: calculate relative height using node normal (for stairs/slopes)
--- Get Z at position on node's plane, then check height difference
-local function getZOnPlane(px, py, nw, ne, sw)
-	local v1 = ne - nw
-	local v2 = sw - nw
-	local normal = Common.Cross(v1, v2)
-	if normal.z == 0 then
-		return nw.z
+-- When multiple areas overlap (stairs), pick closest floor height
+local function pickBestContainingArea(pos, candidates)
+	local bestNode, bestZErr = nil, math.huge
+
+	for i = 1, #candidates do
+		local node = candidates[i]
+		if not node.isDoor and AreaSpatial.IsWithinArea(pos, node) then
+			local floorZ = node._floorZ or node.pos.z
+			local zErr = math.abs(pos.z - floorZ)
+			if zErr < bestZErr then
+				bestZErr = zErr
+				bestNode = node
+			end
+		end
 	end
-	return nw.z - (normal.x * (px - nw.x) + normal.y * (py - nw.y)) / normal.z
+
+	return bestNode
 end
 
--- Check if position is within area's horizontal bounds (X/Y) with height limit
--- Uses precomputed bounds from Phase2_Normalize for speed
-local function isWithinAreaBounds(pos, node)
-	if not node._minX or not node.pos then
-		return false
-	end
-
-	-- Fast horizontal bounds check using precomputed values (>= for border inclusion)
-	local inHorizontalBounds = pos.x >= node._minX
-		and pos.x <= node._maxX
-		and pos.y >= node._minY
-		and pos.y <= node._maxY
-	if not inHorizontalBounds then
-		return false
-	end
-
-	local groundZ = getZOnPlane(pos.x, pos.y, node.nw, node.ne, node.sw)
-	local heightAbovePlane = pos.z - groundZ
-
-	-- Allow up to 72 units above plane, up to 5 units below plane
-	if heightAbovePlane > 72 or heightAbovePlane < -5 then
-		return false
-	end
-
-	return true
-end
-
-function Node.GetClosestNode(pos)
-	if not G.Navigation.nodes then
+--- Exact area at pos, or nil if not inside any area (never guesses nearest).
+function Node.GetAreaAtPosition(pos)
+	if not G.Navigation.nodes or not pos then
 		return nil
 	end
 
-	-- Pure KD-tree search for maximum speed - just return closest by center
+	local grid = G.Navigation.areaGrid
+	if not grid then
+		return nil
+	end
+
+	return pickBestContainingArea(pos, AreaSpatial.QueryGridCell(grid, pos))
+end
+
+--- Nearest area by AABB distance (for path start/goal when off-mesh). Not for "where am I".
+function Node.GetClosestNode(pos)
+	if not G.Navigation.nodes or not pos then
+		return nil
+	end
+
+	local grid = G.Navigation.areaGrid
+	if grid then
+		local cellCandidates = AreaSpatial.QueryGridCell(grid, pos)
+		local contained = pickBestContainingArea(pos, cellCandidates)
+		if contained then
+			return contained
+		end
+
+		local fromCell = AreaSpatial.FindNearestInList(pos, cellCandidates)
+		if fromCell then
+			return fromCell
+		end
+
+		local neighborCandidates = AreaSpatial.QueryGridNeighbors(grid, pos)
+		contained = pickBestContainingArea(pos, neighborCandidates)
+		if contained then
+			return contained
+		end
+
+		local fromNeighbors = AreaSpatial.FindNearestInList(pos, neighborCandidates)
+		if fromNeighbors then
+			return fromNeighbors
+		end
+	end
+
 	if G.Navigation.kdTree then
 		local nearest = Phase3_KDTree.FindNearest(G.Navigation.kdTree, pos)
 		if nearest then
@@ -104,81 +124,7 @@ function Node.GetClosestNode(pos)
 		end
 	end
 
-	-- Fallback: Brute force scan
-	local closestNode, closestDist = nil, math.huge
-	for _, node in pairs(G.Navigation.nodes) do
-		if not node.isDoor then
-			local dist = (node.pos - pos):Length()
-			if dist < closestDist then
-				closestNode, closestDist = node, dist
-			end
-		end
-	end
-
-	return closestNode
-end
-
--- Get minimum distance from position to area (checks center + all 4 corners)
-local function getMinDistanceToArea(pos, node)
-	if not node.pos or not node.nw or not node.ne or not node.sw or not node.se then
-		return math.huge
-	end
-
-	-- Calculate distance to center + all 4 corners
-	local distCenter = (node.pos - pos):Length()
-	local distNW = (node.nw - pos):Length()
-	local distNE = (node.ne - pos):Length()
-	local distSW = (node.sw - pos):Length()
-	local distSE = (node.se - pos):Length()
-
-	-- Return minimum distance
-	return math.min(distCenter, distNW, distNE, distSW, distSE)
-end
-
--- Get area at position - accurate containment check
--- Uses KD-tree to find nearest candidates, checks up to 10 for containment
-function Node.GetAreaAtPosition(pos)
-	if not G.Navigation.nodes then
-		return nil
-	end
-
-	-- Use KD-tree for efficient nearest neighbor search
-	if G.Navigation.kdTree then
-		-- Get 10 nearest candidates by center distance
-		local nearest = Phase3_KDTree.FindKNearest(G.Navigation.kdTree, pos, 10)
-
-		-- Check each candidate for containment using precomputed bounds
-		for _, candidate in ipairs(nearest) do
-			if isWithinAreaBounds(pos, candidate.node) then
-				Log:Debug("GetAreaAtPosition: Found containing area %s", candidate.id)
-				return candidate.node
-			end
-		end
-
-		-- No containing area found in top 10, return closest by center
-		if nearest[1] then
-			Log:Debug("GetAreaAtPosition: No containing area in top 10, using closest %s", nearest[1].id)
-			return nearest[1].node
-		end
-	end
-
-	-- Fallback: Brute force scan with multi-point distance
-	local closestNode, closestMinDist = nil, math.huge
-	for _, node in pairs(G.Navigation.nodes) do
-		if not node.isDoor then
-			-- Check containment first
-			if isWithinAreaBounds(pos, node) then
-				return node
-			end
-			-- Track closest for fallback
-			local minDist = getMinDistanceToArea(pos, node)
-			if minDist < closestMinDist then
-				closestNode, closestMinDist = node, minDist
-			end
-		end
-	end
-
-	return closestNode
+	return nil
 end
 
 -- Connection utilities
@@ -252,7 +198,6 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 				local targetNode = nodes[targetId]
 
 				if targetNode then
-					-- Simple adjacency - just return connected nodes
 					local cost = (node.pos - targetNode.pos):Length()
 					table.insert(neighbors, {
 						node = targetNode,
@@ -266,7 +211,6 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 	return neighbors
 end
 
--- Optimized version for when only nodes are needed (no cost data)
 function Node.GetAdjacentNodesOnly(node, nodes)
 	if not node or not node.c or not nodes then
 		return {}
@@ -275,7 +219,6 @@ function Node.GetAdjacentNodesOnly(node, nodes)
 	local adjacent = {}
 	local count = 0
 
-	-- FIX: Use pairs() for named directional keys, not ipairs()
 	for _, dir in pairs(node.c) do
 		local connections = dir.connections
 		if connections then
@@ -292,8 +235,6 @@ function Node.GetAdjacentNodesOnly(node, nodes)
 
 	return adjacent
 end
-
--- CleanupConnections removed - AccessibilityChecker was disabled (used area centers, not edges)
 
 function Node.NormalizeConnections()
 	ConnectionBuilder.NormalizeConnections()

@@ -288,7 +288,7 @@ end
 
 --[[ Initialization ]]
 
--- Ensure SmartJump callback runs BEFORE NavBot's callback
+callbacks.Unregister("CreateMove", "SmartJump.Standalone")
 callbacks.Unregister("CreateMove", "ZNavBot.CreateMove")
 callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")

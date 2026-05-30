@@ -198,6 +198,59 @@ function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround
 	return pos + vel * tick, vel
 end
 
+local STEP_HEIGHT = Vector3(0, 0, 18)
+
+--- One ground physics tick with hull collision (for SmartJump prediction).
+---@return Vector3|nil newPos
+---@return Vector3 newVel
+---@return boolean hitWall
+---@return table|nil wallTrace
+function GroundMovement.simulateGroundStepHull(pos, vel, wishdir, maxSpeed, hullMin, hullMax, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+
+	local targetPos = pos + vel * tick
+	local step = STEP_HEIGHT
+
+	local startTrace = engine.TraceHull(pos + step, pos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local startOnGround = startTrace.endpos
+
+	local upTrace = engine.TraceHull(targetPos + step, targetPos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local targetRaised = upTrace.endpos
+
+	local wallTrace = engine.TraceHull(startOnGround + step, targetRaised + step, hullMin, hullMax, MASK_PLAYERSOLID)
+	local newPos = targetRaised
+	if wallTrace.fraction > 0 then
+		newPos = wallTrace.endpos
+	end
+
+	local groundTrace = engine.TraceHull(newPos, newPos - step * 2, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	groundTrace = engine.TraceHull(newPos, newPos - step, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	local hitWall = wallTrace.fraction < 1
+	if hitWall then
+		local wallNormal = wallTrace.plane
+		local up = Vector3(0, 0, 1)
+		local wallAngle = math.deg(math.acos(wallNormal:Dot(up)))
+		if wallAngle > 55 then
+			local dot = vel:Dot(wallNormal)
+			vel = vel - wallNormal * dot
+		end
+	end
+
+	return newPos, vel, hitWall, wallTrace
+end
+
 function GroundMovement.getMaxSpeed(player)
 	local cap = player and player:GetPropFloat("m_flMaxspeed")
 	if cap and cap > 0 then

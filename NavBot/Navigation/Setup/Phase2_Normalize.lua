@@ -4,6 +4,7 @@
 
 local Common = require("NavBot.Core.Common")
 local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local Phase2_Normalize = {}
 
@@ -23,6 +24,12 @@ local function precomputeNodeBounds(node)
 	node._maxX = math.max(node.nw.x, node.ne.x, node.sw.x, node.se.x)
 	node._minY = math.min(node.nw.y, node.ne.y, node.sw.y, node.se.y)
 	node._maxY = math.max(node.nw.y, node.ne.y, node.sw.y, node.se.y)
+
+	AreaSpatial.PrecomputeVerticalBounds(node)
+
+	-- Extents used to tune KD-tree candidate counts for large areas
+	node._extentX = node._maxX - node._minX
+	node._extentY = node._maxY - node._minY
 end
 
 --##########################################################################

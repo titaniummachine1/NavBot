@@ -253,29 +253,38 @@ function MovementDecisions.handleMovingState(userCmd)
 		return
 	end
 
-	-- Update movement direction for SmartJump
 	local targetPos = MovementDecisions.getCurrentTarget()
-	if targetPos then
+	G.BotIntendedWishDir = nil
+	G.BotIsMoving = false
+
+	if targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity then
 		local LocalOrigin = G.pLocal.Origin
 		local direction = targetPos - LocalOrigin
-		G.BotMovementDirection = direction:Length() > 0 and Common.Normalize(direction) or Vector3(0, 0, 0)
-		G.BotIsMoving = true
+		direction.z = 0
+		if direction:Length2D() > 0 then
+			G.BotMovementDirection = Common.Normalize(direction)
+		else
+			G.BotMovementDirection = Vector3(0, 0, 0)
+		end
+
+		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
+		if wishdir then
+			G.BotIntendedWishDir = wishdir
+			G.BotIsMoving = true
+		end
 		G.Navigation.currentTargetPos = targetPos
 	end
 
-	-- Handle camera rotation
 	MovementController.handleCameraRotation(userCmd, targetPos)
 
-	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
 
-	-- ALWAYS execute movement at the end, regardless of decision outcomes
-	MovementDecisions.executeMovement(userCmd)
-
-	-- Handle SmartJump after walkTo
+	-- SmartJump uses intended wishdir before walkTo writes cmd
 	MovementDecisions.handleSmartJump(userCmd)
+
+	MovementDecisions.executeMovement(userCmd)
 end
 
 return MovementDecisions
