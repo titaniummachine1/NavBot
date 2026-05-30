@@ -33,6 +33,8 @@ G.World = G.World_Default
 G.Misc = {
 	NodeTouchDistance = 12,
 	NodeTouchHeight = 82,
+	NodePassProximity = 16, -- was this close → treat current node as passed
+	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
 	workLimit = 1,
 }
 

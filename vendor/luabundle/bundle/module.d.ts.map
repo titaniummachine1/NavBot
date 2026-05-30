@@ -1,0 +1,1 @@
+{"version":3,"file":"module.d.ts","sourceRoot":"","sources":["../src/bundle/module.ts"],"names":[],"mappings":"AAAA,MAAM,MAAM,MAAM,GAAG;IACpB,IAAI,EAAE,MAAM,CAAC;IACb,YAAY,CAAC,EAAE,MAAM,CAAC;IACtB,OAAO,EAAE,MAAM,CAAC;CAChB,CAAA;AAED,MAAM,MAAM,SAAS,GAAG;IACvB,CAAC,IAAI,EAAE,MAAM,GAAG,MAAM,CAAC;CACvB,CAAA"}

@@ -12,21 +12,7 @@
     "version:set": "node scripts/version-manager.cjs set",
     "version:bump": "node scripts/version-manager.cjs bump",
     "version:auto": "node scripts/version-manager.cjs auto",
-    "build": "npm run bundle && npm run deploy"
-  },
-  "dependencies": {
-    "lua-format": "^1.3.4",
-    "luabundle": "^1.7.0",
-    "chokidar": "^3.5.3"
-  },
-  "devDependencies": {
-    "commitizen": "^4.3.0",
-    "cz-conventional-changelog": "^3.3.0"
-  },
-  "config": {
-    "commitizen": {
-      "path": "./node_modules/cz-conventional-changelog"
-    }
+    "build": "node bundle.js && node scripts/deploy.cjs"
   },
   "keywords": [
     "lmaobox",

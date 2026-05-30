@@ -1,10 +1,6 @@
 @echo off
 echo 🔄 Setting up NavBot Development Environment...
 
-:: Install dependencies
-echo 📦 Installing Node.js dependencies...
-call npm install
-
 :: Create VERSION file if it doesn't exist
 if not exist VERSION (
     echo 1.0.0 > VERSION

@@ -150,6 +150,18 @@ function Common.Distance2D(a, b)
 	return (a - b):Length2D()
 end
 
+--- Angle in degrees between two vectors (XY only)
+function Common.Angle2DDegrees(a, b)
+	local la = a:Length2D()
+	local lb = b:Length2D()
+	if la < 0.001 or lb < 0.001 then
+		return 0
+	end
+	local dot = a:Dot(b) / (la * lb)
+	dot = math.max(-1, math.min(1, dot))
+	return math.deg(math.acos(dot))
+end
+
 --distance3D check proly fastest posible in lua
 function Common.Distance3D(a, b)
 	return vectorDistance(a, b)

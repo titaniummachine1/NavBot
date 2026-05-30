@@ -712,6 +712,8 @@ G.World = G.World_Default
 G.Misc = {
 	NodeTouchDistance = 12,
 	NodeTouchHeight = 82,
+	NodePassProximity = 16, -- was this close → treat current node as passed
+	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
 	workLimit = 1,
 }
 
@@ -1746,6 +1748,18 @@ end
 -- Distance2d posibly slower then distance 3D due to mroe instructions in lua then single call in cpp lib of dist 3d
 function Common.Distance2D(a, b)
 	return (a - b):Length2D()
+end
+
+--- Angle in degrees between two vectors (XY only)
+function Common.Angle2DDegrees(a, b)
+	local la = a:Length2D()
+	local lb = b:Length2D()
+	if la < 0.001 or lb < 0.001 then
+		return 0
+	end
+	local dot = a:Dot(b) / (la * lb)
+	dot = math.max(-1, math.min(1, dot))
+	return math.deg(math.acos(dot))
 end
 
 --distance3D check proly fastest posible in lua
@@ -8572,7 +8586,12 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	return (horizontalDist < G.Misc.NodeTouchDistance) and (verticalDist <= G.Misc.NodeTouchHeight)
+	local reachDist = G.Misc.NodeTouchDistance
+	-- Wider threshold between path nodes (passed-node proximity)
+	if G.Navigation.path and #G.Navigation.path > 1 then
+		reachDist = math.max(reachDist, G.Misc.NodePassProximity or 16)
+	end
+	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
 end
 
 -- Reset distance tracking (call when path changes)
@@ -8749,6 +8768,7 @@ Node Skipper - Per-tick node skipping with menu-controlled limits
 Uses:
 - G.Menu.Main.MaxSkipRange: max distance to skip (default 500)
 - G.Menu.Main.MaxNodesToSkip: max nodes per tick (default 3)
+- G.Misc.NodePassProximity / NodePassAngleDegrees: passed-node detection
 ]]
 
 local Common = require("NavBot.Core.Common")
@@ -8761,20 +8781,102 @@ local Log = Common.Log.new("NodeSkipper")
 
 local NodeSkipper = {}
 
-function NodeSkipper.Reset() end
-
 local function isDoorNode(node)
 	return node and not node._minX
+end
+
+local function resetPassTracker(nodeId)
+	if not nodeId then
+		G.Navigation.nodePassTrack = nil
+		return
+	end
+	G.Navigation.nodePassTrack = {
+		nodeId = nodeId,
+		lastDirToNode = nil, -- previous tick: horizontal bearing from player to this node
+	}
+end
+
+--- Bearing-to-node overshoot: each tick compare dir-to-node vs last tick.
+--- If it swings >= 60° before normal reach distance, you walked past it.
+local function checkPassedCurrentNode(playerPos, node, nextNode)
+	if not (node and node.pos and nextNode and nextNode.pos) then
+		return false, nil
+	end
+
+	local track = G.Navigation.nodePassTrack
+	if not track or track.nodeId ~= node.id then
+		resetPassTracker(node.id)
+		track = G.Navigation.nodePassTrack
+	end
+
+	local proximity = G.Misc.NodePassProximity or 16
+	local passAngle = G.Misc.NodePassAngleDegrees or 60
+	local reachDist = G.Misc.NodeTouchDistance or 12
+
+	local dist2D = Common.Distance2D(playerPos, node.pos)
+	if dist2D <= proximity then
+		return true, "proximity"
+	end
+
+	local dirToNode = Vector3(node.pos.x - playerPos.x, node.pos.y - playerPos.y, 0)
+	local dirLen = dirToNode:Length2D()
+	if dirLen < 1 then
+		return true, "at_node"
+	end
+	dirToNode = dirToNode / dirLen
+
+	-- Overshoot: direction toward node changed sharply before we reached it
+	if track.lastDirToNode and dist2D > reachDist then
+		local bearingDelta = Common.Angle2DDegrees(track.lastDirToNode, dirToNode)
+		if bearingDelta >= passAngle then
+			track.lastDirToNode = dirToNode
+			return true, "overshoot"
+		end
+	end
+
+	track.lastDirToNode = dirToNode
+	return false, nil
+end
+
+local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
+	if isDoorNode(currentNode) or isDoorNode(nextNode) then
+		Log:Debug("SKIP blocked (door): %s", reason)
+		return false
+	end
+
+	local currentArea = Node.GetAreaAtPosition(playerPos)
+	if not currentArea then
+		return false
+	end
+
+	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, nextNode.pos, currentArea, true, allowJump)
+	if not (success and canSkip) then
+		Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
+		return false
+	end
+
+	local missedNode = table.remove(G.Navigation.path, 1)
+	G.Navigation.pathHistory = G.Navigation.pathHistory or {}
+	table.insert(G.Navigation.pathHistory, 1, missedNode)
+	while #G.Navigation.pathHistory > 32 do
+		table.remove(G.Navigation.pathHistory)
+	end
+
+	G.Navigation.lastSkipTick = globals.TickCount()
+	resetPassTracker(nextNode.id)
+
+	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
+	return true
+end
+
+function NodeSkipper.Reset()
+	G.Navigation.nodePassTrack = nil
 end
 
 function NodeSkipper.Tick(playerPos)
 	assert(playerPos, "Tick: playerPos missing")
 
-	if not G.Menu.Navigation.Skip_Nodes then
-		return false
-	end
-
-	-- Check stuck cooldown (prevent skipping when stuck)
 	if not WorkManager.attemptWork(1, "node_skipping") then
 		return false
 	end
@@ -8786,65 +8888,33 @@ function NodeSkipper.Tick(playerPos)
 
 	local currentNode = path[1]
 	local nextNode = path[2]
+	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
+		return false
+	end
 
-	-- SMART SKIP: Check if player already passed the current target (path[1])
-	-- We compare distance to next target (path[2])
-	if currentNode and currentNode.pos and nextNode and nextNode.pos then
-		-- Get current area for walkability check
-		local currentArea = Node.GetAreaAtPosition(playerPos)
-		if not currentArea then
-			return false
-		end
+	-- Passed current node (proximity / overshoot) — always on, not menu-gated
+	local passed, passReason = checkPassedCurrentNode(playerPos, currentNode, nextNode)
+	if passed and trySkipCurrentNode(playerPos, currentNode, nextNode, passReason) then
+		G.Navigation.currentNodeIndex = 1
+		return true
+	end
 
-		local distPlayerToNext = Common.Distance3D(playerPos, nextNode.pos)
-		local distCurrentToNext = Common.Distance3D(currentNode.pos, nextNode.pos)
+	if not G.Menu.Navigation.Skip_Nodes then
+		return false
+	end
 
-		if distPlayerToNext < distCurrentToNext then
-			if isDoorNode(currentNode) or isDoorNode(nextNode) then
-				Log:Debug(
-					"SMART SKIP blocked: door node in segment (%s -> %s)",
-					tostring(currentNode.id),
-					tostring(nextNode.id)
-				)
-				return false
-			end
-			-- Player is closer to path[2] than path[1] is to path[2] - we passed path[1]
-			-- BUT: Only skip if we can actually walk to nextNode from current position
-			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-			local success, canSkip = pcall(isNavigable.CanSkip, playerPos, nextNode.pos, currentArea, true, allowJump)
+	-- Closer to next node than current node is (legacy smart skip)
+	local distPlayerToNext = Common.Distance3D(playerPos, nextNode.pos)
+	local distCurrentToNext = Common.Distance3D(currentNode.pos, nextNode.pos)
 
-			if success and canSkip then
-				local missedNode = table.remove(path, 1)
-
-				-- Add to history
-				G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-				table.insert(G.Navigation.pathHistory, 1, missedNode)
-				while #G.Navigation.pathHistory > 32 do
-					table.remove(G.Navigation.pathHistory)
-				end
-
-				-- Track when we last skipped
-				G.Navigation.lastSkipTick = globals.TickCount()
-
-				Log:Info(
-					"MISSED waypoint %s (player closer to next), skipping to %s",
-					tostring(missedNode.id),
-					tostring(nextNode.id)
-				)
-				G.Navigation.currentNodeIndex = 1
-				return true
-			else
-				Log:Debug(
-					"SMART SKIP blocked: Cannot walk to next node %s from current position",
-					tostring(nextNode.id)
-				)
-				return false
-			end
+	if distPlayerToNext < distCurrentToNext then
+		if trySkipCurrentNode(playerPos, currentNode, nextNode, "closer_to_next") then
+			G.Navigation.currentNodeIndex = 1
+			return true
 		end
 	end
 
-	-- FORWARD SKIP: Single check per tick (path[3] only)
-	-- If we can walk directly to path[3], skip path[1] and path[2] and bail.
+	-- Forward skip: walk directly to path[3]
 	if #path < 3 then
 		return false
 	end
@@ -8881,6 +8951,7 @@ function NodeSkipper.Tick(playerPos)
 	local skipped1 = table.remove(path, 1)
 	if skipped1 then
 		table.insert(G.Navigation.pathHistory, 1, skipped1)
+		resetPassTracker(path[1] and path[1].id or nil)
 	end
 	local skipped2 = table.remove(path, 1)
 	if skipped2 then
@@ -9091,62 +9162,19 @@ return WorkManager
 end)
 __bundle_register("NavBot.Bot.MovementController", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
-Movement Controller - Handles physics-accurate player movement
-Superior WalkTo implementation with predictive/no-overshoot logic
+Movement Controller - TF2 ground physics walk (Auto_Trickstab friction + accel model)
 ]]
 
-local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
+local Common = require("NavBot.Core.Common")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
+-- Common: camera helper only
 
 local MovementController = {}
-local Log = Common.Log.new("MovementController")
 
--- Constants for physics-accurate movement
-local MAX_SPEED = 450 -- Maximum speed the player can move
-local TWO_PI = 2 * math.pi
-local DEG_TO_RAD = math.pi / 180
+local ARRIVAL_DIST = 1.5
 
--- Ground-physics helpers (synced with server convars)
-local DEFAULT_GROUND_FRICTION = 4 -- fallback for sv_friction
-local DEFAULT_SV_ACCELERATE = 10 -- fallback for sv_accelerate
-
-local function getGroundFriction()
-	local ok, val = pcall(client.GetConVar, "sv_friction")
-	if ok and val and val > 0 then
-		return val
-	end
-	return DEFAULT_GROUND_FRICTION
-end
-
-local function getGroundMaxDeltaV(player, tick)
-	tick = (tick and tick > 0) and tick or 1 / 66.67
-	local svA = client.GetConVar("sv_accelerate") or 0
-	if svA <= 0 then
-		svA = DEFAULT_SV_ACCELERATE
-	end
-
-	local cap = player and player:GetPropFloat("m_flMaxspeed") or MAX_SPEED
-	if not cap or cap <= 0 then
-		cap = MAX_SPEED
-	end
-
-	return svA * cap * tick
-end
-
--- Computes the move vector between two points
-local function computeMove(userCmd, a, b)
-	local dx, dy = b.x - a.x, b.y - a.y
-
-	local targetYaw = (math.atan(dy, dx) + TWO_PI) % TWO_PI
-	local _, currentYaw = userCmd:GetViewAngles()
-	currentYaw = currentYaw * DEG_TO_RAD
-
-	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
-
-	return Vector3(math.cos(yawDiff) * MAX_SPEED, math.sin(-yawDiff) * MAX_SPEED, 0)
-end
-
--- Predictive/no-overshoot WalkTo (superior implementation)
+--- Walk toward dest using simulated friction/coast wish direction + optimal ground accel input.
 function MovementController.walkTo(cmd, player, dest)
 	if not (cmd and player and dest) then
 		return
@@ -9157,56 +9185,32 @@ function MovementController.walkTo(cmd, player, dest)
 		return
 	end
 
-	local tick = globals.TickInterval()
-	if tick <= 0 then
-		tick = 1 / 66.67
-	end
-
-	-- Current horizontal velocity (ignore Z) - this is per second, convert to per tick
-	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
-	vel.z = 0
-	local vel_per_tick = vel * tick -- displacement over this tick if we coast
-
-	-- Get max acceleration for this tick
-	local maxAccel = getGroundMaxDeltaV(player, tick)
-
-	-- Vector from current position to destination
 	local toDest = dest - pos
 	toDest.z = 0
-	local distToDest = toDest:Length()
-
-	if distToDest < 1.5 then
+	if toDest:Length2D() < ARRIVAL_DIST then
 		cmd:SetForwardMove(0)
 		cmd:SetSideMove(0)
 		return
 	end
 
-	-- Counter-velocity steering: acceleration vector from tip of velocity vector to destination
-	-- Place acceleration vector on tip of velocity vector (pos + vel_per_tick), pointing at destination
-	local accelVector = toDest - vel_per_tick
-	local accelLen = accelVector:Length()
+	local onGround = GroundMovement.isOnGround(player)
+	local maxSpeed = GroundMovement.getMaxSpeed(player)
+	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
+	vel.z = 0
 
-	-- If destination is within reach of acceleration vector this tick, walk directly
-	local maxAccelDist = maxAccel * tick
-	if accelLen <= maxAccelDist then
-		local moveVec = computeMove(cmd, pos, dest)
-		cmd:SetForwardMove(moveVec.x)
-		cmd:SetSideMove(moveVec.y)
+	local horizSpeed = vel:Length2D()
+	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
+	local wishdir = GroundMovement.computeWishDirToTarget(pos, vel, dest, coastTicks, onGround)
+
+	if not wishdir then
+		cmd:SetForwardMove(0)
+		cmd:SetSideMove(0)
 		return
 	end
 
-	-- Direction of acceleration vector (this counters velocity and aims at destination)
-	local accelDir = accelVector / accelLen
-
-	-- Calculate required velocity change and clamp to physics limits
-	local desiredAccel = accelDir * maxAccel
-
-	-- Convert acceleration direction to movement inputs
-	local accelEnd = pos + desiredAccel
-	local moveVec = computeMove(cmd, pos, accelEnd)
-
-	cmd:SetForwardMove(moveVec.x)
-	cmd:SetSideMove(moveVec.y)
+	-- Air: still steer toward target; ground uses full cmd speed cap
+	local cmdSpeed = math.min(maxSpeed + 1, 450)
+	GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
 end
 
 --- Handle camera rotation if LookingAhead is enabled AND walking is enabled
@@ -9233,6 +9237,226 @@ function MovementController.handleCameraRotation(userCmd, targetPos)
 end
 
 return MovementController
+
+end)
+__bundle_register("NavBot.Bot.GroundMovement", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Ground movement physics (from Auto_Trickstab SimulateDash / CalculateOptimalWishdir)
+Friction + sv_accelerate ground model for optimal wish direction each tick.
+]]
+
+local GroundMovement = {}
+
+local TWO_PI = 2 * math.pi
+local DEG_TO_RAD = math.pi / 180
+
+local DEFAULT_FRICTION = 4
+local DEFAULT_ACCELERATE = 10
+local DEFAULT_STOP_SPEED = 100
+local DEFAULT_MAX_SPEED = 320
+local DEFAULT_CMD_SPEED = 450
+
+local function getTickInterval()
+	local tick = globals.TickInterval()
+	if tick <= 0 then
+		return 1 / 66.67
+	end
+	return tick
+end
+
+local function getFriction()
+	local ok, val = pcall(client.GetConVar, "sv_friction")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_FRICTION
+end
+
+local function getAccelerate()
+	local ok, val = pcall(client.GetConVar, "sv_accelerate")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_ACCELERATE
+end
+
+local function horizontalDir(from, to)
+	local dir = Vector3(to.x - from.x, to.y - from.y, 0)
+	local len = dir:Length2D()
+	if len < 0.001 then
+		return nil, 0
+	end
+	return dir / len, len
+end
+
+---@param velocity Vector3
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyFriction(velocity, onGround)
+	if not velocity or not onGround then
+		return velocity or Vector3(0, 0, 0)
+	end
+
+	local speed = velocity:Length()
+	if speed < DEFAULT_STOP_SPEED then
+		return Vector3(0, 0, 0)
+	end
+
+	local tick = getTickInterval()
+	local friction = getFriction() * tick
+	local control = speed < DEFAULT_STOP_SPEED and DEFAULT_STOP_SPEED or speed
+	local drop = control * friction
+	local newSpeed = speed - drop
+
+	if newSpeed < 0 then
+		newSpeed = 0
+	end
+
+	if newSpeed < speed then
+		return velocity * (newSpeed / speed)
+	end
+
+	return velocity
+end
+
+--- One tick of ground acceleration along wishdir (TF2 ProcessMovement style).
+---@param velocity Vector3
+---@param wishdir Vector3
+---@param maxSpeed number
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyGroundAccel(velocity, wishdir, maxSpeed, onGround)
+	if not onGround or not wishdir then
+		return velocity
+	end
+
+	local tick = getTickInterval()
+	local accel = getAccelerate()
+	local vel = Vector3(velocity.x, velocity.y, velocity.z)
+
+	local currentSpeed = vel:Dot(wishdir)
+	local addSpeed = maxSpeed - currentSpeed
+	if addSpeed > 0 then
+		local accelSpeed = math.min(accel * maxSpeed * tick, addSpeed)
+		vel = vel + wishdir * accelSpeed
+	end
+
+	local horizSpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+	if horizSpeed > maxSpeed then
+		local scale = maxSpeed / horizSpeed
+		vel = Vector3(vel.x * scale, vel.y * scale, vel.z)
+	end
+
+	return vel
+end
+
+--- Coast with friction only (no input), like CalculateOptimalWishdir pass 1.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param ticks number
+---@param onGround boolean
+---@return Vector3 pos, Vector3 vel
+function GroundMovement.predictCoast(startPos, startVel, ticks, onGround)
+	local tick = getTickInterval()
+	local pos = Vector3(startPos.x, startPos.y, startPos.z)
+	local vel = Vector3(startVel.x, startVel.y, startVel.z)
+
+	for _ = 1, ticks do
+		pos = pos + vel * tick
+		vel = GroundMovement.applyFriction(vel, onGround)
+	end
+
+	return pos, vel
+end
+
+--- Wish direction after coasting: where we should accelerate after friction bleeds velocity.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param dest Vector3
+---@param coastTicks number|nil
+---@param onGround boolean
+---@return Vector3|nil wishdir
+function GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
+	coastTicks = coastTicks or 1
+	onGround = onGround ~= false
+
+	local coastPos, _coastVel
+	if coastTicks > 0 and onGround then
+		coastPos, _coastVel = GroundMovement.predictCoast(startPos, startVel, coastTicks, onGround)
+	else
+		coastPos = startPos
+	end
+
+	local wishdir, dist = horizontalDir(coastPos, dest)
+	if not wishdir then
+		return nil
+	end
+
+	-- Already at target after coast
+	if dist < 1.5 then
+		return nil
+	end
+
+	return wishdir
+end
+
+--- How many ticks to coast before aiming (more speed → slightly more lookahead).
+function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
+	if not maxSpeed or maxSpeed <= 0 then
+		return 1
+	end
+	local ratio = horizSpeed / maxSpeed
+	if ratio < 0.25 then
+		return 0
+	end
+	if ratio < 0.6 then
+		return 1
+	end
+	return 2
+end
+
+--- Convert world wish direction into forward/side move (view-relative).
+---@param cmd UserCmd
+---@param wishdir Vector3
+---@param cmdSpeed number|nil
+function GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
+	cmdSpeed = cmdSpeed or DEFAULT_CMD_SPEED
+
+	local targetYaw = (math.atan(wishdir.y, wishdir.x) + TWO_PI) % TWO_PI
+	local _, currentYaw = cmd:GetViewAngles()
+	currentYaw = currentYaw * DEG_TO_RAD
+
+	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
+
+	cmd:SetForwardMove(math.cos(yawDiff) * cmdSpeed)
+	cmd:SetSideMove(math.sin(-yawDiff) * cmdSpeed)
+end
+
+--- Simulate one tick forward with friction + accel; returns post-tick position.
+function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+	return pos + vel * tick, vel
+end
+
+function GroundMovement.getMaxSpeed(player)
+	local cap = player and player:GetPropFloat("m_flMaxspeed")
+	if cap and cap > 0 then
+		return cap
+	end
+	return DEFAULT_MAX_SPEED
+end
+
+function GroundMovement.isOnGround(player)
+	if player and player.IsOnGround and player:IsOnGround() then
+		return true
+	end
+	local flags = player and player:GetPropInt("m_fFlags") or 0
+	return (flags & 1) ~= 0
+end
+
+return GroundMovement
 
 end)
 __bundle_register("NavBot.Navigation", function(require, _LOADED, __bundle_register, __bundle_modules)

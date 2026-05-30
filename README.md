@@ -11,17 +11,21 @@ For an overview of the lightweight nav-mesh rendering method, see
 
 # How to use
 
-First, go to https://nodejs.org/ and download and install the stable version of Node.JS
+Install [Node.js](https://nodejs.org/) (stable). Clone or download this repo — **no `npm install`**; the bundler is in `vendor/`.
 
-Next, go to releases and download the source code (zip) and unzip it to any place you want.
-
-After that, you open the **Node.JS command prompt** and execute
+Build and deploy once:
 
 ```
-npm install luabundle
+npm run build
 ```
 
-Once it has installed, run Bundle.bat and after it finishes run BundleAndDeploy.bat
+Or watch `NavBot/` and auto bundle + deploy on save:
+
+```
+npm run watch
+```
+
+You can also run `Bundle.bat` then `BundleAndDeploy.bat`
 
 When those batch scripts have finished, run MakeNavs.bat to get nav meshes for all causal maps
 
@@ -173,11 +177,9 @@ Another aspect of transitions is how bots orient themselves through doorways or 
 - **Stairs and Ramps:** These are usually built as a series of nav areas that increment in Z. However, the nav generator flags them as _STAIRS_ (green line overlay) and generally keeps stairs as walkable continuous areas rather than a bunch of tiny steps. Bots don’t need to do anything special for stairs except just walk forward – the engine’s movement code will automatically climb up small step heights (Source engine characters can step up minor height changes up to a certain height without jumping). The nav areas on stairs often overlap multiple actual steps, creating a ramp in nav terms. The _STAIRS_ flag is mostly informational (to prevent the generator from splitting them in weird ways, and to signal the bot that it doesn’t need to jump). When pathfinding, stairs areas are just nodes like others; the vertical difference is encoded in the distances. Since running up stairs might slow movement slightly due to gravity, the cost might be a tad higher than flat distance, but A\* doesn’t explicitly account for that except via distance and maybe a small constant. Bots handle stairs by just moving forward; if the steps are unusually tall (above step height but below jump height), sometimes nav generation fails and such cases require marking the area with _JUMP_ or tweaking the mesh.
 - **Slopes:** Sloped terrain is handled by nav areas with different corner heights, as mentioned. Bots treat it no differently than flat ground – the coordinates smoothly change in Z as they cross the area. Since slope traversal speed is the same as flat in TF2, no special cost or behavior is needed. The navmesh essentially “bakes in” the slope as part of the area geometry, so the bot’s path will just go through those sloped areas. One thing to watch is extremely steep slopes: navmesh might not generate areas on slopes beyond a certain angle (they’d be unwalkable), or they might require a _JUMP_ connection. But moderate slopes (e.g. the ramps up to capture points) are just nav areas with one corner higher than the other. The bot’s movement code (NextBot locomotion) will try to move in a straight line toward the target point; the collision with world geometry will naturally elevate the bot along the slope.
 - **Jumps (Gaps/Cliffs):** If a bot must jump to get from one area to another (for example, a small gap or hopping down from a ledge), the nav mesh can represent this in a couple ways. For upward jumps: The higher area may be marked with the JUMP attribute on its lower neighbor side, meaning “to enter here, bot needs to jump”. The pathfinding algorithm itself can still consider that a connection (because nav generator usually still links the areas), but the bot’s **Action** for that transition will include a jump. TF2 bots are programmed to attempt a jump when traversing into a JUMP-flagged area. If multiple paths exist and one requires a jump, a designer might mark those areas as _avoid_ or give them slightly higher cost so that bots prefer non-jump paths unless the jump route is significantly shorter. For downward drops: The navmesh may sometimes have a one-way connection (if the drop isn’t too high to injure the bot). In many cases, large drops are not linked in navmesh at all (to prevent bots from suicidally dropping). But if a drop is survivable and intended (e.g. dropping off a ledge to a lower floor in 2Fort), the nav mesh might connect the upper area’s south edge to the lower area’s north edge, but not vice versa. The engine can also mark such connections with a _drop-down_ flag (there isn’t a specific nav flag for “drop” aside from one-way link, but “cliff” attribute exists to denote areas near a big drop). Bots deciding to go down might just see it as a neighbor and do it (the movement code will let them fall). If a safe drop requires a _crouch_ or careful movement, usually it’s avoided or handled as a ladder or special case.
-
   - The pathfinding cost for a jump or drop may not be fully captured by center distance. There might be a constant penalty added for jumps (to discourage unless beneficial). Valve’s CS bots, for example, had logic to slightly prefer non-jump paths for smoothness. TF2 bots in combat might actually be more willing to drop down if chasing an enemy, but when simply pathing to a goal, they’d treat a long way around as possibly better than a dangerous drop.
 
 - **Ladders:** Ladders are a distinct nav element. When A\* explores neighbors of an area, it must also consider ladder moves. For example, from bottom area X, the algorithm sees ladder L in X’s “ladder up” list; it will then consider the area at the top of L (let’s call it area Y) as a neighbor of X for pathfinding purposes. Similarly, from a top area that has a ladder down, it considers the bottom area neighbor. The cost to traverse a ladder can be calculated as the ladder’s length or vertical distance divided by climb speed (i.e., time to climb). Ladder climbing is slower than running, so effectively a ladder edge is “longer” than a horizontal edge of the same spatial distance. The nav file includes the ladder’s **length** (vertical extent), so the pathfinder can use that. Typically, ladder traversal speed is known (e.g. X units/sec), so cost = length (or some multiple). Bots will avoid ladder routes if a faster walk route exists due to this cost. However, in many maps ladders might be the only way up certain spots (e.g. the towers in Double Cross).
-
   - When a bot reaches a ladder during movement, the navigation code switches to a ladder climbing mode. Pathfinding only gives it the sequence: e.g. Area 10 (bottom) → _via Ladder 3_ → Area 11 (top). The bot then aligns with Ladder 3’s bottom point and climbs. The nav area at the ladder’s top often does not overlap the ladder; rather the ladder has specific “mount” points (top and bottom). Valve’s nav ladders have fields for the top exit connections – forward, left, right, behind area IDs – which indicate where a bot can go when it finishes climbing. For example, if a ladder top leads onto a ledge area 5, that would be topForwardArea=5 (assuming forward of ladder faces that ledge). The bot, upon climbing, will land into that area and continue on the path.
   - Ladders can also be blocked by design for one team (though usually not – most ladders are neutral). If needed, a ladder’s top or bottom areas might be marked as one-way doors or blocked if, say, it goes into an enemy spawn. That would be handled by the area flags, not ladder data itself.
 

@@ -105,7 +105,12 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	return (horizontalDist < G.Misc.NodeTouchDistance) and (verticalDist <= G.Misc.NodeTouchHeight)
+	local reachDist = G.Misc.NodeTouchDistance
+	-- Wider threshold between path nodes (passed-node proximity)
+	if G.Navigation.path and #G.Navigation.path > 1 then
+		reachDist = math.max(reachDist, G.Misc.NodePassProximity or 16)
+	end
+	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
 end
 
 -- Reset distance tracking (call when path changes)
