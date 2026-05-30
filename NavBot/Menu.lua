@@ -77,20 +77,7 @@ local function OnDrawMenu()
 		TimMenu.NextLine()
 
 		G.Menu.SmartJump.Debug = TimMenu.Checkbox("SmartJump Debug Logs", G.Menu.SmartJump.Debug or false)
-		TimMenu.Tooltip(
-			"SmartJump debug: throttled traces + every state transition at [Info] with tick/cmd/duration"
-		)
-		TimMenu.NextLine()
-
-		G.Menu.SmartJump.UseJumpbug = TimMenu.Checkbox("Auto Jumpbug", G.Menu.SmartJump.UseJumpbug ~= false)
-		TimMenu.Tooltip(
-			"While SmartJump is active and falling: trace down and unduck+jump in the landing window (no key bind)"
-		)
-		TimMenu.NextLine()
-
-		G.Menu.SmartJump.DrawJumpbugTraces =
-			TimMenu.Checkbox("Draw Jumpbug Traces", G.Menu.SmartJump.DrawJumpbugTraces or false)
-		TimMenu.Tooltip("Green/red lines for jumpbug ground traces (enable Show SmartJump on Visuals tab)")
+		TimMenu.Tooltip("SmartJump debug: throttled traces + every state transition at [Info] with tick/cmd/duration")
 		TimMenu.EndSector()
 	elseif G.Menu.Tab == "Navigation" then
 		-- Movement & Pathfinding Section

@@ -62,8 +62,6 @@ local Default_Config = {
 	SmartJump = {
 		Enable = true,
 		Debug = false,
-		UseJumpbug = true,
-		DrawJumpbugTraces = false,
 	},
 }
 

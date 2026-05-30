@@ -172,10 +172,17 @@ function MovementDecisions.checkStuckState(userCmd)
 		local pLocal = G.pLocal.entity
 		if pLocal then
 			if userCmd and SmartJump.wantsLiveJump(userCmd) then
-				G.SmartJump.RequestEmergencyJump = true
 				G.Navigation.lowVelocityTicks = 0
 				if G.currentState == G.States.STUCK then
 					G.currentState = G.States.MOVING
+				end
+				if
+					not SmartJump.isActive()
+					and not SmartJump.isOnJumpFailCooldown()
+					and SmartJump.hasMinJumpSpeed(pLocal)
+					and not G.SmartJump.RequestEmergencyJump
+				then
+					G.SmartJump.RequestEmergencyJump = true
 				end
 				return
 			end
