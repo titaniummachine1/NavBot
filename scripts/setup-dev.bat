@@ -18,10 +18,8 @@ call npm run bundle
 echo ✅ Development environment setup complete!
 echo.
 echo 🎯 Quick start commands:
-echo    npm run dev        - Start development mode with hot reload
-echo    npm run build      - Build and deploy
-echo    npm run watch      - Watch for changes and auto-bundle
-echo    npm run hot-reload - Start hot reload only
+echo    npm run watch      - Watch NavBot\ and bundle + deploy on save
+echo    npm run build      - Bundle and deploy once
 echo.
 echo 💡 Commit with version bumping:
 echo    git commit -m "feat: add new feature"     - Auto bump minor version
