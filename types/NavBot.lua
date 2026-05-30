@@ -4,6 +4,8 @@
 ---@class NavMenuSmartJump
 ---@field Enable boolean
 ---@field Debug boolean SmartJump-only logs without global debug
+---@field UseJumpbug boolean Auto unduck+jump when falling during a SmartJump attempt
+---@field DrawJumpbugTraces boolean Draw jumpbug ground traces when Show SmartJump is on
 
 ---@class NavMenuMain
 ---@field Enable boolean

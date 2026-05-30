@@ -143,6 +143,7 @@ local function configAutoSaveOnUnload()
 	end
 end
 
+callbacks.Unregister("Unload", "NavBot.ConfigAutoSaveOnUnload")
 callbacks.Register("Unload", "NavBot.ConfigAutoSaveOnUnload", configAutoSaveOnUnload)
 
 return Config
