@@ -14,6 +14,7 @@ local MovementController = require("NavBot.Bot.MovementController")
 local WorkManager = require("NavBot.WorkManager")
 local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local SmartJump = require("NavBot.Bot.SmartJump")
 
 local MovementDecisions = {}
 local Log = Common.Log.new("MovementDecisions")
@@ -188,34 +189,32 @@ function MovementDecisions.checkStuckState()
 				end
 			end
 
-			-- Don't treat CTAP / jump ascent as stuck (velocity stays low on ground)
-			local sj = G.SmartJump
-			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+			if SmartJump.isActive() then
 				G.Navigation.lowVelocityTicks = 0
 			else
-			-- Velocity-based stuck detection
-			local velocity = pLocal:EstimateAbsVelocity()
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+				-- Velocity-based stuck detection
+				local velocity = pLocal:EstimateAbsVelocity()
+				if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
+					local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
 
-				-- Critical velocity threshold: < 50 = stuck
-				if speed2D < 50 then
-					G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
+					-- Critical velocity threshold: < 50 = stuck
+					if speed2D < 50 then
+						G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
 
-					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
-					if G.Navigation.lowVelocityTicks > 66 then
-						Log:Warn(
-							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
-							speed2D,
-							G.Navigation.lowVelocityTicks
-						)
-						G.currentState = G.States.STUCK
+						-- If velocity too low for 66 ticks (1 second), switch to STUCK state
+						if G.Navigation.lowVelocityTicks > 66 then
+							Log:Warn(
+								"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
+								speed2D,
+								G.Navigation.lowVelocityTicks
+							)
+							G.currentState = G.States.STUCK
+							G.Navigation.lowVelocityTicks = 0
+						end
+					else
 						G.Navigation.lowVelocityTicks = 0
 					end
-				else
-					G.Navigation.lowVelocityTicks = 0
 				end
-			end
 			end
 		end
 	end
@@ -310,7 +309,6 @@ function MovementDecisions.handleMovingState(userCmd)
 	MovementController.handleCameraRotation(userCmd, targetPos)
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
-	MovementDecisions.checkStuckState()
 	MovementDecisions.executeMovement(userCmd)
 end
 

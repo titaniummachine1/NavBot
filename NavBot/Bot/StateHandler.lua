@@ -7,10 +7,10 @@ local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local Node = require("NavBot.Navigation.Node")
 local WorkManager = require("NavBot.WorkManager")
+local SmartJump = require("NavBot.Bot.SmartJump")
 local GoalFinder = require("NavBot.Bot.GoalFinder")
 local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
 local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
-local SmartJump = require("NavBot.Bot.SmartJump")
 local MovementDecisions = require("NavBot.Bot.MovementDecisions")
 
 local StateHandler = {}
@@ -247,8 +247,11 @@ function StateHandler.handleStuckState(userCmd)
 				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
 			end
 
-			local sj = G.SmartJump
-			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+			if SmartJump.isActive() then
+				G.Navigation.lowVelocityTicks = 0
+				if G.currentState == G.States.STUCK then
+					G.currentState = G.States.MOVING
+				end
 				return
 			end
 

@@ -75,7 +75,7 @@ require("NavBot.Bot.ISWalkableTest")
 require("NavBot.Bot.OptimizedISWalkableTest")
 require("NavBot.Bot.IsNavigableTest")
 require("NavBot.Visuals")
-require("NavBot.Utils.Config")
+local Config = require("NavBot.Utils.Config")
 require("NavBot.Menu")
 
 --[[ Setup ]]
@@ -148,13 +148,12 @@ local function onCreateMove(userCmd)
 				MovementDecisions.updateWalkIntent(userCmd)
 				MovementDecisions.executeMovement(userCmd)
 			end
-			StateHandler.handleStuckState(userCmd)
 		else
 			G.currentState = G.States.MOVING
 		end
 	end
 
-	-- SmartJump runs last so duck/jump buttons are not overwritten by walkTo
+	-- SmartJump before stuck checks so jumpState / suppress window are current this tick
 	if G.Menu.Main.Enable and G.Menu.SmartJump and G.Menu.SmartJump.Enable then
 		local shouldRunJump = G.currentState == G.States.MOVING
 			or G.currentState == G.States.FOLLOWING
@@ -162,6 +161,14 @@ local function onCreateMove(userCmd)
 		if shouldRunJump then
 			SmartJump.Main(userCmd)
 		end
+	end
+
+	if G.currentState == G.States.MOVING or G.currentState == G.States.FOLLOWING then
+		MovementDecisions.checkStuckState()
+	end
+
+	if G.currentState == G.States.STUCK then
+		StateHandler.handleStuckState(userCmd)
 	end
 
 	WorkManager.processWorks()
@@ -376,6 +383,14 @@ if entities.GetLocalPlayer() then
 end
 
 Log:Info("NavBot modular system initialized - %d modules loaded", 7)
+
+local function onNavBotUnload()
+	if G.Menu then
+		Config.CreateCFG(G.Menu)
+	end
+end
+
+callbacks.Register("Unload", "NavBot.MainUnload", onNavBotUnload)
 
 end)
 __bundle_register("NavBot.Menu", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -1238,7 +1253,8 @@ local worldDefault = {
 
 ---@type NavBotGlobals
 local G = {
-	Menu = DefaultConfig,
+	-- Filled by NavBot.Utils.Config.LoadCFG; never alias DefaultConfig (shared table breaks saves).
+	Menu = {},
 	Default = defaultPlayer,
 	pLocal = defaultPlayer,
 	World_Default = worldDefault,
@@ -1283,6 +1299,7 @@ local G = {
 			STATE_DESCENDING = "STATE_DESCENDING",
 		},
 		jumpState = "STATE_IDLE",
+		leftGroundThisJump = false,
 		ShouldJump = false,
 		LastSmartJumpAttempt = 0,
 		LastEmergencyJump = 0,
@@ -1293,8 +1310,12 @@ local G = {
 		JumpPeekPos = nil,
 		HitObstacle = false,
 		lastAngle = nil,
-		stateStartTime = 0,
+		stateStartTime = nil,
 		lastState = nil,
+		lastAdvanceTick = -1,
+		suppressStuckUntilTick = nil,
+		jumpCommitUntilTick = nil,
+		jumpFailCooldownUntil = nil,
 		lastJumpTime = 0,
 		LastObstacleHeight = 0,
 	},
@@ -1726,113 +1747,140 @@ __bundle_register("NavBot.Utils.Config", function(require, _LOADED, __bundle_reg
 
 --[[ Imports ]]
 local G = require("NavBot.Core.Globals")
-
-local Common = require("NavBot.Core.Common")
-local json = require("NavBot.Utils.Json")
 local Default_Config = require("NavBot.Utils.DefaultConfig")
+local Serializer = require("NavBot.Utils.Serializer")
+local json = require("NavBot.Utils.Json")
 
 local Config = {}
-
-local Log = Common.Log
-local Notify = Common.Notify
-Log.Level = 0
 
 local script_name = GetScriptName():match("([^/\\]+)%.lua$")
 local folder_name = string.format([[Lua %s]], script_name)
 
---[[ Helper Functions ]]
-function Config.GetFilePath()
-	-- Note: filesystem.CreateDirectory() returns true only if it created a new directory,
-	-- not if the directory already exists. The function succeeds in both cases, but
-	-- returns different boolean values.
-	local CreatedDirectory, fullPath = filesystem.CreateDirectory(folder_name)
-	return fullPath .. "/config.cfg"
+local function getConfigPath()
+	local _, fullPath = filesystem.CreateDirectory(folder_name)
+	local sep = package.config:sub(1, 1)
+	return fullPath .. sep .. "config.cfg"
 end
 
---- Fill missing keys from defaults (keeps user values for existing keys).
-local function mergeDefaults(expectedMenu, loadedMenu)
-	local didMerge = false
-	for key, value in pairs(expectedMenu) do
-		if loadedMenu[key] == nil then
-			if type(value) == "table" then
-				loadedMenu[key] = {}
-				mergeDefaults(value, loadedMenu[key])
-			else
-				loadedMenu[key] = value
-			end
-			didMerge = true
-		elseif type(value) == "table" and type(loadedMenu[key]) == "table" then
-			if mergeDefaults(value, loadedMenu[key]) then
-				didMerge = true
+function Config.GetFilePath()
+	return getConfigPath()
+end
+
+--- Ensure every expected key exists (handles partial / upgraded configs).
+local function safeInitMenu()
+	if not G.Menu then
+		G.Menu = Serializer.deepCopy(Default_Config)
+		return
+	end
+
+	local function ensureField(parent, key, default)
+		if parent[key] == nil then
+			parent[key] = Serializer.deepCopy(default)
+		elseif type(default) == "table" and type(parent[key]) == "table" then
+			for k, v in pairs(default) do
+				ensureField(parent[key], k, v)
 			end
 		end
 	end
-	return didMerge
+
+	for key, value in pairs(Default_Config) do
+		ensureField(G.Menu, key, value)
+	end
 end
 
---[[ Configuration Functions ]]
-function Config.CreateCFG(cfgTable)
-	cfgTable = cfgTable or Default_Config
-	local filepath = Config.GetFilePath()
-	local file = io.open(filepath, "w")
-	local shortFilePath = filepath:match(".*\\(.*\\.*)$")
-	if file then
-		local serializedConfig = json.encode(cfgTable)
-		file:write(serializedConfig)
-		file:close()
-		printc(100, 183, 0, 255, "Success Saving Config: Path: " .. shortFilePath)
-		Common.Notify.Simple("Success! Saved Config to:", shortFilePath, 5)
-	else
-		local errorMessage = "Failed to open: " .. shortFilePath
-		printc(255, 0, 0, 255, errorMessage)
-		Common.Notify.Simple("Error", errorMessage, 5)
+--- Legacy JSON configs (pre-Serializer).
+local function tryLoadJson(content)
+	if not content or content:sub(1, 1) ~= "{" then
+		return nil
 	end
+	local ok, cfg = pcall(json.decode, content)
+	if ok and type(cfg) == "table" then
+		return cfg
+	end
+	return nil
+end
+
+local function tryLoadLuaConfig(content)
+	if not content or content == "" then
+		return nil
+	end
+	local chunk, err = load("return " .. content)
+	if not chunk then
+		return nil, err
+	end
+	local ok, cfg = pcall(chunk)
+	if ok and type(cfg) == "table" then
+		return cfg
+	end
+	return nil
+end
+
+function Config.CreateCFG(cfgTable)
+	cfgTable = cfgTable or G.Menu or Default_Config
+	local path = getConfigPath()
+	local body = Serializer.serializeTable(cfgTable)
+	local success = Serializer.writeFile(path, body)
+	if not success then
+		printc(255, 0, 0, 255, "[Config] Failed to write: " .. path)
+		return false
+	end
+	local shortPath = path:match(".*[\\/](.+[\\/].+)$") or path
+	printc(100, 183, 0, 255, "[Config] Saved: " .. shortPath)
+	return true
 end
 
 function Config.LoadCFG()
-	local filepath = Config.GetFilePath()
-	local file = io.open(filepath, "r")
-	local shortFilePath = filepath:match(".*\\(.*\\.*)$")
-	if file then
-		local content = file:read("*a")
-		file:close()
-		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
-		if type(loadedCfg) == "table" and not input.IsButtonDown(KEY_LSHIFT) then
-			local merged = mergeDefaults(Default_Config, loadedCfg)
-			if merged then
-				printc(255, 200, 0, 255, "Config updated with new defaults; saving.")
-				Config.CreateCFG(loadedCfg)
-			end
-			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
-			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
-			G.Menu = loadedCfg
+	local path = getConfigPath()
+	local content = Serializer.readFile(path)
+	local needsRewrite = false
+	local shiftHeld = input.IsButtonDown(KEY_LSHIFT)
+
+	if not content or shiftHeld then
+		if shiftHeld then
+			printc(255, 200, 100, 255, "[Config] SHIFT held – creating fresh config...")
 		else
-			local warningMessage = input.IsButtonDown(KEY_LSHIFT) and "Creating a new config."
-				or "Config is outdated or invalid. Resetting to default."
-			printc(255, 0, 0, 255, warningMessage)
-			Common.Notify.Simple("Warning", warningMessage, 5)
-			Config.CreateCFG(Default_Config)
-			---@type NavMenu
-			G.Menu = Default_Config
+			printc(255, 200, 100, 255, "[Config] No config found, creating default...")
 		end
-	else
-		local warningMessage = "Config file not found. Creating a new config."
-		printc(255, 0, 0, 255, warningMessage)
-		Common.Notify.Simple("Warning", warningMessage, 5)
-		Config.CreateCFG(Default_Config)
-		---@type NavMenu
-		G.Menu = Default_Config
+		G.Menu = Serializer.deepCopy(Default_Config)
+		safeInitMenu()
+		Config.CreateCFG(G.Menu)
+		return G.Menu
 	end
+
+	local cfg, compileErr = tryLoadLuaConfig(content)
+	if not cfg then
+		cfg = tryLoadJson(content)
+		if cfg then
+			printc(255, 200, 100, 255, "[Config] Migrated JSON config to Lua format.")
+			needsRewrite = true
+		end
+	end
+
+	if not cfg then
+		printc(255, 100, 100, 255, "[Config] Invalid config – regenerating: " .. tostring(compileErr))
+		G.Menu = Serializer.deepCopy(Default_Config)
+		safeInitMenu()
+		Config.CreateCFG(G.Menu)
+		return G.Menu
+	end
+
+	printc(0, 255, 140, 255, "[Config] Loaded: " .. path)
+	G.Menu = cfg
+	if not Serializer.keysMatch(Default_Config, cfg) then
+		printc(255, 200, 100, 255, "[Config] Missing options detected – merging defaults...")
+		needsRewrite = true
+	end
+	safeInitMenu()
+	if needsRewrite then
+		Config.CreateCFG(G.Menu)
+	end
+	return G.Menu
 end
 
---load on load
 Config.LoadCFG()
 
--- Save configuration automatically when the script unloads
-local function ConfigAutoSaveOnUnload()
+local function configAutoSaveOnUnload()
 	print("[CONFIG] Unloading script, saving configuration...")
-
-	-- Save the current configuration state
 	if G.Menu then
 		Config.CreateCFG(G.Menu)
 	else
@@ -1840,7 +1888,7 @@ local function ConfigAutoSaveOnUnload()
 	end
 end
 
-callbacks.Register("Unload", "ConfigAutoSaveOnUnload", ConfigAutoSaveOnUnload)
+callbacks.Register("Unload", "NavBot.ConfigAutoSaveOnUnload", configAutoSaveOnUnload)
 
 return Config
 
@@ -2449,6 +2497,104 @@ function json.decode(str, pos, nullval, ...)
 end
 
 return json
+
+end)
+__bundle_register("NavBot.Utils.Serializer", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+	Table serialization and file I/O for NavBot config (from Cheater Detection).
+]]
+
+local Serializer = {}
+
+local function deepCopy(orig)
+	if type(orig) ~= "table" then
+		return orig
+	end
+	local copy = {}
+	for k, v in pairs(orig) do
+		copy[k] = deepCopy(v)
+	end
+	return copy
+end
+
+local function serializeTable(tbl, level, visited)
+	level = level or 0
+	visited = visited or {}
+	local indent = string.rep("    ", level)
+	local innerIndent = indent .. "    "
+	local entries = {}
+
+	for k, v in pairs(tbl) do
+		local entryChunks = {}
+		local safeKey = tostring(k):gsub("\\", "\\\\"):gsub('"', '\\"')
+		local keyRepr = (type(k) == "string") and ('["' .. safeKey .. '"]') or ("[" .. safeKey .. "]")
+		table.insert(entryChunks, innerIndent .. keyRepr .. " = ")
+
+		if type(v) == "table" then
+			if visited[v] then
+				table.insert(entryChunks, '"--[[cycle]]"')
+			else
+				visited[v] = true
+				table.insert(entryChunks, serializeTable(v, level + 1, visited))
+			end
+		elseif type(v) == "string" then
+			local sanitized = v:gsub("[^%z\32-\126]", ""):sub(1, 128)
+			sanitized = sanitized:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
+			table.insert(entryChunks, '"' .. sanitized .. '"')
+		else
+			table.insert(entryChunks, tostring(v))
+		end
+		table.insert(entries, table.concat(entryChunks))
+	end
+
+	if #entries == 0 then
+		return "{}"
+	end
+
+	return "{\n" .. table.concat(entries, ",\n") .. "\n" .. indent .. "}"
+end
+
+local function keysMatch(template, loaded)
+	for k, v in pairs(template) do
+		if loaded[k] == nil then
+			return false
+		end
+		if type(v) == "table" and type(loaded[k]) == "table" then
+			if not keysMatch(v, loaded[k]) then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+local function writeFile(path, data)
+	local file = io.open(path, "w")
+	if not file then
+		return false
+	end
+	file:write(data)
+	file:close()
+	return true
+end
+
+local function readFile(path)
+	local file = io.open(path, "r")
+	if not file then
+		return nil
+	end
+	local content = file:read("*a")
+	file:close()
+	return content
+end
+
+Serializer.deepCopy = deepCopy
+Serializer.serializeTable = serializeTable
+Serializer.keysMatch = keysMatch
+Serializer.writeFile = writeFile
+Serializer.readFile = readFile
+
+return Serializer
 
 end)
 __bundle_register("NavBot.Visuals", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -8312,6 +8458,40 @@ local ARRIVAL_DIST = 1.5
 
 local SmartJump = {}
 
+local JUMP_STUCK_SUPPRESS_TICKS = 48
+local JUMP_FAIL_COOLDOWN_TICKS = 22
+local JUMP_STATE_TIMEOUT_TICKS = 132
+
+function SmartJump.isActive()
+	if SJ.jumpState ~= SJC.STATE_IDLE then
+		return true
+	end
+	local tick = globals.TickCount()
+	if SJ.suppressStuckUntilTick and tick < SJ.suppressStuckUntilTick then
+		return true
+	end
+	return false
+end
+
+local function beginJumpAttempt()
+	local tick = globals.TickCount()
+	SJ.leftGroundThisJump = false
+	SJ.jumpState = SJC.STATE_PREPARE_JUMP
+	SJ.suppressStuckUntilTick = tick + JUMP_STUCK_SUPPRESS_TICKS
+	SJ.jumpCommitUntilTick = tick + 8
+end
+
+local function markJumpFailed()
+	SJ.jumpState = SJC.STATE_IDLE
+	SJ.leftGroundThisJump = false
+	SJ.jumpFailCooldownUntil = globals.TickCount() + JUMP_FAIL_COOLDOWN_TICKS
+end
+
+local function isOnJumpFailCooldown()
+	local untilTick = SJ.jumpFailCooldownUntil
+	return untilTick ~= nil and globals.TickCount() < untilTick
+end
+
 local SJ_DEBUG_INTERVAL = 22
 
 local function sjDebugThrottled(key, msg, ...)
@@ -8816,6 +8996,100 @@ local function shouldLateJump(cmd, pLocal)
 	return shouldLateJumpManual(cmd, pLocal)
 end
 
+--- State transitions at most once per tick (CreateMove may run multiple times).
+local function advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
+	local tick = globals.TickCount()
+	if SJ.lastAdvanceTick == tick then
+		return
+	end
+	SJ.lastAdvanceTick = tick
+
+	if SJ.jumpState == SJC.STATE_IDLE then
+		if not onGround or not (hasWishDir or shouldJump) then
+			return
+		end
+		if isOnJumpFailCooldown() then
+			return
+		end
+		if shouldJump or shouldLateJump(cmd, pLocal) then
+			sjDebugThrottled(
+				"jump_start",
+				"START jump state=%s wish=%s path=%s",
+				tostring(G.currentState),
+				tostring(G.BotIntendedWishDir ~= nil),
+				tostring(isBotPathfollowing(cmd))
+			)
+			beginJumpAttempt()
+		else
+			sjDebugThrottled(
+				"idle_no_trigger",
+				"idle: no trigger onGround=%s hasWish=%s state=%s enabled=%s",
+				tostring(onGround),
+				tostring(hasWishDir),
+				tostring(G.currentState),
+				tostring(G.Menu.Main.EnableWalking)
+			)
+		end
+	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
+		SJ.jumpState = SJC.STATE_CTAP
+	elseif SJ.jumpState == SJC.STATE_CTAP then
+		SJ.jumpState = SJC.STATE_ASCENDING
+	elseif SJ.jumpState == SJC.STATE_ASCENDING then
+		if not onGround then
+			SJ.leftGroundThisJump = true
+		end
+		local velocity = pLocal:EstimateAbsVelocity()
+		local currentPos = pLocal:GetAbsOrigin()
+		local shouldUnduck = velocity.z <= 0 and SJ.leftGroundThisJump
+
+		if not shouldUnduck and SJ.leftGroundThisJump and G.Menu.Main.Duck_Grab and G.SmartJump.LastObstacleHeight then
+			if currentPos.z > G.SmartJump.LastObstacleHeight then
+				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
+				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
+				local hitbox = getPlayerHitbox(pLocal)
+				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+				if obstacleTrace.fraction < 1 then
+					shouldUnduck = true
+				end
+			end
+		end
+
+		if shouldUnduck then
+			SJ.jumpState = SJC.STATE_DESCENDING
+		elseif onGround and tick > (SJ.jumpCommitUntilTick or 0) and not SJ.leftGroundThisJump then
+			markJumpFailed()
+		end
+	elseif SJ.jumpState == SJC.STATE_DESCENDING then
+		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
+			beginJumpAttempt()
+		elseif onGround and SJ.leftGroundThisJump then
+			SJ.jumpState = SJC.STATE_IDLE
+			SJ.leftGroundThisJump = false
+		elseif onGround and tick > (SJ.jumpCommitUntilTick or 0) then
+			markJumpFailed()
+		end
+	end
+end
+
+--- Apply duck/jump buttons every CreateMove call for the current state.
+local function applyJumpButtons(cmd, pLocal, onGround, hasWishDir)
+	if SJ.jumpState == SJC.STATE_PREPARE_JUMP then
+		cmd:SetButtons(cmd.buttons | IN_DUCK)
+		cmd:SetButtons(cmd.buttons & ~IN_JUMP)
+	elseif SJ.jumpState == SJC.STATE_CTAP then
+		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+		cmd:SetButtons(cmd.buttons | IN_JUMP)
+	elseif SJ.jumpState == SJC.STATE_ASCENDING then
+		cmd:SetButtons(cmd.buttons | IN_DUCK)
+	elseif SJ.jumpState == SJC.STATE_DESCENDING then
+		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
+			cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+			cmd:SetButtons(cmd.buttons | IN_JUMP)
+		end
+	end
+end
+
 function SmartJump.Main(cmd)
 	if not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
 		SJ.jumpState = SJC.STATE_IDLE
@@ -8838,82 +9112,22 @@ function SmartJump.Main(cmd)
 	if G.SmartJump.RequestEmergencyJump then
 		shouldJump = true
 		G.SmartJump.RequestEmergencyJump = false
-		SJ.jumpState = SJC.STATE_PREPARE_JUMP
+		beginJumpAttempt()
 	end
 
 	local hasWishDir = getManualWishDir(cmd) ~= nil
 		or (G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01)
 		or isBotPathfollowing(cmd)
 
-	if SJ.jumpState == SJC.STATE_IDLE then
-		if onGround and (hasWishDir or shouldJump) then
-			if shouldJump or shouldLateJump(cmd, pLocal) then
-				sjDebugThrottled(
-					"jump_start",
-					"START jump state=%s wish=%s path=%s",
-					tostring(G.currentState),
-					tostring(G.BotIntendedWishDir ~= nil),
-					tostring(isBotPathfollowing(cmd))
-				)
-				SJ.jumpState = SJC.STATE_PREPARE_JUMP
-			else
-				sjDebugThrottled(
-					"idle_no_trigger",
-					"idle: no trigger onGround=%s hasWish=%s state=%s enabled=%s",
-					tostring(onGround),
-					tostring(hasWishDir),
-					tostring(G.currentState),
-					tostring(G.Menu.Main.EnableWalking)
-				)
-			end
-		else
-			sjDebugThrottled("idle_wait", "idle: wait onGround=%s hasWish=%s", tostring(onGround), tostring(hasWishDir))
-		end
-	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
-		cmd:SetButtons(cmd.buttons | IN_DUCK)
-		cmd:SetButtons(cmd.buttons & ~IN_JUMP)
-		SJ.jumpState = SJC.STATE_CTAP
-	elseif SJ.jumpState == SJC.STATE_CTAP then
-		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-		cmd:SetButtons(cmd.buttons | IN_JUMP)
-		SJ.jumpState = SJC.STATE_ASCENDING
-	elseif SJ.jumpState == SJC.STATE_ASCENDING then
-		cmd:SetButtons(cmd.buttons | IN_DUCK)
-		local velocity = pLocal:EstimateAbsVelocity()
-		local currentPos = pLocal:GetAbsOrigin()
-		local shouldUnduck = velocity.z <= 0
+	advanceJumpState(cmd, pLocal, onGround, hasWishDir, shouldJump)
+	applyJumpButtons(cmd, pLocal, onGround, hasWishDir)
 
-		if not shouldUnduck and G.Menu.Main.Duck_Grab and G.SmartJump.LastObstacleHeight then
-			if currentPos.z > G.SmartJump.LastObstacleHeight then
-				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
-				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
-				local hitbox = getPlayerHitbox(pLocal)
-				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-				if obstacleTrace.fraction < 1 then
-					shouldUnduck = true
-				end
-			end
-		end
-
-		if shouldUnduck then
-			SJ.jumpState = SJC.STATE_DESCENDING
-		end
-	elseif SJ.jumpState == SJC.STATE_DESCENDING then
-		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-
-		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
-			cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-			cmd:SetButtons(cmd.buttons | IN_JUMP)
-			SJ.jumpState = SJC.STATE_PREPARE_JUMP
-		elseif onGround then
-			SJ.jumpState = SJC.STATE_IDLE
-		end
-	end
-
-	if not SJ.stateStartTime then
+	if SJ.stateStartTime == nil then
 		SJ.stateStartTime = globals.TickCount()
-	elseif globals.TickCount() - SJ.stateStartTime > 132 then
-		SJ.jumpState = SJC.STATE_IDLE
+	elseif globals.TickCount() - SJ.stateStartTime > JUMP_STATE_TIMEOUT_TICKS then
+		if SJ.jumpState ~= SJC.STATE_IDLE then
+			markJumpFailed()
+		end
 	end
 
 	if SJ.lastState ~= SJ.jumpState then
@@ -9617,6 +9831,7 @@ local MovementController = require("NavBot.Bot.MovementController")
 local WorkManager = require("NavBot.WorkManager")
 local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local SmartJump = require("NavBot.Bot.SmartJump")
 
 local MovementDecisions = {}
 local Log = Common.Log.new("MovementDecisions")
@@ -9791,34 +10006,32 @@ function MovementDecisions.checkStuckState()
 				end
 			end
 
-			-- Don't treat CTAP / jump ascent as stuck (velocity stays low on ground)
-			local sj = G.SmartJump
-			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+			if SmartJump.isActive() then
 				G.Navigation.lowVelocityTicks = 0
 			else
-			-- Velocity-based stuck detection
-			local velocity = pLocal:EstimateAbsVelocity()
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+				-- Velocity-based stuck detection
+				local velocity = pLocal:EstimateAbsVelocity()
+				if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
+					local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
 
-				-- Critical velocity threshold: < 50 = stuck
-				if speed2D < 50 then
-					G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
+					-- Critical velocity threshold: < 50 = stuck
+					if speed2D < 50 then
+						G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
 
-					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
-					if G.Navigation.lowVelocityTicks > 66 then
-						Log:Warn(
-							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
-							speed2D,
-							G.Navigation.lowVelocityTicks
-						)
-						G.currentState = G.States.STUCK
+						-- If velocity too low for 66 ticks (1 second), switch to STUCK state
+						if G.Navigation.lowVelocityTicks > 66 then
+							Log:Warn(
+								"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
+								speed2D,
+								G.Navigation.lowVelocityTicks
+							)
+							G.currentState = G.States.STUCK
+							G.Navigation.lowVelocityTicks = 0
+						end
+					else
 						G.Navigation.lowVelocityTicks = 0
 					end
-				else
-					G.Navigation.lowVelocityTicks = 0
 				end
-			end
 			end
 		end
 	end
@@ -9913,7 +10126,6 @@ function MovementDecisions.handleMovingState(userCmd)
 	MovementController.handleCameraRotation(userCmd, targetPos)
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
-	MovementDecisions.checkStuckState()
 	MovementDecisions.executeMovement(userCmd)
 end
 
@@ -11533,10 +11745,10 @@ local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local Node = require("NavBot.Navigation.Node")
 local WorkManager = require("NavBot.WorkManager")
+local SmartJump = require("NavBot.Bot.SmartJump")
 local GoalFinder = require("NavBot.Bot.GoalFinder")
 local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
 local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
-local SmartJump = require("NavBot.Bot.SmartJump")
 local MovementDecisions = require("NavBot.Bot.MovementDecisions")
 
 local StateHandler = {}
@@ -11773,8 +11985,11 @@ function StateHandler.handleStuckState(userCmd)
 				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
 			end
 
-			local sj = G.SmartJump
-			if sj and sj.jumpState and sj.jumpState ~= sj.Constants.STATE_IDLE then
+			if SmartJump.isActive() then
+				G.Navigation.lowVelocityTicks = 0
+				if G.currentState == G.States.STUCK then
+					G.currentState = G.States.MOVING
+				end
 				return
 			end
 

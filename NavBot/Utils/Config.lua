@@ -2,113 +2,140 @@
 
 --[[ Imports ]]
 local G = require("NavBot.Core.Globals")
-
-local Common = require("NavBot.Core.Common")
-local json = require("NavBot.Utils.Json")
 local Default_Config = require("NavBot.Utils.DefaultConfig")
+local Serializer = require("NavBot.Utils.Serializer")
+local json = require("NavBot.Utils.Json")
 
 local Config = {}
-
-local Log = Common.Log
-local Notify = Common.Notify
-Log.Level = 0
 
 local script_name = GetScriptName():match("([^/\\]+)%.lua$")
 local folder_name = string.format([[Lua %s]], script_name)
 
---[[ Helper Functions ]]
-function Config.GetFilePath()
-	-- Note: filesystem.CreateDirectory() returns true only if it created a new directory,
-	-- not if the directory already exists. The function succeeds in both cases, but
-	-- returns different boolean values.
-	local CreatedDirectory, fullPath = filesystem.CreateDirectory(folder_name)
-	return fullPath .. "/config.cfg"
+local function getConfigPath()
+	local _, fullPath = filesystem.CreateDirectory(folder_name)
+	local sep = package.config:sub(1, 1)
+	return fullPath .. sep .. "config.cfg"
 end
 
---- Fill missing keys from defaults (keeps user values for existing keys).
-local function mergeDefaults(expectedMenu, loadedMenu)
-	local didMerge = false
-	for key, value in pairs(expectedMenu) do
-		if loadedMenu[key] == nil then
-			if type(value) == "table" then
-				loadedMenu[key] = {}
-				mergeDefaults(value, loadedMenu[key])
-			else
-				loadedMenu[key] = value
-			end
-			didMerge = true
-		elseif type(value) == "table" and type(loadedMenu[key]) == "table" then
-			if mergeDefaults(value, loadedMenu[key]) then
-				didMerge = true
+function Config.GetFilePath()
+	return getConfigPath()
+end
+
+--- Ensure every expected key exists (handles partial / upgraded configs).
+local function safeInitMenu()
+	if not G.Menu then
+		G.Menu = Serializer.deepCopy(Default_Config)
+		return
+	end
+
+	local function ensureField(parent, key, default)
+		if parent[key] == nil then
+			parent[key] = Serializer.deepCopy(default)
+		elseif type(default) == "table" and type(parent[key]) == "table" then
+			for k, v in pairs(default) do
+				ensureField(parent[key], k, v)
 			end
 		end
 	end
-	return didMerge
+
+	for key, value in pairs(Default_Config) do
+		ensureField(G.Menu, key, value)
+	end
 end
 
---[[ Configuration Functions ]]
-function Config.CreateCFG(cfgTable)
-	cfgTable = cfgTable or Default_Config
-	local filepath = Config.GetFilePath()
-	local file = io.open(filepath, "w")
-	local shortFilePath = filepath:match(".*\\(.*\\.*)$")
-	if file then
-		local serializedConfig = json.encode(cfgTable)
-		file:write(serializedConfig)
-		file:close()
-		printc(100, 183, 0, 255, "Success Saving Config: Path: " .. shortFilePath)
-		Common.Notify.Simple("Success! Saved Config to:", shortFilePath, 5)
-	else
-		local errorMessage = "Failed to open: " .. shortFilePath
-		printc(255, 0, 0, 255, errorMessage)
-		Common.Notify.Simple("Error", errorMessage, 5)
+--- Legacy JSON configs (pre-Serializer).
+local function tryLoadJson(content)
+	if not content or content:sub(1, 1) ~= "{" then
+		return nil
 	end
+	local ok, cfg = pcall(json.decode, content)
+	if ok and type(cfg) == "table" then
+		return cfg
+	end
+	return nil
+end
+
+local function tryLoadLuaConfig(content)
+	if not content or content == "" then
+		return nil
+	end
+	local chunk, err = load("return " .. content)
+	if not chunk then
+		return nil, err
+	end
+	local ok, cfg = pcall(chunk)
+	if ok and type(cfg) == "table" then
+		return cfg
+	end
+	return nil
+end
+
+function Config.CreateCFG(cfgTable)
+	cfgTable = cfgTable or G.Menu or Default_Config
+	local path = getConfigPath()
+	local body = Serializer.serializeTable(cfgTable)
+	local success = Serializer.writeFile(path, body)
+	if not success then
+		printc(255, 0, 0, 255, "[Config] Failed to write: " .. path)
+		return false
+	end
+	local shortPath = path:match(".*[\\/](.+[\\/].+)$") or path
+	printc(100, 183, 0, 255, "[Config] Saved: " .. shortPath)
+	return true
 end
 
 function Config.LoadCFG()
-	local filepath = Config.GetFilePath()
-	local file = io.open(filepath, "r")
-	local shortFilePath = filepath:match(".*\\(.*\\.*)$")
-	if file then
-		local content = file:read("*a")
-		file:close()
-		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
-		if type(loadedCfg) == "table" and not input.IsButtonDown(KEY_LSHIFT) then
-			local merged = mergeDefaults(Default_Config, loadedCfg)
-			if merged then
-				printc(255, 200, 0, 255, "Config updated with new defaults; saving.")
-				Config.CreateCFG(loadedCfg)
-			end
-			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
-			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
-			G.Menu = loadedCfg
+	local path = getConfigPath()
+	local content = Serializer.readFile(path)
+	local needsRewrite = false
+	local shiftHeld = input.IsButtonDown(KEY_LSHIFT)
+
+	if not content or shiftHeld then
+		if shiftHeld then
+			printc(255, 200, 100, 255, "[Config] SHIFT held – creating fresh config...")
 		else
-			local warningMessage = input.IsButtonDown(KEY_LSHIFT) and "Creating a new config."
-				or "Config is outdated or invalid. Resetting to default."
-			printc(255, 0, 0, 255, warningMessage)
-			Common.Notify.Simple("Warning", warningMessage, 5)
-			Config.CreateCFG(Default_Config)
-			---@type NavMenu
-			G.Menu = Default_Config
+			printc(255, 200, 100, 255, "[Config] No config found, creating default...")
 		end
-	else
-		local warningMessage = "Config file not found. Creating a new config."
-		printc(255, 0, 0, 255, warningMessage)
-		Common.Notify.Simple("Warning", warningMessage, 5)
-		Config.CreateCFG(Default_Config)
-		---@type NavMenu
-		G.Menu = Default_Config
+		G.Menu = Serializer.deepCopy(Default_Config)
+		safeInitMenu()
+		Config.CreateCFG(G.Menu)
+		return G.Menu
 	end
+
+	local cfg, compileErr = tryLoadLuaConfig(content)
+	if not cfg then
+		cfg = tryLoadJson(content)
+		if cfg then
+			printc(255, 200, 100, 255, "[Config] Migrated JSON config to Lua format.")
+			needsRewrite = true
+		end
+	end
+
+	if not cfg then
+		printc(255, 100, 100, 255, "[Config] Invalid config – regenerating: " .. tostring(compileErr))
+		G.Menu = Serializer.deepCopy(Default_Config)
+		safeInitMenu()
+		Config.CreateCFG(G.Menu)
+		return G.Menu
+	end
+
+	printc(0, 255, 140, 255, "[Config] Loaded: " .. path)
+	G.Menu = cfg
+	if not Serializer.keysMatch(Default_Config, cfg) then
+		printc(255, 200, 100, 255, "[Config] Missing options detected – merging defaults...")
+		needsRewrite = true
+	end
+	safeInitMenu()
+	if needsRewrite then
+		Config.CreateCFG(G.Menu)
+	end
+	return G.Menu
 end
 
---load on load
 Config.LoadCFG()
 
--- Save configuration automatically when the script unloads
-local function ConfigAutoSaveOnUnload()
+local function configAutoSaveOnUnload()
 	print("[CONFIG] Unloading script, saving configuration...")
-
-	-- Save the current configuration state
 	if G.Menu then
 		Config.CreateCFG(G.Menu)
 	else
@@ -116,6 +143,6 @@ local function ConfigAutoSaveOnUnload()
 	end
 end
 
-callbacks.Register("Unload", "ConfigAutoSaveOnUnload", ConfigAutoSaveOnUnload)
+callbacks.Register("Unload", "NavBot.ConfigAutoSaveOnUnload", configAutoSaveOnUnload)
 
 return Config

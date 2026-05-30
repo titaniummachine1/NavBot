@@ -32,7 +32,7 @@ require("NavBot.Bot.ISWalkableTest")
 require("NavBot.Bot.OptimizedISWalkableTest")
 require("NavBot.Bot.IsNavigableTest")
 require("NavBot.Visuals")
-require("NavBot.Utils.Config")
+local Config = require("NavBot.Utils.Config")
 require("NavBot.Menu")
 
 --[[ Setup ]]
@@ -105,13 +105,12 @@ local function onCreateMove(userCmd)
 				MovementDecisions.updateWalkIntent(userCmd)
 				MovementDecisions.executeMovement(userCmd)
 			end
-			StateHandler.handleStuckState(userCmd)
 		else
 			G.currentState = G.States.MOVING
 		end
 	end
 
-	-- SmartJump runs last so duck/jump buttons are not overwritten by walkTo
+	-- SmartJump before stuck checks so jumpState / suppress window are current this tick
 	if G.Menu.Main.Enable and G.Menu.SmartJump and G.Menu.SmartJump.Enable then
 		local shouldRunJump = G.currentState == G.States.MOVING
 			or G.currentState == G.States.FOLLOWING
@@ -119,6 +118,14 @@ local function onCreateMove(userCmd)
 		if shouldRunJump then
 			SmartJump.Main(userCmd)
 		end
+	end
+
+	if G.currentState == G.States.MOVING or G.currentState == G.States.FOLLOWING then
+		MovementDecisions.checkStuckState()
+	end
+
+	if G.currentState == G.States.STUCK then
+		StateHandler.handleStuckState(userCmd)
 	end
 
 	WorkManager.processWorks()
@@ -333,3 +340,11 @@ if entities.GetLocalPlayer() then
 end
 
 Log:Info("NavBot modular system initialized - %d modules loaded", 7)
+
+local function onNavBotUnload()
+	if G.Menu then
+		Config.CreateCFG(G.Menu)
+	end
+end
+
+callbacks.Register("Unload", "NavBot.MainUnload", onNavBotUnload)

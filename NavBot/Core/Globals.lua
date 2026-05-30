@@ -28,7 +28,8 @@ local worldDefault = {
 
 ---@type NavBotGlobals
 local G = {
-	Menu = DefaultConfig,
+	-- Filled by NavBot.Utils.Config.LoadCFG; never alias DefaultConfig (shared table breaks saves).
+	Menu = {},
 	Default = defaultPlayer,
 	pLocal = defaultPlayer,
 	World_Default = worldDefault,
@@ -73,6 +74,7 @@ local G = {
 			STATE_DESCENDING = "STATE_DESCENDING",
 		},
 		jumpState = "STATE_IDLE",
+		leftGroundThisJump = false,
 		ShouldJump = false,
 		LastSmartJumpAttempt = 0,
 		LastEmergencyJump = 0,
@@ -83,8 +85,12 @@ local G = {
 		JumpPeekPos = nil,
 		HitObstacle = false,
 		lastAngle = nil,
-		stateStartTime = 0,
+		stateStartTime = nil,
 		lastState = nil,
+		lastAdvanceTick = -1,
+		suppressStuckUntilTick = nil,
+		jumpCommitUntilTick = nil,
+		jumpFailCooldownUntil = nil,
 		lastJumpTime = 0,
 		LastObstacleHeight = 0,
 	},
