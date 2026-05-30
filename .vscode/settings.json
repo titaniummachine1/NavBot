@@ -1,0 +1,40 @@
+{
+    "editor.formatOnSave": true,
+    "[lua]": {
+        "editor.defaultFormatter": "JohnnyMorganz.stylua",
+        "editor.formatOnSave": true
+    },
+    "stylua.searchParentDirectories": true,
+    "stylua.targetReleaseVersion": "latest",
+    "lua.workspace.library": [
+        ".",
+        "NavBot/**"
+    ],
+    "lua.diagnostics.globals": [
+        "G",
+        "draw",
+        "gui",
+        "client",
+        "engine",
+        "entities",
+        "globals",
+        "input",
+        "callbacks",
+        "Notify",
+        "WPlayer",
+        "Common",
+        "Navigation",
+        "TimMenu"
+    ],
+    "lua.diagnostics.disable": [
+        "duplicate-set-field",
+        "undefined-field"
+    ],
+    "files.associations": {
+        "*.lua": "lua"
+    },
+    "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit"
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell"
+}

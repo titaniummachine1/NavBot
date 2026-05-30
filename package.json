@@ -1,0 +1,43 @@
+{
+  "name": "navbot",
+  "version": "1.0.1",
+  "description": "Navigation and pathfinding bot for LMAOBox",
+  "type": "module",
+  "scripts": {
+    "bundle": "node bundle.js",
+    "deploy": "BundleAndDeploy.bat",
+    "watch": "node scripts/simple-watch.cjs",
+    "version:get": "node scripts/version-manager.cjs get",
+    "version:set": "node scripts/version-manager.cjs set",
+    "version:bump": "node scripts/version-manager.cjs bump",
+    "version:auto": "node scripts/version-manager.cjs auto",
+    "dev": "start cmd /k \"npm run watch\"",
+    "build": "npm run bundle && npm run deploy",
+    "commit": "git-cz",
+    "release": "npm run version:auto && git add . && git commit -m 'release: v$(npm run version:get -s)' && git tag v$(npm run version:get -s)"
+  },
+  "dependencies": {
+    "lua-format": "^1.3.4",
+    "luabundle": "^1.7.0",
+    "chokidar": "^3.5.3",
+    "concurrently": "^7.6.0"
+  },
+  "devDependencies": {
+    "commitizen": "^4.3.0",
+    "cz-conventional-changelog": "^3.3.0"
+  },
+  "config": {
+    "commitizen": {
+      "path": "./node_modules/cz-conventional-changelog"
+    }
+  },
+  "keywords": [
+    "lmaobox",
+    "bot",
+    "navigation",
+    "pathfinding",
+    "tf2"
+  ],
+  "author": "titaniummachine1",
+  "license": "MIT"
+}

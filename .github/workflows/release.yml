@@ -1,0 +1,102 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Install dependencies
+      run: npm install
+      
+    - name: Get version from commit
+      id: version
+      run: |
+        # Extract version bump type from commit message
+        COMMIT_MSG="${{ github.event.head_commit.message }}"
+        if [[ "$COMMIT_MSG" =~ ^(major|feat|breaking|BREAKING) ]]; then
+          BUMP_TYPE="major"
+        elif [[ "$COMMIT_MSG" =~ ^(minor|feature|feat|new) ]]; then
+          BUMP_TYPE="minor"
+        elif [[ "$COMMIT_MSG" =~ ^(patch|fix|bug|hotfix|update) ]]; then
+          BUMP_TYPE="patch"
+        else
+          BUMP_TYPE="patch"
+        fi
+        
+        # Get current version
+        if [ -f "package.json" ]; then
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+        else
+          CURRENT_VERSION="1.0.0"
+        fi
+        
+        # Calculate new version
+        IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+        MAJOR=${VERSION_PARTS[0]}
+        MINOR=${VERSION_PARTS[1]}
+        PATCH=${VERSION_PARTS[2]}
+        
+        case $BUMP_TYPE in
+          "major")
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            ;;
+          "minor")
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            ;;
+          "patch")
+            PATCH=$((PATCH + 1))
+            ;;
+        esac
+        
+        NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+        
+    - name: Update version in package.json
+      run: |
+        npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+        
+    - name: Bundle NavBot
+      run: |
+        node bundle.js
+        
+    - name: Create release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        name: NavBot v${{ steps.version.outputs.version }}
+        body: |
+          ## NavBot v${{ steps.version.outputs.version }}
+          
+          **Changes:** ${{ github.event.head_commit.message }}
+          
+          **Version bump:** ${{ steps.version.outputs.bump_type }}
+          
+          ### Installation
+          1. Download `NavBot.lua` from the assets below
+          2. Place in your LMAOBox Lua folder
+          3. Load in LMAOBox
+          
+          **Commit:** [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+        files: |
+          NavBot.lua
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
