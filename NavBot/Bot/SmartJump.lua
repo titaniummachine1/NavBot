@@ -1,6 +1,8 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local GroundMovement = require("NavBot.Bot.GroundMovement")
+local PathSteering = require("NavBot.Navigation.PathSteering")
+local Node = require("NavBot.Navigation.Node")
 
 local Log = Common.Log.new("SmartJump")
 
@@ -8,12 +10,9 @@ Log.Level = 0
 local SJ = G.SmartJump
 local SJC = G.SmartJump.Constants
 
-local STEP_Z = 18
-local STEP_VEC = Vector3(0, 0, STEP_Z)
-local FORWARD_PROBE = 1
-local FORWARD_SLIDE = 24
 local MIN_STEP_HEIGHT = 18
 local MAX_CLEAR_HEIGHT = 72
+local MAX_PATH_SIM_TARGETS = 12
 
 local SmartJump = {}
 
@@ -37,44 +36,159 @@ local function isPlayerOnGround(player)
 	return (pFlags & FL_ONGROUND) == FL_ONGROUND
 end
 
---- Bot simulated wishdir first; else manual cmd move rotated by view (same basis as walkTo).
-local function getWishDir(cmd)
-	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
-		local dir = G.BotIntendedWishDir
-		dir.z = 0
-		return Common.Normalize(dir)
+local function getTouchDistance()
+	return G.Misc.NodeTouchDistance or 16
+end
+
+local function getTickInterval()
+	local tick = globals.TickInterval()
+	if tick <= 0 then
+		return 1 / 66.67
+	end
+	return tick
+end
+
+local function oneTickStepLength(maxSpeed)
+	return maxSpeed * getTickInterval()
+end
+
+--- Manual movement this tick or walking disabled — not bot pathfollow.
+local function isManualOverride(cmd)
+	if not G.Menu.Main.EnableWalking then
+		return true
 	end
 
+	if cmd and (cmd:GetForwardMove() ~= 0 or cmd:GetSideMove() ~= 0) then
+		if G.currentState == G.States.IDLE then
+			local lastManual = G.lastManualMovementTick
+			if lastManual and (globals.TickCount() - lastManual) < 66 then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+--- Active path + bot moving (not manual override).
+local function isBotPathfollowing(cmd)
+	if not G.Navigation.path or #G.Navigation.path == 0 then
+		return false
+	end
+	if isManualOverride(cmd) then
+		return false
+	end
+	if G.currentState ~= G.States.MOVING and G.currentState ~= G.States.FOLLOWING then
+		return false
+	end
+	return true
+end
+
+local function getManualWishDir(cmd)
 	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
 	if moveIntent:Length() < 1 then
 		return nil
 	end
-
 	local viewAngles = engine.GetViewAngles()
 	return Common.Normalize(rotateMoveByView(moveIntent, viewAngles.yaw))
 end
 
---- Into wall 1u, up 72, forward (slide corners), down — can we land on top?
-local function canClearObstacle(hitPos, wishDir, hitbox)
+local function getPathNodeTarget(simPos, pathIndex)
+	local path = G.Navigation.path
+	local node = path and path[pathIndex]
+	if not node or not node.pos then
+		return nil
+	end
+
+	local nextNode = path[pathIndex + 1]
+	if nextNode and not Node.IsDoorNode(node) then
+		return PathSteering.getSteeringPoint(simPos, node, nextNode) or node.pos
+	end
+
+	return node.pos
+end
+
+--- Waypoints when active; otherwise path nodes (portal steering points).
+local function buildPathSimTargets(origin)
+	local targets = {}
+
+	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
+		local startIdx = G.Navigation.currentWaypointIndex or 1
+		for i = startIdx, #G.Navigation.waypoints do
+			local wp = G.Navigation.waypoints[i]
+			if wp and wp.pos then
+				targets[#targets + 1] = wp.pos
+			end
+			if #targets >= MAX_PATH_SIM_TARGETS then
+				return targets
+			end
+		end
+		return targets
+	end
+
+	local path = G.Navigation.path
+	if not path then
+		return targets
+	end
+
+	local limit = math.min(#path, MAX_PATH_SIM_TARGETS)
+	for i = 1, limit do
+		local pt = getPathNodeTarget(origin, i)
+		if pt then
+			targets[#targets + 1] = pt
+		end
+	end
+
+	return targets
+end
+
+local function refreshPathTarget(simPos, targets, targetIndex)
+	local pos = targets[targetIndex]
+	if not pos then
+		return nil
+	end
+	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
+		return pos
+	end
+	return getPathNodeTarget(simPos, targetIndex) or pos
+end
+
+--- Up 72 → one tick forward step → down. Corners: slide forward then down with startsolid checks.
+local function canClearObstacle(hitPos, wishDir, hitbox, maxSpeed, wallTrace)
 	if not wishDir or not hitPos then
 		return false, 0
 	end
 
-	local probe = hitPos + wishDir * FORWARD_PROBE
-	local headTarget = probe + SJC.MAX_JUMP_HEIGHT
+	local groundZ = hitPos.z
+	local upStart = Vector3(hitPos.x, hitPos.y, groundZ + 1)
+	local upEnd = Vector3(hitPos.x, hitPos.y, groundZ) + SJC.MAX_JUMP_HEIGHT
 
-	local upTrace = engine.TraceHull(probe, headTarget, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	local upTrace = engine.TraceHull(upStart, upEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
 	if upTrace.startsolid then
 		return false, 0
 	end
 	local headPos = upTrace.endpos
 
-	local fwdEnd = headPos + wishDir * FORWARD_SLIDE
-	local fwdTrace = engine.TraceHull(headPos, fwdEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	local fwdPos = fwdTrace.endpos
+	local stepLen = oneTickStepLength(maxSpeed)
+	if stepLen < 1 then
+		stepLen = 1
+	end
 
-	local downTrace = engine.TraceHull(fwdPos, fwdPos - SJC.MAX_JUMP_HEIGHT, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	if downTrace.startsolid or downTrace.fraction >= 1 then
+	local fwdEnd = headPos + wishDir * stepLen
+	local fwdTrace = engine.TraceHull(headPos, fwdEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if fwdTrace.startsolid then
+		return false, 0
+	end
+
+	local fwdPos = fwdTrace.endpos
+	local downFrom = fwdPos
+	local downTo = fwdPos - SJC.MAX_JUMP_HEIGHT
+
+	local downTrace = engine.TraceHull(downFrom, downTo, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if downTrace.startsolid then
+		return false, 0
+	end
+	if downTrace.fraction >= 1 then
 		return false, 0
 	end
 	if not isSurfaceWalkable(downTrace.plane) then
@@ -82,9 +196,25 @@ local function canClearObstacle(hitPos, wishDir, hitbox)
 	end
 
 	local lipZ = downTrace.endpos.z
-	local obstacleHeight = lipZ - hitPos.z
-	if obstacleHeight < MIN_STEP_HEIGHT or obstacleHeight > MAX_CLEAR_HEIGHT then
+	local obstacleHeight = lipZ - groundZ
+	if obstacleHeight < MIN_STEP_HEIGHT then
 		return false, 0
+	end
+	if obstacleHeight > MAX_CLEAR_HEIGHT then
+		return false, 0
+	end
+
+	if downTrace.fraction <= 0.01 then
+		return false, 0
+	end
+
+	-- Sheer wall with no standable ledge above step height
+	if wallTrace and wallTrace.fraction < 1 then
+		local normal = wallTrace.plane
+		local wallAngle = math.deg(math.acos(math.min(1, math.max(-1, normal:Dot(Vector3(0, 0, 1))))))
+		if wallAngle > SJC.MAX_WALKABLE_ANGLE and obstacleHeight < MIN_STEP_HEIGHT then
+			return false, 0
+		end
 	end
 
 	G.SmartJump.LastObstacleHeight = lipZ
@@ -112,13 +242,113 @@ local function isNearPayload(position)
 	return false
 end
 
---- Walk along wishdir with ground physics; jump only on last tick that can still clear (late jump).
-local function shouldLateJump(cmd, pLocal)
-	if not pLocal or not isPlayerOnGround(pLocal) then
+local function tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace)
+	local clearNow = canClearObstacle(newPos, wishDir, hitbox, maxSpeed, wallTrace)
+	if not clearNow then
 		return false
 	end
 
-	local wishDir = getWishDir(cmd)
+	local nextPos, _nextVel, hitNext, nextWall =
+		GroundMovement.simulateGroundStepHull(newPos, newVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+
+	if not nextPos then
+		G.SmartJump.PredPos = newPos
+		G.SmartJump.HitObstacle = true
+		return true
+	end
+
+	if not hitNext then
+		return false
+	end
+
+	local clearNext, _h = canClearObstacle(nextPos, wishDir, hitbox, maxSpeed, nextWall)
+	if not clearNext then
+		G.SmartJump.PredPos = newPos
+		G.SmartJump.HitObstacle = true
+		return true
+	end
+
+	return false
+end
+
+local function simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
+	local toTarget = Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0)
+	local dist = toTarget:Length2D()
+	if dist < 0.5 then
+		return simPos, simVel, false, nil
+	end
+
+	local wishDir = toTarget / dist
+	return GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
+end
+
+--- Path mode: chain targets (current → next node …) until jump-peek ticks or obstacle.
+local function shouldLateJumpPathMode(pLocal)
+	local origin = pLocal:GetAbsOrigin()
+	if isNearPayload(origin) then
+		return false
+	end
+
+	local targets = buildPathSimTargets(origin)
+	if #targets == 0 then
+		return false
+	end
+
+	local hitbox = getPlayerHitbox(pLocal)
+	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
+	local touch = getTouchDistance()
+	local tickInterval = getTickInterval()
+	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
+
+	local simPos = origin
+	local simVel = Vector3(0, 0, 0)
+	local targetIndex = 1
+	local targetPos = targets[targetIndex]
+
+	G.SmartJump.SimulationPath = { origin }
+
+	for _ = 1, peakTicks do
+		if not targetPos then
+			break
+		end
+
+		local newPos, newVel, hitWall, wallTrace = simulateWalkTowardTarget(simPos, simVel, targetPos, maxSpeed, hitbox)
+		if not newPos then
+			break
+		end
+
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+
+		local wishDir = Common.Normalize(Vector3(targetPos.x - simPos.x, targetPos.y - simPos.y, 0))
+		if wishDir then
+			if hitWall then
+				if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
+					return true
+				end
+				return false
+			end
+		end
+
+		simPos = newPos
+		simVel = newVel
+
+		if Common.Distance2D(simPos, targetPos) <= touch then
+			targetIndex = targetIndex + 1
+			targetPos = refreshPathTarget(simPos, targets, targetIndex)
+		end
+	end
+
+	return false
+end
+
+--- Manual / no path: single wishdir along cmd or bot intent.
+local function shouldLateJumpManual(cmd, pLocal)
+	local wishDir = nil
+	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
+		wishDir = Common.Normalize(Vector3(G.BotIntendedWishDir.x, G.BotIntendedWishDir.y, 0))
+	else
+		wishDir = getManualWishDir(cmd)
+	end
 	if not wishDir then
 		return false
 	end
@@ -130,33 +360,16 @@ local function shouldLateJump(cmd, pLocal)
 
 	local hitbox = getPlayerHitbox(pLocal)
 	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
-	local vel = pLocal:EstimateAbsVelocity() or Vector3(0, 0, 0)
-	vel.z = 0
-	local horizSpeed = math.max(vel:Length2D(), maxSpeed * 0.85)
-	vel = Vector3(wishDir.x * horizSpeed, wishDir.y * horizSpeed, 0)
-
-	local tickInterval = globals.TickInterval()
-	if tickInterval <= 0 then
-		tickInterval = 1 / 66.67
-	end
-
+	local tickInterval = getTickInterval()
 	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
-	local maxWalkTicks = peakTicks + 8
 
 	local simPos = origin
-	local simVel = vel
+	local simVel = Vector3(wishDir.x * maxSpeed, wishDir.y * maxSpeed, 0)
 	G.SmartJump.SimulationPath = { origin }
 
-	for _ = 1, maxWalkTicks do
-		local newPos, newVel, hitWall = GroundMovement.simulateGroundStepHull(
-			simPos,
-			simVel,
-			wishDir,
-			maxSpeed,
-			hitbox[1],
-			hitbox[2],
-			true
-		)
+	for _ = 1, peakTicks + 4 do
+		local newPos, newVel, hitWall, wallTrace =
+			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
 
 		if not newPos then
 			break
@@ -165,55 +378,29 @@ local function shouldLateJump(cmd, pLocal)
 		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
 
 		if hitWall then
-			local clearNow, _height = canClearObstacle(newPos, wishDir, hitbox)
-			if not clearNow then
-				return false
-			end
-
-			local nextPos, nextVel, hitNext = GroundMovement.simulateGroundStepHull(
-				newPos,
-				newVel,
-				wishDir,
-				maxSpeed,
-				hitbox[1],
-				hitbox[2],
-				true
-			)
-
-			if not nextPos then
-				if isNearPayload(newPos) then
-					return false
-				end
-				G.SmartJump.PredPos = newPos
-				G.SmartJump.HitObstacle = true
+			if tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, maxSpeed, wallTrace) then
 				return true
 			end
-
-			if not hitNext then
-				-- Not flush with wall yet — keep walking toward it
-				simPos = nextPos
-				simVel = nextVel
-			else
-				local clearNext = canClearObstacle(nextPos, wishDir, hitbox)
-				if not clearNext then
-					if isNearPayload(newPos) then
-						return false
-					end
-					G.SmartJump.PredPos = newPos
-					G.SmartJump.HitObstacle = true
-					Log:Debug("SmartJump: late jump at obstacle")
-					return true
-				end
-				simPos = nextPos
-				simVel = nextVel
-			end
-		else
-			simPos = newPos
-			simVel = newVel
+			return false
 		end
+
+		simPos = newPos
+		simVel = newVel
 	end
 
 	return false
+end
+
+local function shouldLateJump(cmd, pLocal)
+	if not pLocal or not isPlayerOnGround(pLocal) then
+		return false
+	end
+
+	if isBotPathfollowing(cmd) then
+		return shouldLateJumpPathMode(pLocal)
+	end
+
+	return shouldLateJumpManual(cmd, pLocal)
 end
 
 function SmartJump.Main(cmd)
@@ -241,7 +428,9 @@ function SmartJump.Main(cmd)
 		SJ.jumpState = SJC.STATE_PREPARE_JUMP
 	end
 
-	local hasWishDir = getWishDir(cmd) ~= nil
+	local hasWishDir = getManualWishDir(cmd) ~= nil
+		or (G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01)
+		or isBotPathfollowing(cmd)
 
 	if SJ.jumpState == SJC.STATE_IDLE then
 		if onGround and (hasWishDir or shouldJump) then
@@ -268,8 +457,7 @@ function SmartJump.Main(cmd)
 				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
 				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
 				local hitbox = getPlayerHitbox(pLocal)
-				local obstacleTrace =
-					engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
 				if obstacleTrace.fraction < 1 then
 					shouldUnduck = true
 				end
