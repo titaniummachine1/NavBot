@@ -1,0 +1,132 @@
+---@meta NavBot
+--- EmmyLua stubs for NavBot menu / globals (pairs with NavBot.Utils.DefaultConfig).
+
+---@class NavMenuSmartJump
+---@field Enable boolean
+---@field Debug boolean
+
+---@class NavMenuMain
+---@field Enable boolean
+---@field EnableWalking boolean
+---@field shouldfindhealth boolean
+---@field SelfHealTreshold number
+---@field smoothFactor number
+---@field LookingAhead boolean
+---@field Duck_Grab boolean
+---@field MaxSkipRange number
+---@field MaxNodesToSkip number
+
+---@class NavMenuNavigation
+---@field Skip_Nodes boolean
+---@field StopDistance number
+---@field WalkableMode string
+---@field CleanupConnections boolean
+---@field AllowExpensiveChecks boolean
+
+---@class NavMenuVisuals
+---@field EnableVisuals boolean
+---@field connectionDepth integer
+---@field memoryUsage boolean
+---@field drawPath boolean
+---@field showConnections boolean
+---@field showAreas boolean
+---@field showDoors boolean
+---@field showCornerConnections boolean
+---@field showD2D boolean
+---@field showNodeIds boolean
+---@field showAgentBoxes boolean
+---@field showSmartJump boolean
+---@field ISWalkableTest boolean
+---@field OptimizedISWalkableTest boolean
+---@field IsNavigableTest boolean
+---@field Debug_Mode boolean
+
+---@class NavMenuMovement
+---@field lookatpath boolean
+---@field smoothLookAtPath boolean
+
+---@class NavMenuTabs
+---@field Main boolean
+---@field Navigation boolean
+---@field Settings boolean
+---@field Visuals boolean
+---@field Movement boolean
+
+---@class NavMenu
+---@field Tab string
+---@field Tabs NavMenuTabs
+---@field Main NavMenuMain
+---@field Navigation NavMenuNavigation
+---@field Visuals NavMenuVisuals
+---@field Movement NavMenuMovement
+---@field SmartJump NavMenuSmartJump
+
+---@class NavMiscRuntime
+---@field NodeTouchDistance number
+---@field NodeOvershootTouchDistance number
+---@field NodeTouchHeight number Vertical touch band above floor (72 = max jump)
+---@field NodePassProximity number
+---@field NodePassDirDotThreshold number
+---@field NodePassAngleDegrees number
+---@field workLimit integer
+
+---@class NavSmartJumpConstants
+---@field GRAVITY number
+---@field JUMP_FORCE number
+---@field MAX_JUMP_HEIGHT Vector3
+---@field MAX_WALKABLE_ANGLE number
+---@field STATE_IDLE string
+---@field STATE_PREPARE_JUMP string
+---@field STATE_CTAP string
+---@field STATE_ASCENDING string
+---@field STATE_DESCENDING string
+
+---@class NavSmartJumpState
+---@field Constants NavSmartJumpConstants
+---@field jumpState string
+---@field ShouldJump boolean
+---@field LastSmartJumpAttempt integer
+---@field LastEmergencyJump integer
+---@field ObstacleDetected boolean
+---@field RequestEmergencyJump boolean
+---@field SimulationPath Vector3[]
+---@field PredPos Vector3|nil
+---@field JumpPeekPos Vector3|nil
+---@field HitObstacle boolean
+---@field lastAngle any
+---@field stateStartTime integer
+---@field lastState string|nil
+---@field lastJumpTime integer
+---@field LastObstacleHeight number
+
+---@class NavBotGlobals
+---@field Menu NavMenu
+---@field Default table
+---@field pLocal table
+---@field World table
+---@field World_Default table
+---@field Misc NavMiscRuntime
+---@field Navigation table Nav module + runtime path/nodes (see Navigation.lua)
+---@field SmartJump NavSmartJumpState
+---@field BotIsMoving boolean
+---@field BotMovementDirection Vector3
+---@field BotIntendedWishDir Vector3|nil
+---@field Greedy table|nil Set in Main.lua
+---@field ISWalkableTest table|nil
+---@field OptimizedISWalkableTest table|nil
+---@field IsNavigableTest table|nil
+---@field Cache table
+---@field Tasks table
+---@field Current_Tasks table
+---@field Current_Task integer
+---@field Benchmark table
+---@field States table
+---@field currentState string|nil
+---@field prevState string|nil
+---@field wasManualWalking boolean
+---@field lastManualMovementTick integer|nil
+---@field lastPathfindingTick integer|nil
+
+--- Runtime globals (see NavBot.Core.Globals).
+---@type NavBotGlobals
+G = nil

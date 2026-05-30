@@ -1,20 +1,13 @@
 {
-  "editor.formatOnSave": true,
-  "[lua]": {
-    "editor.defaultFormatter": "JohnnyMorganz.stylua",
-    "editor.formatOnSave": true
-  },
-  "stylua.searchParentDirectories": true,
-  "stylua.targetReleaseVersion": "latest",
+  "$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
   "Lua.runtime.version": "Lua 5.4",
   "Lua.workspace.library": [
-    "C:/gitProjects/Lmaobox-Annotations/library",
-    "${workspaceFolder}/types"
+    "c:/gitProjects/Lmaobox-Annotations/library",
+    "${workspace}/types"
   ],
   "Lua.workspace.checkThirdParty": false,
   "Lua.workspace.ignoreDir": ["**/.git", "vendor", "vendor/**", "NavBot.lua"],
   "Lua.diagnostics.globals": [
-    "G",
     "client",
     "entities",
     "globals",
@@ -52,10 +45,7 @@
     "printc",
     "GetScriptName",
     "Notify",
-    "WPlayer",
-    "Common",
-    "Navigation",
-    "TimMenu"
+    "G"
   ],
   "Lua.diagnostics.disable": [
     "duplicate-set-field",
@@ -67,19 +57,5 @@
   "Lua.completion.callSnippet": "Both",
   "Lua.hint.enable": true,
   "Lua.hint.paramName": "All",
-  "Lua.hint.setType": true,
-  "files.associations": {
-    "*.lua": "lua",
-    "**/vendor/**/*.lua": "plaintext"
-  },
-  "files.exclude": {
-    "**/vendor/luabundle/**": true
-  },
-  "files.watcherExclude": {
-    "**/vendor/**": true
-  },
-  "editor.codeActionsOnSave": {
-    "source.fixAll": "explicit"
-  },
-  "terminal.integrated.defaultProfile.windows": "PowerShell"
+  "Lua.hint.setType": true
 }

@@ -5,16 +5,21 @@
 --  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps only tilt
 --  the floor plane. Containment = horizontal AABB + vertical band above floor.
 
+local G = require("NavBot.Core.Globals")
+local Constants = require("NavBot.Utils.Constants")
+
 local AreaSpatial = {}
 
 local GRID_CELL_SIZE = 256
 
--- Upright player slack relative to area floor (matches G.Misc.NodeTouchHeight ≈ 82)
+-- Feet can sit slightly below floor; above-floor band matches max jump (72u).
 AreaSpatial.Z_PAD_BELOW = 8
-AreaSpatial.Z_PAD_ABOVE = 82
 
 local Z_PAD_BELOW = AreaSpatial.Z_PAD_BELOW
-local Z_PAD_ABOVE = AreaSpatial.Z_PAD_ABOVE
+
+function AreaSpatial.getTouchHeightAbove()
+	return G.Misc.NodeTouchHeight or Constants.HITBOX.MAX_JUMP_HEIGHT
+end
 
 --- Precompute floor Z and vertical query band on a normalized node.
 function AreaSpatial.PrecomputeVerticalBounds(node)
@@ -23,12 +28,13 @@ function AreaSpatial.PrecomputeVerticalBounds(node)
 	end
 
 	local floorZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	local above = AreaSpatial.getTouchHeightAbove()
 	node._floorZ = floorZ
 	node._minZ = floorZ - Z_PAD_BELOW
-	node._maxZ = floorZ + Z_PAD_ABOVE
+	node._maxZ = floorZ + above
 end
 
---- Horizontal axis-aligned footprint + vertical band (82 up, 8 down from floor).
+--- Horizontal axis-aligned footprint + vertical band (72u up, 8 down from floor).
 function AreaSpatial.IsWithinArea(pos, node)
 	if not node or not node._minX then
 		return false
@@ -46,8 +52,9 @@ function AreaSpatial.IsWithinArea(pos, node)
 		return true
 	end
 
+	local above = AreaSpatial.getTouchHeightAbove()
 	local heightAboveFloor = pos.z - floorZ
-	return heightAboveFloor <= Z_PAD_ABOVE and heightAboveFloor >= -Z_PAD_BELOW
+	return heightAboveFloor <= above and heightAboveFloor >= -Z_PAD_BELOW
 end
 
 --- Squared distance from a point to the XY footprint + Z query band (0 if inside).

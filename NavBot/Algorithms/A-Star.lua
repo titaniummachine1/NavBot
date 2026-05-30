@@ -44,9 +44,6 @@ local function releaseTables(...)
 	end
 end
 
--- Type definitions for A* pathfinding
-
----@class Vector3
 local function heuristicCost(nodeA, nodeB)
 	-- Euclidean distance heuristic
 	local dx = nodeA.pos.x - nodeB.pos.x

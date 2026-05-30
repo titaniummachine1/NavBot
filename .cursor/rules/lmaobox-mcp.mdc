@@ -1,0 +1,28 @@
+---
+description: Always use user-lmaobox-context MCP before Lmaobox/TF2 API calls
+alwaysApply: true
+---
+
+# Lmaobox MCP (required)
+
+When writing or reviewing **any** NavBot code that touches Lmaobox / TF2 APIs (`client`, `engine`, `entities`, `draw`, `callbacks`, `input`, `globals`, `FL_*`, `IN_*`, `MASK_*`, `TF_CLASS_*`, entity props, `UserCmd`, traces, etc.):
+
+1. **Discover** — `smart_search` on `user-lmaobox-context` with a short natural-language query (e.g. `"trace hull player solid"`, `"m_fFlags on ground"`).
+2. **Verify** — `get_smart_context` with the **exact** symbol before using it (signature, returns, examples, gotchas).
+3. **Types** (optional) — `get_types` when you only need a signature.
+4. **Lua check** (optional) — `luacheck` on snippets you are unsure about.
+
+Do **not** guess API names, prop paths, or flag checks. Prefer MCP over `lmaobox_lua_documentation.md` when both exist; use the markdown file only if MCP is unavailable.
+
+### Flag / ground checks (from MCP)
+
+```lua
+local flags = player:GetPropInt("m_fFlags")
+local onGround = (flags & FL_ONGROUND) ~= 0
+```
+
+Use `player:GetAbsOrigin()` for world feet position when testing nav touch / containment.
+
+### Nav touch height
+
+Node vertical touch band = **`Constants.HITBOX.MAX_JUMP_HEIGHT` (72)** via `G.Misc.NodeTouchHeight` and `AreaSpatial.IsWithinArea` — aligns with max jump apex, not standing hull height (~82).

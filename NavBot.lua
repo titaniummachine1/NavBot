@@ -52,6 +52,7 @@ Delegates all complex logic to focused modules with single responsibilities
 
 --[[ Core Dependencies ]]
 local Common = require("NavBot.Core.Common")
+---@type NavBotGlobals
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local WorkManager = require("NavBot.WorkManager")
@@ -161,6 +162,9 @@ end
 local function onDrawModel(ctx)
 	if ctx:GetModelName():find("medkit") then
 		local entity = ctx:GetEntity()
+		if not entity then
+			return
+		end
 		G.World.healthPacks[entity:GetIndex()] = entity:GetAbsOrigin()
 	end
 end
@@ -353,7 +357,7 @@ if entities.GetLocalPlayer() then
 		G.Navigation.nodes = {}
 	end
 
-	if G.Menu.Main.CleanupConnections then
+	if G.Menu.Navigation.CleanupConnections then
 		Log:Info("Connection cleanup enabled - this may cause temporary frame drops")
 	else
 		Log:Info("Connection cleanup is disabled in settings (recommended for performance)")
@@ -677,13 +681,13 @@ return MenuModule
 
 end)
 __bundle_register("NavBot.Core.Globals", function(require, _LOADED, __bundle_register, __bundle_modules)
+---@diagnostic disable: duplicate-set-field, undefined-field
+
+---@type NavMenu
 local DefaultConfig = require("NavBot.Utils.DefaultConfig")
--- Define the G module
-local G = {}
+local Constants = require("NavBot.Utils.Constants")
 
-G.Menu = DefaultConfig
-
-G.Default = {
+local defaultPlayer = {
 	entity = nil,
 	index = 1,
 	team = 1,
@@ -697,80 +701,66 @@ G.Default = {
 	vHitbox = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 45) },
 }
 
-G.pLocal = G.Default
-
-G.World_Default = {
+local worldDefault = {
 	players = {},
-	healthPacks = {}, -- Stores positions of health packs
-	spawns = {}, -- Stores positions of spawn points
-	payloads = {}, -- Stores payload entities in payload maps
-	flags = {}, -- Stores flag entities in CTF maps (implicitly included in the logic)
+	healthPacks = {},
+	spawns = {},
+	payloads = {},
+	flags = {},
 }
 
-G.World = G.World_Default
-
-G.Misc = {
-	NodeTouchDistance = 16, -- normal portal / node reach (2D)
-	NodeOvershootTouchDistance = 48, -- only when intent dir dot drops below threshold
-	NodeTouchHeight = 82,
-	NodePassProximity = 16,
-	NodePassDirDotThreshold = 0.5, -- Amalgam-style: cos(angle) between saved intent and dir-to-target
-	NodePassAngleDegrees = 60, -- legacy reference (~arccos(0.5))
-	workLimit = 1,
-}
-
-G.Navigation = {
-	path = nil,
-	nodes = nil,
-	currentNodeIndex = 1, -- Current node we're moving towards (1 = first node in path)
-	currentNodeTicks = 0,
-	stuckStartTick = nil, -- Track when we first entered stuck state
-	FirstAgentNode = 1,
-	SecondAgentNode = 2,
-	lastKnownTargetPosition = nil, -- Remember last position of follow target
-	goalPos = nil, -- Current goal world position
-	goalNodeId = nil, -- Closest node to the goal position
-	navMeshUpdated = false, -- Set when navmesh is rebuilt
-	kdTree = nil, -- XY KD-tree (AABB-distance queries)
-	areaGrid = nil, -- Uniform grid for exact area-at-position lookup
-	-- Node skipping system
-	lastSkipCheckTick = 0, -- Last tick when we performed skip check
-	nextNodeCloser = false, -- Flag indicating if next node is closer
-}
-
--- SmartJump configuration
-G.Menu.SmartJump = {
-	Enable = true,
-	Debug = false,
-}
-
--- SmartJump runtime state and constants
-G.SmartJump = G.SmartJump
-	or {
-		-- Constants (must be defined first)
+---@type NavBotGlobals
+local G = {
+	Menu = DefaultConfig,
+	Default = defaultPlayer,
+	pLocal = defaultPlayer,
+	World_Default = worldDefault,
+	World = worldDefault,
+	Misc = {
+		NodeTouchDistance = 16,
+		NodeOvershootTouchDistance = 48,
+		NodeTouchHeight = Constants.HITBOX.MAX_JUMP_HEIGHT, -- 72u: full jump apex can still touch/pass nodes
+		NodePassProximity = 16,
+		NodePassDirDotThreshold = 0.5,
+		NodePassAngleDegrees = 60,
+		workLimit = 1,
+	},
+	---@type table Navigation module table + runtime path state (replaced in Main.lua)
+	Navigation = {
+		path = nil,
+		nodes = nil,
+		currentNodeIndex = 1,
+		currentNodeTicks = 0,
+		stuckStartTick = nil,
+		FirstAgentNode = 1,
+		SecondAgentNode = 2,
+		lastKnownTargetPosition = nil,
+		goalPos = nil,
+		goalNodeId = nil,
+		navMeshUpdated = false,
+		kdTree = nil,
+		areaGrid = nil,
+		lastSkipCheckTick = 0,
+		nextNodeCloser = false,
+	},
+	SmartJump = {
 		Constants = {
-			GRAVITY = 800, -- Gravity per second squared
-			JUMP_FORCE = 271, -- Initial vertical boost for a duck jump
-			MAX_JUMP_HEIGHT = Vector3(0, 0, 72), -- Maximum jump height vector
-			MAX_WALKABLE_ANGLE = 55, -- Maximum angle considered walkable (trace landing)
-
-			-- State definitions
+			GRAVITY = 800,
+			JUMP_FORCE = 271,
+			MAX_JUMP_HEIGHT = Vector3(0, 0, 72),
+			MAX_WALKABLE_ANGLE = 55,
 			STATE_IDLE = "STATE_IDLE",
 			STATE_PREPARE_JUMP = "STATE_PREPARE_JUMP",
 			STATE_CTAP = "STATE_CTAP",
 			STATE_ASCENDING = "STATE_ASCENDING",
 			STATE_DESCENDING = "STATE_DESCENDING",
 		},
-
-		-- Runtime state
 		jumpState = "STATE_IDLE",
 		ShouldJump = false,
 		LastSmartJumpAttempt = 0,
 		LastEmergencyJump = 0,
 		ObstacleDetected = false,
 		RequestEmergencyJump = false,
-
-		-- Movement state
 		SimulationPath = {},
 		PredPos = nil,
 		JumpPeekPos = nil,
@@ -780,55 +770,242 @@ G.SmartJump = G.SmartJump
 		lastState = nil,
 		lastJumpTime = 0,
 		LastObstacleHeight = 0,
-	}
-
--- Bot movement tracking (for SmartJump integration)
-G.BotIsMoving = false -- Track if bot is actively moving
-G.BotMovementDirection = Vector3(0, 0, 0) -- Horizontal direction toward current nav target
-G.BotIntendedWishDir = nil -- World wishdir from walk simulation (before cmd is written)
-
--- Memory management and cache tracking
-G.Cache = {
-	lastCleanup = 0,
-	cleanupInterval = 500, -- Clean up every 500 ticks (~8 seconds) instead of 2000
-	maxCacheSize = 1000, -- Maximum number of cached items
+	},
+	BotIsMoving = false,
+	BotMovementDirection = Vector3(0, 0, 0),
+	BotIntendedWishDir = nil,
+	Cache = {
+		lastCleanup = 0,
+		cleanupInterval = 500,
+		maxCacheSize = 1000,
+	},
+	Tasks = {
+		None = 0,
+		Objective = 1,
+		Follow = 2,
+		Health = 3,
+		Medic = 4,
+		Goto = 5,
+	},
+	Current_Tasks = {},
+	Current_Task = 1,
+	Benchmark = {
+		MemUsage = 0,
+	},
+	States = {
+		IDLE = "IDLE",
+		PATHFINDING = "PATHFINDING",
+		MOVING = "MOVING",
+		STUCK = "STUCK",
+		FOLLOWING = "FOLLOWING",
+	},
+	currentState = nil,
+	prevState = nil,
+	wasManualWalking = false,
 }
 
-G.Tasks = {
-	None = 0,
-	Objective = 1,
-	Follow = 2,
-	Health = 3,
-	Medic = 4,
-	Goto = 5,
-}
-
-G.Current_Tasks = {}
 G.Current_Task = G.Tasks.Objective
-
-G.Benchmark = {
-	MemUsage = 0,
-}
-
--- Define states
-G.States = {
-	IDLE = "IDLE",
-	PATHFINDING = "PATHFINDING",
-	MOVING = "MOVING",
-	STUCK = "STUCK",
-	FOLLOWING = "FOLLOWING", -- Direct following of dynamic target on same node
-}
-
-G.currentState = nil
-G.prevState = nil -- Track previous bot state
-G.wasManualWalking = false -- Track if user manually walked last tick
 
 return G
 
 end)
+__bundle_register("NavBot.Utils.Constants", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+NavBot Constants Module
+Centralized constants used across the codebase
+--]]
+
+local Constants = {}
+
+-- ============================================================================
+-- PHYSICS CONSTANTS
+-- ============================================================================
+
+---Gravity in units per second squared
+Constants.GRAVITY = 800
+
+---Player hitbox dimensions
+Constants.HITBOX = {
+	WIDTH = 24,
+	STEP_HEIGHT = 18,
+	MAX_JUMP_HEIGHT = 72,
+	DUCK_JUMP_HEIGHT = 54,
+	CLEARANCE_OFFSET = 34,
+}
+
+---Movement constants
+Constants.MOVEMENT = {
+	MAX_SLOPE_ANGLE = 55, -- Maximum climbable angle in degrees
+	MIN_STEP_SIZE = 5, -- Minimum step size in units
+	PREFERRED_STEPS = 10, -- Preferred number of steps for simulations
+	TICK_RATE = 66, -- Game tick rate
+	ACCELERATION = 5.5, -- Player acceleration
+	SURFACE_FRICTION = 1.0, -- Player surface friction
+}
+
+---Navigation constants
+Constants.NAVIGATION = {
+	DROP_HEIGHT = 144, -- Height to drop when fixing nodes
+	GROUND_TRACE_OFFSET_START = Vector3(0, 0, 5),
+	GROUND_TRACE_OFFSET_END = Vector3(0, 0, -67),
+	MAX_PATH_LENGTH = 1000, -- Maximum path length to prevent infinite loops
+	CONNECTION_TIMEOUT = 5000, -- Connection processing timeout in ms
+}
+
+---Door generation constants
+Constants.DOORS = {
+	MIN_DOOR_WIDTH = 24, -- Minimum door width in units
+	MAX_HEIGHT_DIFFERENCE = 72, -- Maximum height difference for connections
+	WALL_CLEARANCE = 24, -- Clearance needed from walls
+	HEIGHT_TOLERANCE = 0.5, -- Height comparison tolerance
+}
+
+---Visual constants
+Constants.VISUALS = {
+	UP_VECTOR = Vector3(0, 0, 1),
+	AREA_FILL_COLOR = { 55, 255, 155, 12 },
+	AREA_OUTLINE_COLOR = { 255, 255, 255, 77 },
+	CONNECTION_BIDIRECTIONAL_COLOR = { 255, 255, 0, 160 },
+	CONNECTION_UNIDIRECTIONAL_COLOR = { 255, 64, 64, 160 },
+	DOOR_COLOR = { 0, 180, 255, 220 },
+	NODE_BOX_SIZE = 10,
+}
+
+---Grid system constants
+Constants.GRID = {
+	DEFAULT_CHUNK_SIZE = 256, -- Default grid chunk size
+	DEFAULT_RENDER_CHUNKS = 3, -- Default number of chunks to render
+	MAX_NODES_PER_CHUNK = 1000, -- Safety limit for nodes per chunk
+	MIN_CHUNK_SIZE = 32, -- Minimum allowed chunk size
+	MAX_CHUNK_SIZE = 1024, -- Maximum allowed chunk size
+}
+
+---Pathfinding constants
+Constants.PATHFINDING = {
+	MAX_SEARCH_DISTANCE = 200, -- Maximum distance for internal navigation
+	MIN_CLOSE_DISTANCE = 50, -- Minimum distance considered "close"
+	NODE_SKIP_CHECK_DELAY = 22, -- Ticks between node skip checks
+	NODE_SKIP_DISTANCE_CHECK_DELAY = 11, -- Ticks between distance checks
+	MAX_PATH_HISTORY = 32, -- Maximum path history to keep
+}
+
+---Smart Jump constants
+Constants.SMART_JUMP = {
+	JUMP_FORCE = 300, -- Jump force (velocity)
+	MAX_JUMP_HEIGHT = 72, -- Maximum jump height
+	OBSTACLE_HEIGHT_TOLERANCE = 100, -- Maximum obstacle height to consider
+	MIN_OBSTACLE_HEIGHT = 18, -- Minimum obstacle height to trigger jump
+}
+
+---Configuration constants
+Constants.CONFIG = {
+	MAX_CONFIG_SIZE = 1024 * 1024, -- Maximum config file size (1MB)
+	CONFIG_BACKUP_COUNT = 5, -- Number of config backups to keep
+	AUTO_SAVE_DELAY = 5000, -- Auto-save delay in milliseconds
+}
+
+---Memory management constants
+Constants.MEMORY = {
+	GC_THRESHOLD = 1024 * 1024, -- GC threshold in KB
+	MAX_TABLE_SIZE = 10000, -- Maximum table size before cleanup
+	CLEANUP_INTERVAL = 1000, -- Cleanup interval in ticks
+}
+
+---Error handling constants
+Constants.ERRORS = {
+	MAX_RETRY_ATTEMPTS = 3, -- Maximum retry attempts
+	RETRY_DELAY = 1000, -- Retry delay in milliseconds
+	ERROR_LOG_SIZE = 1000, -- Maximum error log entries
+}
+
+---Debug constants
+Constants.DEBUG = {
+	MAX_DEBUG_LINES = 100, -- Maximum debug lines to show
+	DEBUG_TEXT_DURATION = 5000, -- Debug text display duration
+	PERFORMANCE_LOG_INTERVAL = 1000, -- Performance logging interval
+}
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+---Get a constant value by path (e.g., "PHYSICS.GRAVITY")
+---@param path string Dot-separated path to the constant
+---@return any The constant value or nil if not found
+function Constants.Get(path)
+	local current = Constants
+	for part in path:gmatch("([^%.]+)") do
+		current = current[part]
+		if not current then
+			return nil
+		end
+	end
+	return current
+end
+
+---Check if a constant exists at the given path
+---@param path string Dot-separated path to the constant
+---@return boolean True if the constant exists
+function Constants.Has(path)
+	return Constants.Get(path) ~= nil
+end
+
+---Set a constant value (for testing or runtime overrides)
+---@param path string Dot-separated path to the constant
+---@param value any New value for the constant
+function Constants.Set(path, value)
+	local parts = {}
+	for part in path:gmatch("([^%.]+)") do
+		table.insert(parts, part)
+	end
+
+	local current = Constants
+	for i = 1, #parts - 1 do
+		current[parts[i]] = current[parts[i]] or {}
+		current = current[parts[i]]
+	end
+
+	current[parts[#parts]] = value
+end
+
+---Get all constants in a category
+---@param category string Category name (e.g., "PHYSICS")
+---@return table Table of constants in the category
+function Constants.GetCategory(category)
+	return Constants[category] or {}
+end
+
+---List all available categories
+---@return string[] Array of category names
+function Constants.GetCategories()
+	local categories = {}
+	for key, value in pairs(Constants) do
+		if
+			type(value) == "table"
+			and key ~= "Get"
+			and key ~= "Has"
+			and key ~= "Set"
+			and key ~= "GetCategory"
+			and key ~= "GetCategories"
+		then
+			table.insert(categories, key)
+		end
+	end
+	table.sort(categories)
+	return categories
+end
+
+return Constants
+
+end)
 __bundle_register("NavBot.Utils.DefaultConfig", function(require, _LOADED, __bundle_register, __bundle_modules)
-local defaultconfig
-defaultconfig = {
+--[[
+    Default menu schema for NavBot.
+    Persisted via NavBot.Utils.Config (JSON). Types: types/NavBot.lua
+]]
+
+---@type NavMenu
+local Default_Config = {
 	Tab = "Main",
 	Tabs = {
 		Main = true,
@@ -840,50 +1017,60 @@ defaultconfig = {
 
 	Main = {
 		Enable = true,
-		shouldfindhealth = true, -- Path to health
-		SelfHealTreshold = 45, -- Health percentage to start looking for healthPacks
+		EnableWalking = true, -- false = manual WASD only (pathfinding may still run)
+		shouldfindhealth = true,
+		SelfHealTreshold = 45,
 		smoothFactor = 0.05,
-		LookingAhead = true, -- Enable automatic camera rotation towards target node
+		LookingAhead = true,
 		Duck_Grab = true,
+		MaxSkipRange = 500,
+		MaxNodesToSkip = 3,
 	},
+
 	Navigation = {
-		Skip_Nodes = true, --skips nodes if it can go directly to ones closer to target.
-		StopDistance = 50, -- Distance to stop from target when following (FOLLOWING state)
-		WalkableMode = "Smooth", -- "Smooth" uses 18-unit steps, "Aggressive" allows 72-unit jumps
-		CleanupConnections = true, -- Cleanup invalid connections during map load (disable to prevent crashes)
-		AllowExpensiveChecks = true, -- Allow expensive walkability checks for proper stair/ramp connections
+		Skip_Nodes = true,
+		StopDistance = 50,
+		WalkableMode = "Smooth", -- "Smooth" = 18u steps; "Aggressive" = 72u jump links
+		CleanupConnections = true,
+		AllowExpensiveChecks = true,
 	},
+
 	Visuals = {
 		EnableVisuals = true,
-		connectionDepth = 4, -- Flood-fill depth: how many connection steps from player to visualize (1-50)
+		connectionDepth = 4,
 		memoryUsage = false,
-		drawPath = true, -- Draws the path to the current goal
-		showConnections = true, -- Show area↔door triangle connections
-		showAreas = true, -- Show area outlines
-		showDoors = true, -- Show door lines (cyan)
-		showCornerConnections = false, -- Show wall corner points (orange)
-		showD2D = false, -- Show door-to-door connections (light blue)
-		showNodeIds = false, -- Show node ID numbers for debugging
-		showAgentBoxes = false, -- Show agent boxes
-		showSmartJump = false, -- Show SmartJump hitbox and trajectory visualization
-		ISWalkableTest = false, -- ISWalkable test suite toggle
-		Debug_Mode = false, -- Master debug toggle for visuals and debug logging
+		drawPath = true,
+		showConnections = true,
+		showAreas = true,
+		showDoors = true,
+		showCornerConnections = false,
+		showD2D = false,
+		showNodeIds = false,
+		showAgentBoxes = false,
+		showSmartJump = false,
+		ISWalkableTest = false,
+		OptimizedISWalkableTest = false,
+		IsNavigableTest = false,
+		Debug_Mode = false,
 	},
+
 	Movement = {
-		lookatpath = true, -- Look at where we are walking
-		smoothLookAtPath = true, -- Set this to true to enable smooth look at path
-		Smart_Jump = true, -- jumps perfectly before obstacle to be at peek of jump height when at colision point
+		lookatpath = true,
+		smoothLookAtPath = true,
 	},
+
 	SmartJump = {
 		Enable = true,
 		Debug = false,
 	},
 }
 
-return defaultconfig
+return Default_Config
 
 end)
 __bundle_register("NavBot.Utils.Config", function(require, _LOADED, __bundle_register, __bundle_modules)
+---@diagnostic disable: duplicate-set-field, undefined-field
+
 --[[ Imports ]]
 local G = require("NavBot.Core.Globals")
 
@@ -950,10 +1137,14 @@ function Config.LoadCFG()
 	if file then
 		local content = file:read("*a")
 		file:close()
-		local loadedCfg = json.decode(content)
-		if loadedCfg and checkAllKeysExist(Default_Config, loadedCfg) and not input.IsButtonDown(KEY_LSHIFT) then
-			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. shortFilePath)
-			Common.Notify.Simple("Success! Loaded Config from", shortFilePath, 5)
+		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
+		if
+			type(loadedCfg) == "table"
+			and checkAllKeysExist(Default_Config, loadedCfg)
+			and not input.IsButtonDown(KEY_LSHIFT)
+		then
+			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
+			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
 			G.Menu = loadedCfg
 		else
 			local warningMessage = input.IsButtonDown(KEY_LSHIFT) and "Creating a new config."
@@ -961,6 +1152,7 @@ function Config.LoadCFG()
 			printc(255, 0, 0, 255, warningMessage)
 			Common.Notify.Simple("Warning", warningMessage, 5)
 			Config.CreateCFG(Default_Config)
+			---@type NavMenu
 			G.Menu = Default_Config
 		end
 	else
@@ -968,12 +1160,9 @@ function Config.LoadCFG()
 		printc(255, 0, 0, 255, warningMessage)
 		Common.Notify.Simple("Warning", warningMessage, 5)
 		Config.CreateCFG(Default_Config)
+		---@type NavMenu
 		G.Menu = Default_Config
 	end
-
-	-- Set G.Config with key settings for other modules
-	G.Config = G.Config or {}
-	G.Config.AutoFetch = G.Menu.Main.AutoFetch -- Pull from Menu settings
 end
 
 --load on load
@@ -1344,8 +1533,8 @@ end
 
 ---Encodes a lua table to a JSON string.
 ---@param value any
----@param state JsonState
----@return string|boolean
+---@param state? JsonState
+---@return string
 function json.encode(value, state)
     state = state or {}
     local oldbuffer = state.buffer
@@ -4697,16 +4886,21 @@ __bundle_register("NavBot.Navigation.AreaSpatial", function(require, _LOADED, __
 --  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps only tilt
 --  the floor plane. Containment = horizontal AABB + vertical band above floor.
 
+local G = require("NavBot.Core.Globals")
+local Constants = require("NavBot.Utils.Constants")
+
 local AreaSpatial = {}
 
 local GRID_CELL_SIZE = 256
 
--- Upright player slack relative to area floor (matches G.Misc.NodeTouchHeight ≈ 82)
+-- Feet can sit slightly below floor; above-floor band matches max jump (72u).
 AreaSpatial.Z_PAD_BELOW = 8
-AreaSpatial.Z_PAD_ABOVE = 82
 
 local Z_PAD_BELOW = AreaSpatial.Z_PAD_BELOW
-local Z_PAD_ABOVE = AreaSpatial.Z_PAD_ABOVE
+
+function AreaSpatial.getTouchHeightAbove()
+	return G.Misc.NodeTouchHeight or Constants.HITBOX.MAX_JUMP_HEIGHT
+end
 
 --- Precompute floor Z and vertical query band on a normalized node.
 function AreaSpatial.PrecomputeVerticalBounds(node)
@@ -4715,12 +4909,13 @@ function AreaSpatial.PrecomputeVerticalBounds(node)
 	end
 
 	local floorZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	local above = AreaSpatial.getTouchHeightAbove()
 	node._floorZ = floorZ
 	node._minZ = floorZ - Z_PAD_BELOW
-	node._maxZ = floorZ + Z_PAD_ABOVE
+	node._maxZ = floorZ + above
 end
 
---- Horizontal axis-aligned footprint + vertical band (82 up, 8 down from floor).
+--- Horizontal axis-aligned footprint + vertical band (72u up, 8 down from floor).
 function AreaSpatial.IsWithinArea(pos, node)
 	if not node or not node._minX then
 		return false
@@ -4738,8 +4933,9 @@ function AreaSpatial.IsWithinArea(pos, node)
 		return true
 	end
 
+	local above = AreaSpatial.getTouchHeightAbove()
 	local heightAboveFloor = pos.z - floorZ
-	return heightAboveFloor <= Z_PAD_ABOVE and heightAboveFloor >= -Z_PAD_BELOW
+	return heightAboveFloor <= above and heightAboveFloor >= -Z_PAD_BELOW
 end
 
 --- Squared distance from a point to the XY footprint + Z query band (0 if inside).
@@ -8276,15 +8472,8 @@ local function tryLateJumpAtObstacle(simPos, newPos, newVel, wishDir, hitbox, ma
 		return false
 	end
 
-	local nextPos, _nextVel, hitNext, nextWall = GroundMovement.simulateGroundStepHull(
-		newPos,
-		newVel,
-		wishDir,
-		maxSpeed,
-		hitbox[1],
-		hitbox[2],
-		true
-	)
+	local nextPos, _nextVel, hitNext, nextWall =
+		GroundMovement.simulateGroundStepHull(newPos, newVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
 
 	if not nextPos then
 		G.SmartJump.PredPos = newPos
@@ -8403,15 +8592,8 @@ local function shouldLateJumpManual(cmd, pLocal)
 	G.SmartJump.SimulationPath = { origin }
 
 	for _ = 1, peakTicks + 4 do
-		local newPos, newVel, hitWall, wallTrace = GroundMovement.simulateGroundStepHull(
-			simPos,
-			simVel,
-			wishDir,
-			maxSpeed,
-			hitbox[1],
-			hitbox[2],
-			true
-		)
+		local newPos, newVel, hitWall, wallTrace =
+			GroundMovement.simulateGroundStepHull(simPos, simVel, wishDir, maxSpeed, hitbox[1], hitbox[2], true)
 
 		if not newPos then
 			break
@@ -8499,8 +8681,7 @@ function SmartJump.Main(cmd)
 				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
 				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
 				local hitbox = getPlayerHitbox(pLocal)
-				local obstacleTrace =
-					engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
 				if obstacleTrace.fraction < 1 then
 					shouldUnduck = true
 				end
@@ -9199,6 +9380,9 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local PathSteering = require("NavBot.Navigation.PathSteering")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local Node = require("NavBot.Navigation.Node")
+local Constants = require("NavBot.Utils.Constants")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
@@ -9303,13 +9487,23 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance or 12
+	local reachDist = G.Misc.NodeTouchDistance or 16
+	local touchHeight = G.Misc.NodeTouchHeight or Constants.HITBOX.MAX_JUMP_HEIGHT
 	if G.Navigation.path and #G.Navigation.path > 1 then
 		local currentNode = G.Navigation.path[1]
 		local nextNode = G.Navigation.path[2]
 		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
 	end
-	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
+
+	-- Mid-air: origin is high but still inside nav area's 72u vertical band (GetAbsOrigin).
+	local currentNode = G.Navigation.path and G.Navigation.path[1]
+	if currentNode and not Node.IsDoorNode(currentNode) then
+		if horizontalDist < reachDist and AreaSpatial.IsWithinArea(origin, currentNode) then
+			return true
+		end
+	end
+
+	return (horizontalDist < reachDist) and (verticalDist <= touchHeight)
 end
 
 -- Reset distance tracking (call when path changes)
@@ -9320,7 +9514,7 @@ end
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
 	previousDistance = nil -- Reset tracking when advancing nodes
-	Log:Debug(tostring(G.Menu.Main.Skip_Nodes), #G.Navigation.path)
+	Log:Debug(tostring(G.Menu.Navigation.Skip_Nodes), #G.Navigation.path)
 
 	Log:Debug("Removing current node (reached target)")
 	Navigation.RemoveCurrentNode()
@@ -10607,9 +10801,6 @@ local function releaseTables(...)
 	end
 end
 
--- Type definitions for A* pathfinding
-
----@class Vector3
 local function heuristicCost(nodeA, nodeB)
 	-- Euclidean distance heuristic
 	local dx = nodeA.pos.x - nodeB.pos.x

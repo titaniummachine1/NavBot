@@ -9,6 +9,7 @@ Delegates all complex logic to focused modules with single responsibilities
 
 --[[ Core Dependencies ]]
 local Common = require("NavBot.Core.Common")
+---@type NavBotGlobals
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local WorkManager = require("NavBot.WorkManager")
@@ -118,6 +119,9 @@ end
 local function onDrawModel(ctx)
 	if ctx:GetModelName():find("medkit") then
 		local entity = ctx:GetEntity()
+		if not entity then
+			return
+		end
 		G.World.healthPacks[entity:GetIndex()] = entity:GetAbsOrigin()
 	end
 end
@@ -310,7 +314,7 @@ if entities.GetLocalPlayer() then
 		G.Navigation.nodes = {}
 	end
 
-	if G.Menu.Main.CleanupConnections then
+	if G.Menu.Navigation.CleanupConnections then
 		Log:Info("Connection cleanup enabled - this may cause temporary frame drops")
 	else
 		Log:Info("Connection cleanup is disabled in settings (recommended for performance)")

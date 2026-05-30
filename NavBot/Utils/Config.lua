@@ -1,3 +1,5 @@
+---@diagnostic disable: duplicate-set-field, undefined-field
+
 --[[ Imports ]]
 local G = require("NavBot.Core.Globals")
 
@@ -64,10 +66,14 @@ function Config.LoadCFG()
 	if file then
 		local content = file:read("*a")
 		file:close()
-		local loadedCfg = json.decode(content)
-		if loadedCfg and checkAllKeysExist(Default_Config, loadedCfg) and not input.IsButtonDown(KEY_LSHIFT) then
-			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. shortFilePath)
-			Common.Notify.Simple("Success! Loaded Config from", shortFilePath, 5)
+		local loadedCfg = json.decode(content) --[[@as NavMenu?]]
+		if
+			type(loadedCfg) == "table"
+			and checkAllKeysExist(Default_Config, loadedCfg)
+			and not input.IsButtonDown(KEY_LSHIFT)
+		then
+			printc(100, 183, 0, 255, "Success Loading Config: Path: " .. (shortFilePath or filepath))
+			Common.Notify.Simple("Success! Loaded Config from", shortFilePath or filepath, 5)
 			G.Menu = loadedCfg
 		else
 			local warningMessage = input.IsButtonDown(KEY_LSHIFT) and "Creating a new config."
@@ -75,6 +81,7 @@ function Config.LoadCFG()
 			printc(255, 0, 0, 255, warningMessage)
 			Common.Notify.Simple("Warning", warningMessage, 5)
 			Config.CreateCFG(Default_Config)
+			---@type NavMenu
 			G.Menu = Default_Config
 		end
 	else
@@ -82,12 +89,9 @@ function Config.LoadCFG()
 		printc(255, 0, 0, 255, warningMessage)
 		Common.Notify.Simple("Warning", warningMessage, 5)
 		Config.CreateCFG(Default_Config)
+		---@type NavMenu
 		G.Menu = Default_Config
 	end
-
-	-- Set G.Config with key settings for other modules
-	G.Config = G.Config or {}
-	G.Config.AutoFetch = G.Menu.Main.AutoFetch -- Pull from Menu settings
 end
 
 --load on load

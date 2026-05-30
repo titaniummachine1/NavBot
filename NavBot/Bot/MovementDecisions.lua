@@ -7,6 +7,9 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local PathSteering = require("NavBot.Navigation.PathSteering")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local Node = require("NavBot.Navigation.Node")
+local Constants = require("NavBot.Utils.Constants")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
@@ -111,13 +114,23 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance or 12
+	local reachDist = G.Misc.NodeTouchDistance or 16
+	local touchHeight = G.Misc.NodeTouchHeight or Constants.HITBOX.MAX_JUMP_HEIGHT
 	if G.Navigation.path and #G.Navigation.path > 1 then
 		local currentNode = G.Navigation.path[1]
 		local nextNode = G.Navigation.path[2]
 		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
 	end
-	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
+
+	-- Mid-air: origin is high but still inside nav area's 72u vertical band (GetAbsOrigin).
+	local currentNode = G.Navigation.path and G.Navigation.path[1]
+	if currentNode and not Node.IsDoorNode(currentNode) then
+		if horizontalDist < reachDist and AreaSpatial.IsWithinArea(origin, currentNode) then
+			return true
+		end
+	end
+
+	return (horizontalDist < reachDist) and (verticalDist <= touchHeight)
 end
 
 -- Reset distance tracking (call when path changes)
@@ -128,7 +141,7 @@ end
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
 	previousDistance = nil -- Reset tracking when advancing nodes
-	Log:Debug(tostring(G.Menu.Main.Skip_Nodes), #G.Navigation.path)
+	Log:Debug(tostring(G.Menu.Navigation.Skip_Nodes), #G.Navigation.path)
 
 	Log:Debug("Removing current node (reached target)")
 	Navigation.RemoveCurrentNode()
