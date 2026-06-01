@@ -176,7 +176,7 @@ function MovementDecisions.checkStuckState()
 					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
 					if G.Navigation.lowVelocityTicks > 66 then
 						Log:Warn(
-							"STUCK: Low velocity (%d) for %d ticks, entering STUCK state",
+							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
 							speed2D,
 							G.Navigation.lowVelocityTicks
 						)
@@ -253,38 +253,29 @@ function MovementDecisions.handleMovingState(userCmd)
 		return
 	end
 
+	-- Update movement direction for SmartJump
 	local targetPos = MovementDecisions.getCurrentTarget()
-	G.BotIntendedWishDir = nil
-	G.BotIsMoving = false
-
-	if targetPos and G.Menu.Main.EnableWalking and G.pLocal.entity then
+	if targetPos then
 		local LocalOrigin = G.pLocal.Origin
 		local direction = targetPos - LocalOrigin
-		direction.z = 0
-		if direction:Length2D() > 0 then
-			G.BotMovementDirection = Common.Normalize(direction)
-		else
-			G.BotMovementDirection = Vector3(0, 0, 0)
-		end
-
-		local wishdir = MovementController.computeWishDir(G.pLocal.entity, targetPos)
-		if wishdir then
-			G.BotIntendedWishDir = wishdir
-			G.BotIsMoving = true
-		end
+		G.BotMovementDirection = direction:Length() > 0 and Common.Normalize(direction) or Vector3(0, 0, 0)
+		G.BotIsMoving = true
 		G.Navigation.currentTargetPos = targetPos
 	end
 
+	-- Handle camera rotation
 	MovementController.handleCameraRotation(userCmd, targetPos)
 
+	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
 
-	-- SmartJump uses intended wishdir before walkTo writes cmd
-	MovementDecisions.handleSmartJump(userCmd)
-
+	-- ALWAYS execute movement at the end, regardless of decision outcomes
 	MovementDecisions.executeMovement(userCmd)
+
+	-- Handle SmartJump after walkTo
+	MovementDecisions.handleSmartJump(userCmd)
 end
 
 return MovementDecisions

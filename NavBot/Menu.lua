@@ -73,6 +73,10 @@ local function OnDrawMenu()
 		-- Smart Jump (works independently of NavBot enable state)
 		G.Menu.SmartJump.Enable = TimMenu.Checkbox("Smart Jump", G.Menu.SmartJump.Enable)
 		TimMenu.Tooltip("Enable intelligent jumping over obstacles (works even when NavBot is disabled)")
+		TimMenu.NextLine()
+
+		G.Menu.SmartJump.Debug = TimMenu.Checkbox("SmartJump Debug Logs", G.Menu.SmartJump.Debug or false)
+		TimMenu.Tooltip("Throttled path-sim and state transition logs for SmartJump")
 		TimMenu.EndSector()
 	elseif G.Menu.Tab == "Navigation" then
 		-- Movement & Pathfinding Section

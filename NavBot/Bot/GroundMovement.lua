@@ -260,11 +260,11 @@ function GroundMovement.getMaxSpeed(player)
 end
 
 function GroundMovement.isOnGround(player)
-	if player and player.IsOnGround and player:IsOnGround() then
-		return true
+	if not player then
+		return false
 	end
-	local flags = player and player:GetPropInt("m_fFlags") or 0
-	return (flags & 1) ~= 0
+	local flags = player:GetPropInt("m_fFlags")
+	return (flags & FL_ONGROUND) ~= 0
 end
 
 return GroundMovement

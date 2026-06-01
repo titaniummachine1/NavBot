@@ -50,11 +50,10 @@ G.Navigation = {
 	goalPos = nil, -- Current goal world position
 	goalNodeId = nil, -- Closest node to the goal position
 	navMeshUpdated = false, -- Set when navmesh is rebuilt
-	kdTree = nil, -- XY KD-tree (AABB-distance queries)
-	areaGrid = nil, -- Uniform grid for exact area-at-position lookup
 	-- Node skipping system
 	lastSkipCheckTick = 0, -- Last tick when we performed skip check
 	nextNodeCloser = false, -- Flag indicating if next node is closer
+	lowVelocityTicks = 0,
 }
 
 -- SmartJump configuration
@@ -71,7 +70,7 @@ G.SmartJump = G.SmartJump
 			GRAVITY = 800, -- Gravity per second squared
 			JUMP_FORCE = 271, -- Initial vertical boost for a duck jump
 			MAX_JUMP_HEIGHT = Vector3(0, 0, 72), -- Maximum jump height vector
-			MAX_WALKABLE_ANGLE = 55, -- Maximum angle considered walkable (trace landing)
+			MAX_WALKABLE_ANGLE = 45, -- Maximum angle considered walkable
 
 			-- State definitions
 			STATE_IDLE = "STATE_IDLE",
@@ -103,8 +102,7 @@ G.SmartJump = G.SmartJump
 
 -- Bot movement tracking (for SmartJump integration)
 G.BotIsMoving = false -- Track if bot is actively moving
-G.BotMovementDirection = Vector3(0, 0, 0) -- Horizontal direction toward current nav target
-G.BotIntendedWishDir = nil -- World wishdir from walk simulation (before cmd is written)
+G.BotMovementDirection = Vector3(0, 0, 0) -- Bot's intended movement direction
 
 -- Memory management and cache tracking
 G.Cache = {

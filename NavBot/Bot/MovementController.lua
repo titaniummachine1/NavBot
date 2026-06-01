@@ -10,33 +10,6 @@ local MovementController = {}
 
 local ARRIVAL_DIST = 1.5
 
---- Same wishdir walkTo would use (coast + accel model); nil if at destination.
-function MovementController.computeWishDir(player, dest)
-	if not (player and dest) then
-		return nil
-	end
-
-	local pos = player:GetAbsOrigin()
-	if not pos then
-		return nil
-	end
-
-	local toDest = dest - pos
-	toDest.z = 0
-	if toDest:Length2D() < ARRIVAL_DIST then
-		return nil
-	end
-
-	local onGround = GroundMovement.isOnGround(player)
-	local maxSpeed = GroundMovement.getMaxSpeed(player)
-	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
-	vel.z = 0
-
-	local horizSpeed = vel:Length2D()
-	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
-	return GroundMovement.computeWishDirToTarget(pos, vel, dest, coastTicks, onGround)
-end
-
 --- Walk toward dest using simulated friction/coast wish direction + optimal ground accel input.
 function MovementController.walkTo(cmd, player, dest)
 	if not (cmd and player and dest) then

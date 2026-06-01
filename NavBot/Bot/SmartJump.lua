@@ -1,98 +1,182 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
-local GroundMovement = require("NavBot.Bot.GroundMovement")
-
 local Log = Common.Log.new("SmartJump")
 
 Log.Level = 0
 local SJ = G.SmartJump
 local SJC = G.SmartJump.Constants
 
-local STEP_Z = 18
-local STEP_VEC = Vector3(0, 0, STEP_Z)
-local FORWARD_PROBE = 1
-local FORWARD_SLIDE = 24
-local MIN_STEP_HEIGHT = 18
-local MAX_CLEAR_HEIGHT = 72
+-- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
 
-local SmartJump = {}
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
 
-local function getPlayerHitbox(player)
-	return { player:GetMins(), player:GetMaxs() }
+local function GetPlayerHitbox(player)
+	local mins = player:GetMins()
+	local maxs = player:GetMaxs()
+	return {
+		mins,
+		maxs,
+	}
 end
 
-local function rotateMoveByView(moveIntent, yaw)
+local function RotateVectorByYaw(vector, yaw)
 	local rad = math.rad(yaw)
 	local cos, sin = math.cos(rad), math.sin(rad)
-	return Vector3(cos * moveIntent.x - sin * moveIntent.y, sin * moveIntent.x + cos * moveIntent.y, 0)
+	return Vector3(cos * vector.x - sin * vector.y, sin * vector.x + cos * vector.y, vector.z)
 end
 
 local function isSurfaceWalkable(normal)
-	local angle = math.deg(math.acos(normal:Dot(Vector3(0, 0, 1))))
-	return angle < SJC.MAX_WALKABLE_ANGLE
+	local vUp = Vector3(0, 0, 1)
+	local angle = math.deg(math.acos(normal:Dot(vUp)))
+	return angle < 55
 end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return (pFlags & FL_ONGROUND) == FL_ONGROUND
+	return pFlags & FL_ONGROUND == FL_ONGROUND
 end
 
---- Bot simulated wishdir first; else manual cmd move rotated by view (same basis as walkTo).
-local function getWishDir(cmd)
-	if G.BotIntendedWishDir and G.BotIntendedWishDir:Length2D() > 0.01 then
-		local dir = G.BotIntendedWishDir
-		dir.z = 0
-		return Common.Normalize(dir)
-	end
-
-	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
-	if moveIntent:Length() < 1 then
-		return nil
-	end
-
-	local viewAngles = engine.GetViewAngles()
-	return Common.Normalize(rotateMoveByView(moveIntent, viewAngles.yaw))
+local function isPlayerDucking(player)
+	return player:GetPropInt("m_fFlags") & FL_DUCKING == FL_DUCKING
 end
 
---- Into wall 1u, up 72, forward (slide corners), down — can we land on top?
-local function canClearObstacle(hitPos, wishDir, hitbox)
-	if not wishDir or not hitPos then
+local SmartJump = {}
+
+-- ============================================================================
+-- OBSTACLE DETECTION AND JUMP CALCULATION
+-- ============================================================================
+
+local function CheckJumpable(hitPos, moveDirection, hitbox)
+	if not moveDirection then
 		return false, 0
 	end
 
-	local probe = hitPos + wishDir * FORWARD_PROBE
-	local headTarget = probe + SJC.MAX_JUMP_HEIGHT
+	local checkPos = hitPos + moveDirection * 1
+	local abovePos = checkPos + SJC.MAX_JUMP_HEIGHT
 
-	local upTrace = engine.TraceHull(probe, headTarget, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	if upTrace.startsolid then
-		return false, 0
+	-- Perform the trace and get detailed results
+	local trace = engine.TraceHull(abovePos, checkPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+
+	if isSurfaceWalkable(trace.plane) then
+		-- FIXED: Calculate obstacle height from actual trace distance, not hardcoded 72
+		local traceLength = (abovePos - checkPos):Length()
+		local obstacleHeight = traceLength * (1 - trace.fraction)
+
+		-- FIXED: Ensure obstacle height is reasonable
+		if trace.fraction == 0 then
+			-- Trace hit immediately, this might be a wall we're standing against
+			return false, 0
+		end
+
+		if obstacleHeight <= 0 or obstacleHeight > 100 then
+			-- Invalid obstacle height
+			return false, 0
+		end
+
+		if obstacleHeight > 18 then
+			G.SmartJump.LastObstacleHeight = hitPos.z + obstacleHeight
+
+			-- Calculate minimum ticks needed to clear this obstacle
+			-- Use quadratic formula to find time to reach obstacle height
+			local jumpVel = SJC.JUMP_FORCE
+			local gravity = SJC.GRAVITY
+			local tickInterval = globals.TickInterval()
+
+			local a = 0.5 * gravity
+			local b = -jumpVel
+			local c = obstacleHeight
+			local discriminant = b * b - 4 * a * c
+
+			local minTicksNeeded = 0
+			if discriminant >= 0 then
+				local t1 = (-b - math.sqrt(discriminant)) / (2 * a)
+				local t2 = (-b + math.sqrt(discriminant)) / (2 * a)
+				local t = math.min(t1 > 0 and t1 or math.huge, t2 > 0 and t2 or math.huge)
+				if t ~= math.huge then
+					minTicksNeeded = math.ceil(t / tickInterval)
+				end
+			else
+				-- FIXED: For negative discriminant, use approximation
+				-- Estimate time based on obstacle height vs max jump height
+				local maxJumpHeight = 72
+				local timeToMaxHeight = math.sqrt(2 * maxJumpHeight / gravity)
+				local fraction = obstacleHeight / maxJumpHeight
+				local estimatedTime = timeToMaxHeight * fraction
+				minTicksNeeded = math.ceil(estimatedTime / tickInterval)
+			end
+
+			G.SmartJump.JumpPeekPos = trace.endpos
+			return true, minTicksNeeded
+		end
 	end
-	local headPos = upTrace.endpos
-
-	local fwdEnd = headPos + wishDir * FORWARD_SLIDE
-	local fwdTrace = engine.TraceHull(headPos, fwdEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	local fwdPos = fwdTrace.endpos
-
-	local downTrace = engine.TraceHull(fwdPos, fwdPos - SJC.MAX_JUMP_HEIGHT, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
-	if downTrace.startsolid or downTrace.fraction >= 1 then
-		return false, 0
-	end
-	if not isSurfaceWalkable(downTrace.plane) then
-		return false, 0
-	end
-
-	local lipZ = downTrace.endpos.z
-	local obstacleHeight = lipZ - hitPos.z
-	if obstacleHeight < MIN_STEP_HEIGHT or obstacleHeight > MAX_CLEAR_HEIGHT then
-		return false, 0
-	end
-
-	G.SmartJump.LastObstacleHeight = lipZ
-	G.SmartJump.JumpPeekPos = downTrace.endpos
-	return true, obstacleHeight
+	return false, 0
 end
+
+-- ============================================================================
+-- MOVEMENT SIMULATION
+-- ============================================================================
+
+local function SimulateMovementTick(startPos, velocity, pLocal)
+	local upVector = Vector3(0, 0, 1)
+	local stepVector = Vector3(0, 0, 18)
+	local hitbox = GetPlayerHitbox(pLocal)
+	local deltaTime = globals.TickInterval()
+	local moveDirection = Common.Normalize(velocity)
+	local targetPos = startPos + velocity * deltaTime
+
+	local startPostrace = engine.TraceHull(startPos + stepVector, startPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	local downpstartPos = startPostrace.endpos
+	local uptrace = engine.TraceHull(targetPos + stepVector, targetPos, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	local downpostarget = uptrace.endpos
+	local wallTrace =
+		engine.TraceHull(downpstartPos + stepVector, downpostarget + stepVector, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+
+	if wallTrace.fraction ~= 0 then
+		targetPos = wallTrace.endpos
+	end
+
+	local Groundtrace = engine.TraceHull(targetPos, targetPos - stepVector * 2, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if Groundtrace.fraction < 1 then
+		targetPos = Groundtrace.endpos
+	else
+		return nil, false, velocity, false, 0
+	end
+
+	Groundtrace = engine.TraceHull(targetPos, targetPos - stepVector, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+	if Groundtrace.fraction < 1 then
+		targetPos = Groundtrace.endpos
+	else
+		return nil, false, velocity, false, 0
+	end
+
+	local hitObstacle = wallTrace.fraction < 1
+	local canJump = false
+	local minJumpTicks = 0
+
+	if hitObstacle then
+		canJump, minJumpTicks = CheckJumpable(targetPos, moveDirection, hitbox)
+		local wallNormal = wallTrace.plane
+		local wallAngle = math.deg(math.acos(wallNormal:Dot(upVector)))
+
+		-- FIXED: Apply sliding logic only for steep walls (>55 degrees)
+		-- This matches the swing prediction behavior - only slide on steep walls
+		if wallAngle > 55 then
+			-- The wall is too steep, we'll collide
+			local dot = velocity:Dot(wallNormal)
+			velocity = velocity - wallNormal * dot
+		end
+	end
+
+	return targetPos, hitObstacle, velocity, canJump, minJumpTicks
+end
+-- ============================================================================
+-- SMART JUMP DETECTION
+-- ============================================================================
 
 local function isNearPayload(position)
+	-- Check if position is near any payload cart
 	if not G.World.payloads then
 		return false
 	end
@@ -100,11 +184,17 @@ local function isNearPayload(position)
 	for _, payload in pairs(G.World.payloads) do
 		if payload:IsValid() then
 			local payloadPos = payload:GetAbsOrigin()
-			if (position - payloadPos):Length() < 200 then
+
+			-- Check distance to entity center
+			local distToCenter = (position - payloadPos):Length()
+			if distToCenter < 200 then
 				return true
 			end
+
+			-- Also check distance to ground-level position (offset -80 like in GoalFinder)
 			local groundPos = Vector3(payloadPos.x, payloadPos.y, payloadPos.z - 80)
-			if (position - groundPos):Length() < 150 then
+			local distToGround = (position - groundPos):Length()
+			if distToGround < 150 then
 				return true
 			end
 		end
@@ -112,184 +202,238 @@ local function isNearPayload(position)
 	return false
 end
 
---- Walk along wishdir with ground physics; jump only on last tick that can still clear (late jump).
-local function shouldLateJump(cmd, pLocal)
-	if not pLocal or not isPlayerOnGround(pLocal) then
+local function SmartJumpDetection(cmd, pLocal)
+	if not pLocal or (not isPlayerOnGround(pLocal)) then
 		return false
 	end
 
-	local wishDir = getWishDir(cmd)
-	if not wishDir then
+	local pLocalPos = pLocal:GetAbsOrigin()
+
+	-- Early exit: don't jump if already near payload
+	if isNearPayload(pLocalPos) then
 		return false
 	end
 
-	local origin = pLocal:GetAbsOrigin()
-	if isNearPayload(origin) then
-		return false
+	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
+	local viewAngles = engine.GetViewAngles()
+
+	if moveIntent:Length() == 0 and G.BotIsMoving and G.BotMovementDirection then
+		local forward = viewAngles:Forward()
+		local right = viewAngles:Right()
+		moveIntent = Vector3(G.BotMovementDirection:Dot(forward) * 450, (-G.BotMovementDirection:Dot(right)) * 450, 0)
 	end
 
-	local hitbox = getPlayerHitbox(pLocal)
-	local maxSpeed = GroundMovement.getMaxSpeed(pLocal)
-	local vel = pLocal:EstimateAbsVelocity() or Vector3(0, 0, 0)
-	vel.z = 0
-	local horizSpeed = math.max(vel:Length2D(), maxSpeed * 0.85)
-	vel = Vector3(wishDir.x * horizSpeed, wishDir.y * horizSpeed, 0)
+	local rotatedMoveIntent = RotateVectorByYaw(moveIntent, viewAngles.yaw)
 
+	-- FIXED: Ensure we always have minimum move direction for simulation
+	-- Even if move intent is very small, we need direction to detect obstacles
+	local moveDir = Common.Normalize(rotatedMoveIntent)
+	local moveLength = rotatedMoveIntent:Length()
+
+	-- Always use minimum move speed for simulation (450 units/second)
+	local minMoveSpeed = 450
+	local simulationSpeed = math.max(moveLength, minMoveSpeed)
+
+	-- If no movement intent at all, use forward direction
+	if moveLength <= 1 then
+		local forward = viewAngles:Forward()
+		moveDir = forward
+		simulationSpeed = minMoveSpeed
+	end
+
+	local currentVel = pLocal:EstimateAbsVelocity()
+	local horizontalSpeed = currentVel:Length()
+
+	-- Use simulation speed if we have movement intent, otherwise use current velocity
+	if horizontalSpeed <= 1 then
+		horizontalSpeed = simulationSpeed
+	end
+
+	local initialVelocity = moveDir * horizontalSpeed
+
+	-- Calculate actual jump peak timing using TF2 physics
+	-- Jump velocity impulse: immediately sets Z velocity to JUMP_FORCE
+	-- Gravity: 800 units/second²
+	-- Find time to reach peak: t = JUMP_FORCE / GRAVITY
+	local jumpVel = SJC.JUMP_FORCE
+	local gravity = SJC.GRAVITY
 	local tickInterval = globals.TickInterval()
-	if tickInterval <= 0 then
-		tickInterval = 1 / 66.67
-	end
 
-	local peakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
-	local maxWalkTicks = peakTicks + 8
+	-- Time to reach jump peak: t = v/g
+	local timeToPeak = jumpVel / gravity -- 271/800 = 0.33875 seconds
+	local jumpPeakTicks = math.ceil(timeToPeak / tickInterval) -- ~23 ticks
 
-	local simPos = origin
-	local simVel = vel
-	G.SmartJump.SimulationPath = { origin }
+	local totalSimulationTicks = jumpPeakTicks
 
-	for _ = 1, maxWalkTicks do
-		local newPos, newVel, hitWall = GroundMovement.simulateGroundStepHull(
-			simPos,
-			simVel,
-			wishDir,
-			maxSpeed,
-			hitbox[1],
-			hitbox[2],
-			true
-		)
+	local currentPos = pLocalPos
+	local currentVelocity = initialVelocity
+
+	G.SmartJump.SimulationPath = {
+		currentPos,
+	}
+
+	for tick = 1, totalSimulationTicks do
+		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
+			SimulateMovementTick(currentPos, currentVelocity, pLocal)
 
 		if not newPos then
 			break
 		end
 
-		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+		table.insert(G.SmartJump.SimulationPath, newPos)
 
-		if hitWall then
-			local clearNow, _height = canClearObstacle(newPos, wishDir, hitbox)
-			if not clearNow then
-				return false
-			end
+		if hitObstacle and canJump then
+			--print(tick, minJumpTicks)
 
-			local nextPos, nextVel, hitNext = GroundMovement.simulateGroundStepHull(
-				newPos,
-				newVel,
-				wishDir,
-				maxSpeed,
-				hitbox[1],
-				hitbox[2],
-				true
-			)
-
-			if not nextPos then
-				if isNearPayload(newPos) then
+			if tick <= minJumpTicks then
+				-- Check if we're trying to jump onto or near payload
+				if isNearPayload(newPos) or isNearPayload(currentPos) then
+					Log:Debug("SmartJump: Skipping jump - near payload cart")
 					return false
 				end
+
 				G.SmartJump.PredPos = newPos
 				G.SmartJump.HitObstacle = true
+				Log:Debug("SmartJump: Jumping at tick %d (needed: %d)", tick, minJumpTicks)
 				return true
-			end
-
-			if not hitNext then
-				-- Not flush with wall yet — keep walking toward it
-				simPos = nextPos
-				simVel = nextVel
 			else
-				local clearNext = canClearObstacle(nextPos, wishDir, hitbox)
-				if not clearNext then
-					if isNearPayload(newPos) then
-						return false
-					end
-					G.SmartJump.PredPos = newPos
-					G.SmartJump.HitObstacle = true
-					Log:Debug("SmartJump: late jump at obstacle")
-					return true
-				end
-				simPos = nextPos
-				simVel = nextVel
+				Log:Debug("SmartJump: Obstacle detected at tick %d (need tick %d) -> Waiting", tick, minJumpTicks)
+				return false
 			end
-		else
-			simPos = newPos
-			simVel = newVel
 		end
-	end
 
+		currentPos = newPos
+		currentVelocity = newVelocity
+	end
 	return false
 end
+-- ============================================================================
+-- MAIN SMART JUMP LOGIC
+-- ============================================================================
 
 function SmartJump.Main(cmd)
 	if not G.Menu.SmartJump.Enable then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
+		SJ.ObstacleDetected = false
 		SJ.RequestEmergencyJump = false
 		return
 	end
 
 	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or not pLocal:IsAlive() or pLocal:IsDormant() then
+	if not pLocal or (not pLocal:IsAlive()) or pLocal:IsDormant() then
 		SJ.jumpState = SJC.STATE_IDLE
 		SJ.ShouldJump = false
+		SJ.ObstacleDetected = false
 		SJ.RequestEmergencyJump = false
-		return
+		return false
 	end
 
 	local onGround = isPlayerOnGround(pLocal)
+	local ducking = isPlayerDucking(pLocal)
 	local shouldJump = false
 
 	if G.SmartJump.RequestEmergencyJump then
 		shouldJump = true
 		G.SmartJump.RequestEmergencyJump = false
+		G.SmartJump.LastSmartJumpAttempt = globals.TickCount()
 		SJ.jumpState = SJC.STATE_PREPARE_JUMP
+		Log:Info("SmartJump: Processing emergency jump request")
 	end
 
-	local hasWishDir = getWishDir(cmd) ~= nil
+	local hasMovementIntent = false
+	local moveDir = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
+	if moveDir:Length() > 0 or G.BotIsMoving and G.BotMovementDirection and G.BotMovementDirection:Length() > 0 then
+		hasMovementIntent = true
+	end
+
+	if onGround and ducking and hasMovementIntent and SJ.jumpState == SJC.STATE_IDLE then
+		local obstacleDetected = SmartJumpDetection(cmd, pLocal)
+		if obstacleDetected then
+			SJ.jumpState = SJC.STATE_PREPARE_JUMP
+			Log:Debug("SmartJump: Crouched movement with obstacle detected, initiating jump")
+		else
+			Log:Debug("SmartJump: Crouched movement but no obstacle detected, staying idle")
+		end
+	end
 
 	if SJ.jumpState == SJC.STATE_IDLE then
-		if onGround and (hasWishDir or shouldJump) then
-			if shouldJump or shouldLateJump(cmd, pLocal) then
+		if onGround and hasMovementIntent then
+			local smartJumpDetected = SmartJumpDetection(cmd, pLocal)
+			if smartJumpDetected or shouldJump then
 				SJ.jumpState = SJC.STATE_PREPARE_JUMP
+				Log:Debug("SmartJump: IDLE -> PREPARE_JUMP (obstacle detected)")
 			end
 		end
 	elseif SJ.jumpState == SJC.STATE_PREPARE_JUMP then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
 		cmd:SetButtons(cmd.buttons & ~IN_JUMP)
 		SJ.jumpState = SJC.STATE_CTAP
+		Log:Debug("SmartJump: PREPARE_JUMP -> CTAP (ducking)")
 	elseif SJ.jumpState == SJC.STATE_CTAP then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
 		cmd:SetButtons(cmd.buttons | IN_JUMP)
 		SJ.jumpState = SJC.STATE_ASCENDING
+		Log:Debug("SmartJump: CTAP -> ASCENDING (unduck + jump)")
 	elseif SJ.jumpState == SJC.STATE_ASCENDING then
 		cmd:SetButtons(cmd.buttons | IN_DUCK)
 		local velocity = pLocal:EstimateAbsVelocity()
 		local currentPos = pLocal:GetAbsOrigin()
-		local shouldUnduck = velocity.z <= 0
 
+		-- Check if we should unduck (improve duck grab logic)
+		local shouldUnduck = velocity.z <= 0 -- Always unduck when falling
+
+		-- If Duck_Grab is enabled and we have obstacle height info, do improved check
 		if not shouldUnduck and G.Menu.Main.Duck_Grab and G.SmartJump.LastObstacleHeight then
-			if currentPos.z > G.SmartJump.LastObstacleHeight then
+			local playerHeight = currentPos.z
+
+			-- Only consider unducking if we're above the obstacle
+			if playerHeight > G.SmartJump.LastObstacleHeight then
+				-- IMPROVED: Trace down from player position + obstacle height + 1
 				local traceStart = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight + 1)
 				local traceEnd = Vector3(currentPos.x, currentPos.y, G.SmartJump.LastObstacleHeight - 10)
-				local hitbox = getPlayerHitbox(pLocal)
-				local obstacleTrace =
-					engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+				local hitbox = GetPlayerHitbox(pLocal)
+				local obstacleTrace = engine.TraceHull(traceStart, traceEnd, hitbox[1], hitbox[2], MASK_PLAYERSOLID)
+
+				-- If trace hits something, obstacle is still there - safe to unduck
 				if obstacleTrace.fraction < 1 then
 					shouldUnduck = true
+					Log:Debug(
+						"SmartJump: Unducking - obstacle confirmed at height %.1f",
+						G.SmartJump.LastObstacleHeight
+					)
+				else
+					Log:Debug(
+						"SmartJump: Staying ducked - no obstacle detected at height %.1f",
+						G.SmartJump.LastObstacleHeight
+					)
 				end
 			end
 		end
 
 		if shouldUnduck then
 			SJ.jumpState = SJC.STATE_DESCENDING
-		elseif onGround then
-			SJ.jumpState = SJC.STATE_IDLE
+			Log:Debug("SmartJump: ASCENDING -> DESCENDING (improved duck grab check)")
 		end
 	elseif SJ.jumpState == SJC.STATE_DESCENDING then
 		cmd:SetButtons(cmd.buttons & ~IN_DUCK)
 
-		if not onGround and hasWishDir and shouldLateJump(cmd, pLocal) then
-			cmd:SetButtons(cmd.buttons & ~IN_DUCK)
-			cmd:SetButtons(cmd.buttons | IN_JUMP)
-			SJ.jumpState = SJC.STATE_PREPARE_JUMP
+		if hasMovementIntent then
+			local bhopJump = SmartJumpDetection(cmd, pLocal)
+			if bhopJump then
+				cmd:SetButtons(cmd.buttons & ~IN_DUCK)
+				cmd:SetButtons(cmd.buttons | IN_JUMP)
+				SJ.jumpState = SJC.STATE_PREPARE_JUMP
+				Log:Debug("SmartJump: DESCENDING -> PREPARE_JUMP (bhop with obstacle)")
+			end
+
+			if onGround then
+				SJ.jumpState = SJC.STATE_IDLE
+				Log:Debug("SmartJump: DESCENDING -> IDLE (landed)")
+			end
 		elseif onGround then
 			SJ.jumpState = SJC.STATE_IDLE
+			Log:Debug("SmartJump: DESCENDING -> IDLE (no movement intent)")
 		end
 	end
 
@@ -297,24 +441,43 @@ function SmartJump.Main(cmd)
 		SJ.stateStartTime = globals.TickCount()
 	elseif globals.TickCount() - SJ.stateStartTime > 132 then
 		SJ.jumpState = SJC.STATE_IDLE
+		SJ.stateStartTime = nil
 	end
 
-	if SJ.lastState ~= SJ.jumpState then
+	local currentState = SJ.jumpState
+	if SJ.lastState ~= currentState then
 		SJ.stateStartTime = globals.TickCount()
-		SJ.lastState = SJ.jumpState
+		SJ.lastState = currentState
 	end
 
 	G.SmartJump.ShouldJump = shouldJump
+	return shouldJump
 end
 
-local function onDrawSmartJump()
-	if not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
+-- ============================================================================
+-- VISUALIZATION AND CALLBACKS
+-- ============================================================================
+
+local function OnCreateMoveStandalone(cmd)
+	local pLocal = entities.GetLocalPlayer()
+	if not pLocal or (not pLocal:IsAlive()) then
 		return
 	end
+	SmartJump.Main(cmd)
+end
+
+local function OnDrawSmartJump()
+	local pLocal = entities.GetLocalPlayer()
+	if not pLocal or not G.Menu.SmartJump or not G.Menu.SmartJump.Enable then
+		return
+	end
+
+	-- Check if SmartJump visuals are enabled in menu
 	if not (G.Menu.Visuals and G.Menu.Visuals.showSmartJump) then
 		return
 	end
 
+	local vHitbox = GetPlayerHitbox(pLocal)
 	if G.SmartJump.PredPos then
 		local screenPos = client.WorldToScreen(G.SmartJump.PredPos)
 		if screenPos then
@@ -323,27 +486,86 @@ local function onDrawSmartJump()
 		end
 	end
 
+	if G.SmartJump.JumpPeekPos then
+		local screenpeekpos = client.WorldToScreen(G.SmartJump.JumpPeekPos)
+		if screenpeekpos then
+			draw.Color(0, 255, 0, 255)
+			draw.FilledRect(screenpeekpos[1] - 5, screenpeekpos[2] - 5, screenpeekpos[1] + 5, screenpeekpos[2] + 5)
+		end
+
+		local minPoint = vHitbox[1] + G.SmartJump.JumpPeekPos
+		local maxPoint = vHitbox[2] + G.SmartJump.JumpPeekPos
+		local vertices = {
+			Vector3(minPoint.x, minPoint.y, minPoint.z),
+			Vector3(minPoint.x, maxPoint.y, minPoint.z),
+			Vector3(maxPoint.x, maxPoint.y, minPoint.z),
+			Vector3(maxPoint.x, minPoint.y, minPoint.z),
+			Vector3(minPoint.x, minPoint.y, maxPoint.z),
+			Vector3(minPoint.x, maxPoint.y, maxPoint.z),
+			Vector3(maxPoint.x, maxPoint.y, maxPoint.z),
+			Vector3(maxPoint.x, minPoint.y, maxPoint.z),
+		}
+
+		for i, vertex in ipairs(vertices) do
+			vertices[i] = client.WorldToScreen(vertex)
+		end
+
+		if
+			vertices[1]
+			and vertices[2]
+			and vertices[3]
+			and vertices[4]
+			and vertices[5]
+			and vertices[6]
+			and vertices[7]
+			and vertices[8]
+		then
+			draw.Color(0, 255, 255, 255)
+			draw.Line(vertices[1][1], vertices[1][2], vertices[2][1], vertices[2][2])
+			draw.Line(vertices[2][1], vertices[2][2], vertices[3][1], vertices[3][2])
+			draw.Line(vertices[3][1], vertices[3][2], vertices[4][1], vertices[4][2])
+			draw.Line(vertices[4][1], vertices[4][2], vertices[1][1], vertices[1][2])
+			draw.Line(vertices[5][1], vertices[5][2], vertices[6][1], vertices[6][2])
+			draw.Line(vertices[6][1], vertices[6][2], vertices[7][1], vertices[7][2])
+			draw.Line(vertices[7][1], vertices[7][2], vertices[8][1], vertices[8][2])
+			draw.Line(vertices[8][1], vertices[8][2], vertices[5][1], vertices[5][2])
+			draw.Line(vertices[1][1], vertices[1][2], vertices[5][1], vertices[5][2])
+			draw.Line(vertices[2][1], vertices[2][2], vertices[6][1], vertices[6][2])
+			draw.Line(vertices[3][1], vertices[3][2], vertices[7][1], vertices[7][2])
+			draw.Line(vertices[4][1], vertices[4][2], vertices[8][1], vertices[8][2])
+		end
+	end
+
 	if G.SmartJump.SimulationPath and #G.SmartJump.SimulationPath > 1 then
 		for i = 1, #G.SmartJump.SimulationPath - 1 do
-			local a = client.WorldToScreen(G.SmartJump.SimulationPath[i])
-			local b = client.WorldToScreen(G.SmartJump.SimulationPath[i + 1])
-			if a and b then
-				draw.Color(0, 150, 255, 180)
-				draw.Line(a[1], a[2], b[1], b[2])
+			local currentPos = G.SmartJump.SimulationPath[i]
+			local nextPos = G.SmartJump.SimulationPath[i + 1]
+			local currentScreen = client.WorldToScreen(currentPos)
+			local nextScreen = client.WorldToScreen(nextPos)
+			if currentScreen and nextScreen then
+				local alpha = math.floor(100 + i / #G.SmartJump.SimulationPath * 155)
+				draw.Color(0, 150, 255, alpha)
+				draw.Line(currentScreen[1], currentScreen[2], nextScreen[1], nextScreen[2])
 			end
 		end
 	end
 
 	if G.SmartJump.JumpPeekPos then
-		local s = client.WorldToScreen(G.SmartJump.JumpPeekPos)
-		if s then
-			draw.Color(0, 255, 0, 255)
-			draw.FilledRect(s[1] - 4, s[2] - 4, s[1] + 4, s[2] + 4)
+		local landingScreen = client.WorldToScreen(G.SmartJump.JumpPeekPos)
+		if landingScreen then
+			draw.Color(0, 255, 255, 255)
+			draw.FilledRect(landingScreen[1] - 4, landingScreen[2] - 4, landingScreen[1] + 4, landingScreen[2] + 4)
 		end
 	end
 end
 
+-- ============================================================================
+-- MODULE INITIALIZATION
+-- ============================================================================
+
+callbacks.Unregister("CreateMove", "SmartJump.Standalone")
+callbacks.Register("CreateMove", "SmartJump.Standalone", OnCreateMoveStandalone)
 callbacks.Unregister("Draw", "SmartJump.Visual")
-callbacks.Register("Draw", "SmartJump.Visual", onDrawSmartJump)
+callbacks.Register("Draw", "SmartJump.Visual", OnDrawSmartJump)
 
 return SmartJump
