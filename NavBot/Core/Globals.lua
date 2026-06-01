@@ -31,10 +31,12 @@ G.World_Default = {
 G.World = G.World_Default
 
 G.Misc = {
-	NodeTouchDistance = 12,
+	NodeTouchDistance = 16,
+	NodeOvershootTouchDistance = 48,
 	NodeTouchHeight = 82,
-	NodePassProximity = 16, -- was this close → treat current node as passed
-	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
+	NodePassProximity = 16,
+	NodePassDirDotThreshold = 0.5, -- intent dot for PathSteering overshoot pass
+	NodePassAngleDegrees = 60, -- legacy bearing pass (unused when PathSteering active)
 	workLimit = 1,
 }
 

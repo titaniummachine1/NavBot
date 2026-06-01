@@ -439,6 +439,10 @@ local function OnDrawMenu()
 		-- Smart Jump (works independently of NavBot enable state)
 		G.Menu.SmartJump.Enable = TimMenu.Checkbox("Smart Jump", G.Menu.SmartJump.Enable)
 		TimMenu.Tooltip("Enable intelligent jumping over obstacles (works even when NavBot is disabled)")
+		TimMenu.NextLine()
+
+		G.Menu.SmartJump.Debug = TimMenu.Checkbox("SmartJump Debug Logs", G.Menu.SmartJump.Debug or false)
+		TimMenu.Tooltip("Throttled path-sim and state transition logs for SmartJump")
 		TimMenu.EndSector()
 	elseif G.Menu.Tab == "Navigation" then
 		-- Movement & Pathfinding Section
@@ -710,10 +714,12 @@ G.World_Default = {
 G.World = G.World_Default
 
 G.Misc = {
-	NodeTouchDistance = 12,
+	NodeTouchDistance = 16,
+	NodeOvershootTouchDistance = 48,
 	NodeTouchHeight = 82,
-	NodePassProximity = 16, -- was this close → treat current node as passed
-	NodePassAngleDegrees = 60, -- bearing-to-node swing while moving → overshoot
+	NodePassProximity = 16,
+	NodePassDirDotThreshold = 0.5, -- intent dot for PathSteering overshoot pass
+	NodePassAngleDegrees = 60, -- legacy bearing pass (unused when PathSteering active)
 	workLimit = 1,
 }
 
@@ -8059,14 +8065,109 @@ end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return pFlags & FL_ONGROUND == FL_ONGROUND
+	return (pFlags & FL_ONGROUND) ~= 0
 end
 
 local function isPlayerDucking(player)
-	return player:GetPropInt("m_fFlags") & FL_DUCKING == FL_DUCKING
+	return (player:GetPropInt("m_fFlags") & FL_DUCKING) ~= 0
 end
 
 local SmartJump = {}
+
+local MAX_PATH_SIM_SEGMENTS = 16
+local SJ_DEBUG_INTERVAL = 22
+local PATH_NODE_ARRIVAL_DIST = 16
+
+local function sjDebugThrottled(key, msg, ...)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		return
+	end
+	local tick = globals.TickCount()
+	G.SmartJump._debugLast = G.SmartJump._debugLast or {}
+	local last = G.SmartJump._debugLast[key] or 0
+	if tick - last < SJ_DEBUG_INTERVAL then
+		return
+	end
+	G.SmartJump._debugLast[key] = tick
+	Log:Info(msg, ...)
+end
+
+local function logJumpStateTransition(fromState, toState, reason)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		return
+	end
+	if fromState == toState then
+		return
+	end
+	Log:Info("SmartJump | %s -> %s | %s", tostring(fromState or "nil"), tostring(toState), tostring(reason or ""))
+end
+
+local function isManualOverride(cmd)
+	if not cmd then
+		return false
+	end
+	return cmd.forwardmove ~= 0 or cmd.sidemove ~= 0
+end
+
+local function isBotPathfollowing(cmd)
+	if not G.Menu.Main.EnableWalking then
+		return false
+	end
+	if not G.Navigation.path or #G.Navigation.path == 0 then
+		return false
+	end
+	if isManualOverride(cmd) then
+		return false
+	end
+	if
+		G.currentState ~= G.States.MOVING
+		and G.currentState ~= G.States.FOLLOWING
+		and G.currentState ~= G.States.STUCK
+	then
+		return false
+	end
+	return true
+end
+
+local function getPathSimTargets()
+	local targets = {}
+	local arrival = G.Misc and G.Misc.NodeTouchDistance or PATH_NODE_ARRIVAL_DIST
+
+	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
+		local startIdx = G.Navigation.currentWaypointIndex or 1
+		for i = startIdx, #G.Navigation.waypoints do
+			local wp = G.Navigation.waypoints[i]
+			if wp and wp.pos then
+				targets[#targets + 1] = wp.pos
+			end
+			if #targets >= MAX_PATH_SIM_SEGMENTS then
+				return targets, arrival
+			end
+		end
+	end
+
+	if G.Navigation.path then
+		for i = 1, #G.Navigation.path do
+			local node = G.Navigation.path[i]
+			if node and node.pos then
+				targets[#targets + 1] = node.pos
+			end
+			if #targets >= MAX_PATH_SIM_SEGMENTS then
+				break
+			end
+		end
+	end
+
+	return targets, arrival
+end
+
+local function horizontalDirTo(fromPos, toPos)
+	local delta = Vector3(toPos.x - fromPos.x, toPos.y - fromPos.y, 0)
+	if delta:Length2D() < 0.01 then
+		return nil
+	end
+	return Common.Normalize(delta)
+end
 
 -- ============================================================================
 -- OBSTACLE DETECTION AND JUMP CALCULATION
@@ -8226,6 +8327,133 @@ local function isNearPayload(position)
 	return false
 end
 
+local function runSimulationTicks(pLocal, pLocalPos, initialVelocity, jumpPeakTicks)
+	local currentPos = pLocalPos
+	local currentVelocity = initialVelocity
+
+	G.SmartJump.SimulationPath = {
+		currentPos,
+	}
+
+	for tick = 1, jumpPeakTicks do
+		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
+			SimulateMovementTick(currentPos, currentVelocity, pLocal)
+
+		if not newPos then
+			break
+		end
+
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+
+		if hitObstacle and canJump then
+			if tick <= minJumpTicks then
+				if isNearPayload(newPos) or isNearPayload(currentPos) then
+					sjDebugThrottled("payload_skip", "path sim: skip jump near payload")
+					return false
+				end
+
+				G.SmartJump.PredPos = newPos
+				G.SmartJump.HitObstacle = true
+				sjDebugThrottled("jump_ok", "path sim: jump at tick %d (need %d)", tick, minJumpTicks)
+				return true
+			end
+			sjDebugThrottled("jump_late", "path sim: wall at tick %d need %d", tick, minJumpTicks)
+			return false
+		end
+
+		currentPos = newPos
+		currentVelocity = newVelocity
+	end
+
+	sjDebugThrottled("no_jump", "path sim: no jump in %d ticks", jumpPeakTicks)
+	return false
+end
+
+local function SmartJumpDetectionPath(pLocal)
+	local pLocalPos = pLocal:GetAbsOrigin()
+	local targets, arrivalDist = getPathSimTargets()
+	if #targets == 0 then
+		sjDebugThrottled("no_path", "path sim: no path nodes")
+		return false
+	end
+
+	local currentVel = pLocal:EstimateAbsVelocity()
+	local horizontalSpeed = math.max(currentVel:Length2D(), 450)
+	local tickInterval = globals.TickInterval()
+	if tickInterval <= 0 then
+		tickInterval = 1 / 66.67
+	end
+	local jumpPeakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
+
+	local targetIndex = 1
+	local currentPos = pLocalPos
+	local moveDir = horizontalDirTo(currentPos, targets[targetIndex])
+	if not moveDir then
+		return false
+	end
+
+	local currentVelocity = moveDir * horizontalSpeed
+
+	for _ = 1, jumpPeakTicks do
+		local targetPos = targets[targetIndex]
+		local toTarget = horizontalDirTo(currentPos, targetPos)
+		if toTarget then
+			currentVelocity = toTarget * horizontalSpeed
+		end
+
+		local dist2d = (Vector3(targetPos.x - currentPos.x, targetPos.y - currentPos.y, 0)):Length2D()
+		if dist2d <= arrivalDist then
+			targetIndex = targetIndex + 1
+			if targetIndex > #targets then
+				sjDebugThrottled("path_end", "path sim: reached end of path (%d nodes)", #targets)
+				break
+			end
+			local nextDir = horizontalDirTo(currentPos, targets[targetIndex])
+			if nextDir then
+				currentVelocity = nextDir * horizontalSpeed
+			end
+		end
+
+		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
+			SimulateMovementTick(currentPos, currentVelocity, pLocal)
+
+		if not newPos then
+			break
+		end
+
+		if #G.SmartJump.SimulationPath == 0 then
+			G.SmartJump.SimulationPath = { pLocalPos }
+		end
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+
+		if hitObstacle and canJump then
+			local simTick = #G.SmartJump.SimulationPath - 1
+			if simTick <= minJumpTicks then
+				if isNearPayload(newPos) or isNearPayload(currentPos) then
+					return false
+				end
+				G.SmartJump.PredPos = newPos
+				G.SmartJump.HitObstacle = true
+				sjDebugThrottled(
+					"path_jump",
+					"path sim: jump node %d/%d tick %d lip=%.0f",
+					targetIndex,
+					#targets,
+					simTick,
+					(G.SmartJump.LastObstacleHeight or newPos.z) - newPos.z
+				)
+				return true
+			end
+			return false
+		end
+
+		currentPos = newPos
+		currentVelocity = newVelocity
+	end
+
+	return false
+end
+
 local function SmartJumpDetection(cmd, pLocal)
 	if not pLocal or (not isPlayerOnGround(pLocal)) then
 		return false
@@ -8236,6 +8464,10 @@ local function SmartJumpDetection(cmd, pLocal)
 	-- Early exit: don't jump if already near payload
 	if isNearPayload(pLocalPos) then
 		return false
+	end
+
+	if isBotPathfollowing(cmd) then
+		return SmartJumpDetectionPath(pLocal)
 	end
 
 	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
@@ -8287,49 +8519,7 @@ local function SmartJumpDetection(cmd, pLocal)
 	local timeToPeak = jumpVel / gravity -- 271/800 = 0.33875 seconds
 	local jumpPeakTicks = math.ceil(timeToPeak / tickInterval) -- ~23 ticks
 
-	local totalSimulationTicks = jumpPeakTicks
-
-	local currentPos = pLocalPos
-	local currentVelocity = initialVelocity
-
-	G.SmartJump.SimulationPath = {
-		currentPos,
-	}
-
-	for tick = 1, totalSimulationTicks do
-		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
-			SimulateMovementTick(currentPos, currentVelocity, pLocal)
-
-		if not newPos then
-			break
-		end
-
-		table.insert(G.SmartJump.SimulationPath, newPos)
-
-		if hitObstacle and canJump then
-			--print(tick, minJumpTicks)
-
-			if tick <= minJumpTicks then
-				-- Check if we're trying to jump onto or near payload
-				if isNearPayload(newPos) or isNearPayload(currentPos) then
-					Log:Debug("SmartJump: Skipping jump - near payload cart")
-					return false
-				end
-
-				G.SmartJump.PredPos = newPos
-				G.SmartJump.HitObstacle = true
-				Log:Debug("SmartJump: Jumping at tick %d (needed: %d)", tick, minJumpTicks)
-				return true
-			else
-				Log:Debug("SmartJump: Obstacle detected at tick %d (need tick %d) -> Waiting", tick, minJumpTicks)
-				return false
-			end
-		end
-
-		currentPos = newPos
-		currentVelocity = newVelocity
-	end
-	return false
+	return runSimulationTicks(pLocal, pLocalPos, initialVelocity, jumpPeakTicks)
 end
 -- ============================================================================
 -- MAIN SMART JUMP LOGIC
@@ -8470,6 +8660,7 @@ function SmartJump.Main(cmd)
 
 	local currentState = SJ.jumpState
 	if SJ.lastState ~= currentState then
+		logJumpStateTransition(SJ.lastState, currentState, "stateMachine")
 		SJ.stateStartTime = globals.TickCount()
 		SJ.lastState = currentState
 	end
@@ -8648,6 +8839,9 @@ Handles all movement decisions while ensuring walkTo is always called
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
+local PathSteering = require("NavBot.Navigation.PathSteering")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
@@ -8736,9 +8930,14 @@ function MovementDecisions.getCurrentTarget()
 		end
 	end
 
-	-- Fallback to path node
+	-- Path segment: portal / exit toward next node (not area center on large boxes)
 	if G.Navigation.path and #G.Navigation.path > 0 then
 		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		local origin = G.pLocal and G.pLocal.Origin
+		if currentNode and origin then
+			return PathSteering.getSteeringPoint(origin, currentNode, nextNode)
+		end
 		return currentNode and currentNode.pos
 	end
 
@@ -8747,12 +8946,23 @@ end
 
 -- Helper: Check if we've reached the target
 function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance
-	-- Wider threshold between path nodes (passed-node proximity)
+	local reachDist = G.Misc.NodeTouchDistance or 16
+	local touchHeight = G.Misc.NodeTouchHeight or 82
 	if G.Navigation.path and #G.Navigation.path > 1 then
-		reachDist = math.max(reachDist, G.Misc.NodePassProximity or 16)
+		local currentNode = G.Navigation.path[1]
+		local nextNode = G.Navigation.path[2]
+		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
 	end
-	return (horizontalDist < reachDist) and (verticalDist <= G.Misc.NodeTouchHeight)
+
+	-- Mid-air: origin high but still inside nav area vertical band
+	local currentNode = G.Navigation.path and G.Navigation.path[1]
+	if currentNode and not Node.IsDoorNode(currentNode) then
+		if horizontalDist < reachDist and AreaSpatial.IsWithinArea(origin, currentNode) then
+			return true
+		end
+	end
+
+	return (horizontalDist < reachDist) and (verticalDist <= touchHeight)
 end
 
 -- Reset distance tracking (call when path changes)
@@ -8763,12 +8973,17 @@ end
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
 	previousDistance = nil -- Reset tracking when advancing nodes
-	Log:Debug(tostring(G.Menu.Main.Skip_Nodes), #G.Navigation.path)
+	Log:Debug(tostring(G.Menu.Navigation.Skip_Nodes), #G.Navigation.path)
 
 	Log:Debug("Removing current node (reached target)")
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
+
+	local path = G.Navigation.path
+	if path and path[1] and G.pLocal and G.pLocal.Origin then
+		PathSteering.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+	end
 
 	if #G.Navigation.path == 0 then
 		Navigation.ClearPath()
@@ -8926,16 +9141,14 @@ end)
 __bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
 Node Skipper - Per-tick node skipping with menu-controlled limits
-Uses:
-- G.Menu.Main.MaxSkipRange: max distance to skip (default 500)
-- G.Menu.Main.MaxNodesToSkip: max nodes per tick (default 3)
-- G.Misc.NodePassProximity / NodePassAngleDegrees: passed-node detection
+Pass detection uses path progress + portal reach (PathSteering), not bearing-to-center.
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
 local Node = require("NavBot.Navigation.Node")
+local PathSteering = require("NavBot.Navigation.PathSteering")
 local WorkManager = require("NavBot.WorkManager")
 
 local Log = Common.Log.new("NodeSkipper")
@@ -8946,60 +9159,25 @@ local function isDoorNode(node)
 	return node and not node._minX
 end
 
-local function resetPassTracker(nodeId)
-	if not nodeId then
-		G.Navigation.nodePassTrack = nil
-		return
+local function lockIntentAfterSkip(playerPos)
+	local path = G.Navigation.path
+	if path and path[1] then
+		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
 	end
-	G.Navigation.nodePassTrack = {
-		nodeId = nodeId,
-		lastDirToNode = nil, -- previous tick: horizontal bearing from player to this node
-	}
 end
 
---- Bearing-to-node overshoot: each tick compare dir-to-node vs last tick.
---- If it swings >= 60° before normal reach distance, you walked past it.
-local function checkPassedCurrentNode(playerPos, node, nextNode)
-	if not (node and node.pos and nextNode and nextNode.pos) then
-		return false, nil
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not track or track.nodeId ~= node.id then
-		resetPassTracker(node.id)
-		track = G.Navigation.nodePassTrack
-	end
-
-	local proximity = G.Misc.NodePassProximity or 16
-	local passAngle = G.Misc.NodePassAngleDegrees or 60
-	local reachDist = G.Misc.NodeTouchDistance or 12
-
-	local dist2D = Common.Distance2D(playerPos, node.pos)
-	if dist2D <= proximity then
-		return true, "proximity"
-	end
-
-	local dirToNode = Vector3(node.pos.x - playerPos.x, node.pos.y - playerPos.y, 0)
-	local dirLen = dirToNode:Length2D()
-	if dirLen < 1 then
-		return true, "at_node"
-	end
-	dirToNode = dirToNode / dirLen
-
-	-- Overshoot: direction toward node changed sharply before we reached it
-	if track.lastDirToNode and dist2D > reachDist then
-		local bearingDelta = Common.Angle2DDegrees(track.lastDirToNode, dirToNode)
-		if bearingDelta >= passAngle then
-			track.lastDirToNode = dirToNode
-			return true, "overshoot"
-		end
-	end
-
-	track.lastDirToNode = dirToNode
-	return false, nil
+local function checkPassedCurrentNode(playerPos, currentNode, nextNode)
+	return PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
 end
 
-local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
+local function skipGoalPos(playerPos, nextNode, afterNext)
+	if afterNext and afterNext.pos then
+		return PathSteering.getSteeringPoint(playerPos, nextNode, afterNext)
+	end
+	return nextNode.pos
+end
+
+local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason, goalOverride)
 	if isDoorNode(currentNode) or isDoorNode(nextNode) then
 		Log:Debug("SKIP blocked (door): %s", reason)
 		return false
@@ -9010,8 +9188,9 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 		return false
 	end
 
+	local goalPos = goalOverride or skipGoalPos(playerPos, nextNode, nil)
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, nextNode.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
 		return false
@@ -9025,7 +9204,6 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
-	resetPassTracker(nextNode.id)
 
 	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
 	return true
@@ -9053,9 +9231,9 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Passed current node (proximity / overshoot) — always on, not menu-gated
 	local passed, passReason = checkPassedCurrentNode(playerPos, currentNode, nextNode)
 	if passed and trySkipCurrentNode(playerPos, currentNode, nextNode, passReason) then
+		lockIntentAfterSkip(playerPos)
 		G.Navigation.currentNodeIndex = 1
 		return true
 	end
@@ -9064,18 +9242,19 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	-- Closer to next node than current node is (legacy smart skip)
-	local distPlayerToNext = Common.Distance3D(playerPos, nextNode.pos)
-	local distCurrentToNext = Common.Distance3D(currentNode.pos, nextNode.pos)
+	local steerCurrent = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local steerNext = PathSteering.getSteeringPoint(playerPos, nextNode, path[3])
+	local distPlayerToNext = Common.Distance2D(playerPos, steerNext or nextNode.pos)
+	local distCurrentToNext = Common.Distance2D(steerCurrent or currentNode.pos, steerNext or nextNode.pos)
 
 	if distPlayerToNext < distCurrentToNext then
 		if trySkipCurrentNode(playerPos, currentNode, nextNode, "closer_to_next") then
+			lockIntentAfterSkip(playerPos)
 			G.Navigation.currentNodeIndex = 1
 			return true
 		end
 	end
 
-	-- Forward skip: walk directly to path[3]
 	if #path < 3 then
 		return false
 	end
@@ -9087,11 +9266,17 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	if isDoorNode(path[1]) or isDoorNode(path[2]) or isDoorNode(skipTarget) then
-		Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		G.__lastForwardSkipDoorLogTick = G.__lastForwardSkipDoorLogTick or 0
+		local now = globals.TickCount()
+		if now - G.__lastForwardSkipDoorLogTick > 66 then
+			G.__lastForwardSkipDoorLogTick = now
+			Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
+		end
 		return false
 	end
 
-	local distToTarget = Common.Distance3D(playerPos, skipTarget.pos)
+	local goalPos = skipGoalPos(playerPos, skipTarget, path[4])
+	local distToTarget = Common.Distance3D(playerPos, goalPos)
 	if distToTarget > maxSkipRange then
 		return false
 	end
@@ -9102,7 +9287,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, skipTarget.pos, currentArea, true, allowJump)
+	local success, canSkip = pcall(isNavigable.CanSkip, playerPos, goalPos, currentArea, true, allowJump)
 	if not (success and canSkip) then
 		return false
 	end
@@ -9112,7 +9297,6 @@ function NodeSkipper.Tick(playerPos)
 	local skipped1 = table.remove(path, 1)
 	if skipped1 then
 		table.insert(G.Navigation.pathHistory, 1, skipped1)
-		resetPassTracker(path[1] and path[1].id or nil)
 	end
 	local skipped2 = table.remove(path, 1)
 	if skipped2 then
@@ -9124,6 +9308,7 @@ function NodeSkipper.Tick(playerPos)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
+	lockIntentAfterSkip(playerPos)
 
 	Log:Info("FORWARD SKIP: bypassed 2 nodes (direct path to %s, range %.0f)", tostring(skipTarget.id), maxSkipRange)
 	G.Navigation.currentNodeIndex = 1
@@ -9319,6 +9504,298 @@ function WorkManager.clearWork(identifier)
 end
 
 return WorkManager
+
+end)
+__bundle_register("NavBot.Navigation.PathSteering", function(require, _LOADED, __bundle_register, __bundle_modules)
+--##########################################################################
+--  PathSteering.lua  ·  Portal targets + Amalgam-style pass detection
+--##########################################################################
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Node = require("NavBot.Navigation.Node")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+
+local PathSteering = {}
+
+local SMALL_AREA_EXTENT = 96
+local MIN_SEGMENT_LEN = 12
+
+local function getPassDirDotThreshold()
+	return G.Misc.NodePassDirDotThreshold or 0.5
+end
+
+local function getTouchDistance()
+	return G.Misc.NodeTouchDistance or 16
+end
+
+local function getOvershootTouchDistance()
+	return G.Misc.NodeOvershootTouchDistance or 48
+end
+
+local function horizontalDir(from, to)
+	local dx = to.x - from.x
+	local dy = to.y - from.y
+	local len = math.sqrt(dx * dx + dy * dy)
+	if len < 0.001 then
+		return nil, 0
+	end
+	return Vector3(dx / len, dy / len, 0), len
+end
+
+local function horizontalUnit(vec)
+	if not vec then
+		return nil
+	end
+	local flat = Vector3(vec.x, vec.y, 0)
+	local len = flat:Length2D()
+	if len < 0.001 then
+		return nil
+	end
+	return flat / len
+end
+
+local function findNodeExit(startPos, dir, node)
+	if not node._minX then
+		return nil
+	end
+
+	local minX, maxX = node._minX, node._maxX
+	local minY, maxY = node._minY, node._maxY
+	local tMin = math.huge
+	local exitX, exitY
+
+	if dir.x > 0 then
+		local t = (maxX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = maxX
+			exitY = startPos.y + dir.y * t
+		end
+	elseif dir.x < 0 then
+		local t = (minX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = minX
+			exitY = startPos.y + dir.y * t
+		end
+	end
+
+	if dir.y > 0 then
+		local t = (maxY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = maxY
+		end
+	elseif dir.y < 0 then
+		local t = (minY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = minY
+		end
+	end
+
+	if tMin == math.huge then
+		return nil
+	end
+
+	return Vector3(exitX, exitY, startPos.z)
+end
+
+local function getGroundZOnNode(pos, node)
+	if not node.nw or not node.ne or not node.sw then
+		return node._floorZ or node.pos.z
+	end
+
+	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
+	local dx = pos.x - nw.x
+	local dy = pos.y - nw.y
+	local dxNe = ne.x - nw.x
+	local dySe = se.y - nw.y
+	local inTri1 = (dxNe ~= 0 or dySe ~= 0) and (dx / dxNe + dy / dySe) <= 1.0
+
+	local v0, v1, v2 = nw, ne, se
+	if not inTri1 then
+		v0, v1, v2 = nw, se, sw
+	end
+
+	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
+	if math.abs(denom) < 0.0001 then
+		return v0.z
+	end
+
+	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
+	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
+	local w2 = 1.0 - w0 - w1
+	return w0 * v0.z + w1 * v1.z + w2 * v2.z
+end
+
+local function applyGroundZ(point, node)
+	if not point then
+		return nil
+	end
+	return Vector3(point.x, point.y, getGroundZOnNode(point, node))
+end
+
+local function isInsideNodeAABB(pos, node)
+	if Node.IsDoorNode(node) then
+		return false
+	end
+	return AreaSpatial.IsWithinArea(pos, node)
+end
+
+--- Save horizontal intent toward the new path[1] right after a node is cleared.
+function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
+	if not (targetNode and targetNode.pos) then
+		G.Navigation.nodePassTrack = nil
+		return
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, targetNode, nodeAfter)
+	local dir = horizontalDir(playerPos, steer or targetNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	G.Navigation.nodePassTrack = {
+		nodeId = targetNode.id,
+		dirToTarget = dir,
+	}
+end
+
+local function ensureSegmentIntent(playerPos, currentNode, nextNode)
+	local track = G.Navigation.nodePassTrack
+	if track and track.nodeId == currentNode.id and track.dirToTarget then
+		return track
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local dir = horizontalDir(playerPos, steer or currentNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	track = {
+		nodeId = currentNode.id,
+		dirToTarget = dir,
+	}
+	G.Navigation.nodePassTrack = track
+	return track
+end
+
+function PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	if not currentNode or not currentNode.pos then
+		return nil
+	end
+
+	if Node.IsDoorNode(currentNode) or not nextNode or not nextNode.pos then
+		return currentNode.pos
+	end
+
+	local dir = horizontalDir(playerPos, nextNode.pos)
+	if not dir then
+		dir = horizontalDir(currentNode.pos, nextNode.pos)
+	end
+	if not dir then
+		return currentNode.pos
+	end
+
+	local extent = math.max(currentNode._extentX or 0, currentNode._extentY or 0)
+	local exitPt = findNodeExit(playerPos, dir, currentNode)
+
+	if extent < SMALL_AREA_EXTENT or not exitPt then
+		return currentNode.pos
+	end
+
+	return applyGroundZ(exitPt, currentNode) or currentNode.pos
+end
+
+function PathSteering.getReachDistance2D(_currentNode, _nextNode)
+	return getTouchDistance()
+end
+
+--- Door node: only passed after crossing into the neighbor area (not while standing before the doorway).
+local function hasPassedDoorNode(playerPos, doorNode, nextNode)
+	if not Node.IsDoorNode(doorNode) then
+		return false, nil
+	end
+
+	local neighborArea = nextNode
+	if Node.IsDoorNode(nextNode) then
+		local nodes = G.Navigation.nodes
+		local targetId = doorNode.targetAreaId
+		if nodes and targetId then
+			neighborArea = nodes[targetId]
+		end
+	end
+
+	if not neighborArea or not neighborArea._minX then
+		return false, nil
+	end
+
+	if AreaSpatial.IsWithinArea(playerPos, neighborArea) then
+		return true, "door_entered_neighbor"
+	end
+
+	local dir, segLen = horizontalDir(doorNode.pos, neighborArea.pos)
+	if not dir or segLen < 4 then
+		return false, nil
+	end
+
+	local along = (playerPos.x - doorNode.pos.x) * dir.x + (playerPos.y - doorNode.pos.y) * dir.y
+	local boundarySlack = math.min(32, segLen * 0.4)
+	if along < boundarySlack then
+		return false, nil
+	end
+
+	if Common.Distance2D(playerPos, neighborArea.pos) > getOvershootTouchDistance() * 2.5 then
+		return false, nil
+	end
+
+	return true, "door_past_boundary"
+end
+
+function PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
+	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
+		return false, nil
+	end
+
+	if Node.IsDoorNode(currentNode) then
+		return hasPassedDoorNode(playerPos, currentNode, nextNode)
+	end
+
+	local steer = PathSteering.getSteeringPoint(playerPos, currentNode, nextNode)
+	local targetPos = steer or currentNode.pos
+	local dist2D = Common.Distance2D(playerPos, targetPos)
+	local touch = getTouchDistance()
+
+	local track = ensureSegmentIntent(playerPos, currentNode, nextNode)
+	local dirNow = horizontalDir(playerPos, targetPos)
+	if not dirNow then
+		dirNow = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	-- Normal reach: 16u at portal/center, inside current area AABB
+	if dist2D <= touch and isInsideNodeAABB(playerPos, currentNode) then
+		return true, "touch"
+	end
+
+	-- Amalgam-style overshoot: intent dir flipped (dot < 0.5), 48u, still inside this area's AABB
+	if track.dirToTarget and dirNow then
+		local dirDot = track.dirToTarget:Dot(dirNow)
+		if dirDot < getPassDirDotThreshold() and dist2D <= getOvershootTouchDistance() then
+			if isInsideNodeAABB(playerPos, currentNode) then
+				return true, "overshoot"
+			end
+		end
+	end
+
+	return false, nil
+end
+
+return PathSteering
 
 end)
 __bundle_register("NavBot.Bot.MovementController", function(require, _LOADED, __bundle_register, __bundle_modules)
