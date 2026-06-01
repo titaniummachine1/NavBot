@@ -35,14 +35,109 @@ end
 
 local function isPlayerOnGround(player)
 	local pFlags = player:GetPropInt("m_fFlags")
-	return pFlags & FL_ONGROUND == FL_ONGROUND
+	return (pFlags & FL_ONGROUND) ~= 0
 end
 
 local function isPlayerDucking(player)
-	return player:GetPropInt("m_fFlags") & FL_DUCKING == FL_DUCKING
+	return (player:GetPropInt("m_fFlags") & FL_DUCKING) ~= 0
 end
 
 local SmartJump = {}
+
+local MAX_PATH_SIM_SEGMENTS = 16
+local SJ_DEBUG_INTERVAL = 22
+local PATH_NODE_ARRIVAL_DIST = 16
+
+local function sjDebugThrottled(key, msg, ...)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		return
+	end
+	local tick = globals.TickCount()
+	G.SmartJump._debugLast = G.SmartJump._debugLast or {}
+	local last = G.SmartJump._debugLast[key] or 0
+	if tick - last < SJ_DEBUG_INTERVAL then
+		return
+	end
+	G.SmartJump._debugLast[key] = tick
+	Log:Info(msg, ...)
+end
+
+local function logJumpStateTransition(fromState, toState, reason)
+	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
+		return
+	end
+	if fromState == toState then
+		return
+	end
+	Log:Info("SmartJump | %s -> %s | %s", tostring(fromState or "nil"), tostring(toState), tostring(reason or ""))
+end
+
+local function isManualOverride(cmd)
+	if not cmd then
+		return false
+	end
+	return cmd.forwardmove ~= 0 or cmd.sidemove ~= 0
+end
+
+local function isBotPathfollowing(cmd)
+	if not G.Menu.Main.EnableWalking then
+		return false
+	end
+	if not G.Navigation.path or #G.Navigation.path == 0 then
+		return false
+	end
+	if isManualOverride(cmd) then
+		return false
+	end
+	if
+		G.currentState ~= G.States.MOVING
+		and G.currentState ~= G.States.FOLLOWING
+		and G.currentState ~= G.States.STUCK
+	then
+		return false
+	end
+	return true
+end
+
+local function getPathSimTargets()
+	local targets = {}
+	local arrival = G.Misc and G.Misc.NodeTouchDistance or PATH_NODE_ARRIVAL_DIST
+
+	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
+		local startIdx = G.Navigation.currentWaypointIndex or 1
+		for i = startIdx, #G.Navigation.waypoints do
+			local wp = G.Navigation.waypoints[i]
+			if wp and wp.pos then
+				targets[#targets + 1] = wp.pos
+			end
+			if #targets >= MAX_PATH_SIM_SEGMENTS then
+				return targets, arrival
+			end
+		end
+	end
+
+	if G.Navigation.path then
+		for i = 1, #G.Navigation.path do
+			local node = G.Navigation.path[i]
+			if node and node.pos then
+				targets[#targets + 1] = node.pos
+			end
+			if #targets >= MAX_PATH_SIM_SEGMENTS then
+				break
+			end
+		end
+	end
+
+	return targets, arrival
+end
+
+local function horizontalDirTo(fromPos, toPos)
+	local delta = Vector3(toPos.x - fromPos.x, toPos.y - fromPos.y, 0)
+	if delta:Length2D() < 0.01 then
+		return nil
+	end
+	return Common.Normalize(delta)
+end
 
 -- ============================================================================
 -- OBSTACLE DETECTION AND JUMP CALCULATION
@@ -202,6 +297,133 @@ local function isNearPayload(position)
 	return false
 end
 
+local function runSimulationTicks(pLocal, pLocalPos, initialVelocity, jumpPeakTicks)
+	local currentPos = pLocalPos
+	local currentVelocity = initialVelocity
+
+	G.SmartJump.SimulationPath = {
+		currentPos,
+	}
+
+	for tick = 1, jumpPeakTicks do
+		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
+			SimulateMovementTick(currentPos, currentVelocity, pLocal)
+
+		if not newPos then
+			break
+		end
+
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+
+		if hitObstacle and canJump then
+			if tick <= minJumpTicks then
+				if isNearPayload(newPos) or isNearPayload(currentPos) then
+					sjDebugThrottled("payload_skip", "path sim: skip jump near payload")
+					return false
+				end
+
+				G.SmartJump.PredPos = newPos
+				G.SmartJump.HitObstacle = true
+				sjDebugThrottled("jump_ok", "path sim: jump at tick %d (need %d)", tick, minJumpTicks)
+				return true
+			end
+			sjDebugThrottled("jump_late", "path sim: wall at tick %d need %d", tick, minJumpTicks)
+			return false
+		end
+
+		currentPos = newPos
+		currentVelocity = newVelocity
+	end
+
+	sjDebugThrottled("no_jump", "path sim: no jump in %d ticks", jumpPeakTicks)
+	return false
+end
+
+local function SmartJumpDetectionPath(pLocal)
+	local pLocalPos = pLocal:GetAbsOrigin()
+	local targets, arrivalDist = getPathSimTargets()
+	if #targets == 0 then
+		sjDebugThrottled("no_path", "path sim: no path nodes")
+		return false
+	end
+
+	local currentVel = pLocal:EstimateAbsVelocity()
+	local horizontalSpeed = math.max(currentVel:Length2D(), 450)
+	local tickInterval = globals.TickInterval()
+	if tickInterval <= 0 then
+		tickInterval = 1 / 66.67
+	end
+	local jumpPeakTicks = math.ceil((SJC.JUMP_FORCE / SJC.GRAVITY) / tickInterval)
+
+	local targetIndex = 1
+	local currentPos = pLocalPos
+	local moveDir = horizontalDirTo(currentPos, targets[targetIndex])
+	if not moveDir then
+		return false
+	end
+
+	local currentVelocity = moveDir * horizontalSpeed
+
+	for _ = 1, jumpPeakTicks do
+		local targetPos = targets[targetIndex]
+		local toTarget = horizontalDirTo(currentPos, targetPos)
+		if toTarget then
+			currentVelocity = toTarget * horizontalSpeed
+		end
+
+		local dist2d = (Vector3(targetPos.x - currentPos.x, targetPos.y - currentPos.y, 0)):Length2D()
+		if dist2d <= arrivalDist then
+			targetIndex = targetIndex + 1
+			if targetIndex > #targets then
+				sjDebugThrottled("path_end", "path sim: reached end of path (%d nodes)", #targets)
+				break
+			end
+			local nextDir = horizontalDirTo(currentPos, targets[targetIndex])
+			if nextDir then
+				currentVelocity = nextDir * horizontalSpeed
+			end
+		end
+
+		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
+			SimulateMovementTick(currentPos, currentVelocity, pLocal)
+
+		if not newPos then
+			break
+		end
+
+		if #G.SmartJump.SimulationPath == 0 then
+			G.SmartJump.SimulationPath = { pLocalPos }
+		end
+		G.SmartJump.SimulationPath[#G.SmartJump.SimulationPath + 1] = newPos
+
+		if hitObstacle and canJump then
+			local simTick = #G.SmartJump.SimulationPath - 1
+			if simTick <= minJumpTicks then
+				if isNearPayload(newPos) or isNearPayload(currentPos) then
+					return false
+				end
+				G.SmartJump.PredPos = newPos
+				G.SmartJump.HitObstacle = true
+				sjDebugThrottled(
+					"path_jump",
+					"path sim: jump node %d/%d tick %d lip=%.0f",
+					targetIndex,
+					#targets,
+					simTick,
+					(G.SmartJump.LastObstacleHeight or newPos.z) - newPos.z
+				)
+				return true
+			end
+			return false
+		end
+
+		currentPos = newPos
+		currentVelocity = newVelocity
+	end
+
+	return false
+end
+
 local function SmartJumpDetection(cmd, pLocal)
 	if not pLocal or (not isPlayerOnGround(pLocal)) then
 		return false
@@ -212,6 +434,10 @@ local function SmartJumpDetection(cmd, pLocal)
 	-- Early exit: don't jump if already near payload
 	if isNearPayload(pLocalPos) then
 		return false
+	end
+
+	if isBotPathfollowing(cmd) then
+		return SmartJumpDetectionPath(pLocal)
 	end
 
 	local moveIntent = Vector3(cmd.forwardmove, -cmd.sidemove, 0)
@@ -263,49 +489,7 @@ local function SmartJumpDetection(cmd, pLocal)
 	local timeToPeak = jumpVel / gravity -- 271/800 = 0.33875 seconds
 	local jumpPeakTicks = math.ceil(timeToPeak / tickInterval) -- ~23 ticks
 
-	local totalSimulationTicks = jumpPeakTicks
-
-	local currentPos = pLocalPos
-	local currentVelocity = initialVelocity
-
-	G.SmartJump.SimulationPath = {
-		currentPos,
-	}
-
-	for tick = 1, totalSimulationTicks do
-		local newPos, hitObstacle, newVelocity, canJump, minJumpTicks =
-			SimulateMovementTick(currentPos, currentVelocity, pLocal)
-
-		if not newPos then
-			break
-		end
-
-		table.insert(G.SmartJump.SimulationPath, newPos)
-
-		if hitObstacle and canJump then
-			--print(tick, minJumpTicks)
-
-			if tick <= minJumpTicks then
-				-- Check if we're trying to jump onto or near payload
-				if isNearPayload(newPos) or isNearPayload(currentPos) then
-					Log:Debug("SmartJump: Skipping jump - near payload cart")
-					return false
-				end
-
-				G.SmartJump.PredPos = newPos
-				G.SmartJump.HitObstacle = true
-				Log:Debug("SmartJump: Jumping at tick %d (needed: %d)", tick, minJumpTicks)
-				return true
-			else
-				Log:Debug("SmartJump: Obstacle detected at tick %d (need tick %d) -> Waiting", tick, minJumpTicks)
-				return false
-			end
-		end
-
-		currentPos = newPos
-		currentVelocity = newVelocity
-	end
-	return false
+	return runSimulationTicks(pLocal, pLocalPos, initialVelocity, jumpPeakTicks)
 end
 -- ============================================================================
 -- MAIN SMART JUMP LOGIC
@@ -446,6 +630,7 @@ function SmartJump.Main(cmd)
 
 	local currentState = SJ.jumpState
 	if SJ.lastState ~= currentState then
+		logJumpStateTransition(SJ.lastState, currentState, "stateMachine")
 		SJ.stateStartTime = globals.TickCount()
 		SJ.lastState = currentState
 	end
