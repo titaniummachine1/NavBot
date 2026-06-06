@@ -81,7 +81,9 @@ function watchDirectory(dir) {
 }
 
 console.log("[Watch] NavBot/**/*.lua → bundle + deploy");
-console.log("[Watch] Saves (incl. focus-change auto-save) update the .lua on disk.");
+console.log(
+  "[Watch] Saves (incl. focus-change auto-save) update the .lua on disk.",
+);
 console.log("[Watch] Press Ctrl+C to stop.");
 console.log("");
 

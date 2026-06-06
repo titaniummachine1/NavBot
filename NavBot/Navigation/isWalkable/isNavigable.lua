@@ -441,7 +441,96 @@ local function traceOneBigSegment(startPos, endPos, _startNormal, allowJump)
 	return false
 end
 
--- MAIN FUNCTION - Phase 1: portal check per crossing; hull trace inline (fail fast)
+local function getWaypointNodeId(waypoint)
+	if waypoint.node and waypoint.node.id then
+		return waypoint.node.id
+	end
+	return nil
+end
+
+-- Phase 2 only: hull traces after Phase 1 built the full area path
+local function traceWaypoints(waypoints, allowJump)
+	local traceCount = 0
+	local index = 1
+
+	while index <= #waypoints do
+		local nodeId = getWaypointNodeId(waypoints[index])
+		local nodeStartIndex = index
+		local nodeEndIndex = index
+
+		while nodeEndIndex < #waypoints do
+			local nextNodeId = getWaypointNodeId(waypoints[nodeEndIndex + 1])
+			if nextNodeId ~= nodeId then
+				break
+			end
+			nodeEndIndex = nodeEndIndex + 1
+		end
+
+		local fromWp = waypoints[nodeStartIndex]
+		local toWp = waypoints[nodeEndIndex]
+
+		if DEBUG_MODE then
+			print(
+				string.format(
+					"[IsNavigable] Phase2 node trace %s -> %s (node %s)",
+					tostring(nodeStartIndex),
+					tostring(nodeEndIndex),
+					tostring(nodeId)
+				)
+			)
+		end
+
+		if not traceOneBigSegment(fromWp.pos, toWp.pos, fromWp.normal, allowJump) then
+			if DEBUG_MODE then
+				print(string.format("[IsNavigable] FAIL: Phase2 node %s segment blocked", tostring(nodeId)))
+			end
+			saveDebugFail(fromWp.pos, toWp.pos)
+			return false
+		end
+		traceCount = traceCount + 1
+
+		if nodeEndIndex < #waypoints then
+			local nextWp = waypoints[nodeEndIndex + 1]
+			local nextNodeId = getWaypointNodeId(nextWp)
+			if nextNodeId ~= nodeId then
+				if DEBUG_MODE then
+					print(
+						string.format(
+							"[IsNavigable] Phase2 boundary trace %s -> %s",
+							tostring(nodeId),
+							tostring(nextNodeId)
+						)
+					)
+				end
+
+				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
+					if DEBUG_MODE then
+						print(
+							string.format(
+								"[IsNavigable] FAIL: Phase2 boundary %s -> %s blocked",
+								tostring(nodeId),
+								tostring(nextNodeId)
+							)
+						)
+					end
+					saveDebugFail(toWp.pos, nextWp.pos)
+					return false
+				end
+				traceCount = traceCount + 1
+			end
+		end
+
+		index = nodeEndIndex + 1
+	end
+
+	if DEBUG_MODE then
+		print(string.format("[IsNavigable] Phase2 SUCCESS: %d hull traces (%d waypoints)", traceCount, #waypoints))
+	end
+
+	return true
+end
+
+-- MAIN FUNCTION - Phase 1: portal march only; Phase 2: hull traces if Phase 1 succeeds
 -- allowJump: if true, will use jump height (72) when step height (18) fails
 function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump)
 	assert(startNode, "CanSkip: startNode required")
@@ -494,26 +583,24 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		end
 		visitedNodes[currentNode.id] = true
 
-		-- Check if goal reached
+		-- Check if goal reached (Phase 1 done — run Phase 2 traces)
 		if isPointInNodeBounds(goalPos, currentNode) then
 			local goalZ, goalNormal = getGroundZFromQuad(goalPos, currentNode)
 			local goalWpPos = goalZ and Vector3(goalPos.x, goalPos.y, goalZ) or goalPos
-			if not traceOneBigSegment(currentPos, goalWpPos, goalNormal, allowJump) then
-				if DEBUG_MODE then
-					print(string.format("[IsNavigable] FAIL: Final segment to goal blocked in node %d", currentNode.id))
-				end
-				saveDebugPath(waypoints)
-				saveDebugFail(currentPos, goalWpPos)
-				setDebugResult(false)
-				return false
-			end
-			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = nil })
-			saveDebugPath(waypoints)
+			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = goalNormal })
 			if DEBUG_MODE then
-				print(string.format("[IsNavigable] SUCCESS: reached goal in node %d", currentNode.id))
+				print(
+					string.format(
+						"[IsNavigable] Phase1 SUCCESS: goal in node %d (%d waypoints) — starting Phase2",
+						currentNode.id,
+						#waypoints
+					)
+				)
 			end
-			setDebugResult(true)
-			return true
+			saveDebugPath(waypoints)
+			local navigable = traceWaypoints(waypoints, allowJump)
+			setDebugResult(navigable)
+			return navigable
 		end
 
 		-- Snap XY onto the fixed goal line (pitch/Z comes from nav quad only)
@@ -590,17 +677,6 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		end
 
 		local entryPos = Vector3(entryX, entryY, entryZ)
-
-		-- Fail fast: one hull trace per crossing (stop marching if blocked)
-		if not traceOneBigSegment(currentPos, entryPos, groundNormal, allowJump) then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: Crossing %d -> %d blocked", currentNode.id, neighborNode.id))
-			end
-			saveDebugPath(waypoints)
-			saveDebugFail(currentPos, entryPos)
-			setDebugResult(false)
-			return false
-		end
 
 		-- Add intermediate waypoint if Z changes significantly (for slopes/hills)
 		local zDiff = math.abs(entryZ - currentPos.z)
