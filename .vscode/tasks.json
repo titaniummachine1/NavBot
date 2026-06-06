@@ -2,9 +2,31 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "NavBot Watch & Deploy",
+      "type": "shell",
+      "command": "node scripts/simple-watch.cjs",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "navbot",
+        "showReuseMessage": false,
+        "focus": false
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "Bundle and Deploy NavBot",
       "type": "shell",
       "command": "node scripts/bundle-and-deploy.cjs",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "group": {
         "kind": "build",
         "isDefault": true

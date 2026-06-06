@@ -26,12 +26,15 @@ local MIN_STEP_SIZE = MaxSpeed * globals.TickInterval()
 local MAX_SURFACE_ANGLE = 55
 local MAX_ITERATIONS = 37
 local TOLERANCE = 16.0
+local OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
+local DOOR_PORTAL_HALF_WIDTH = 24
 
 -- Debug
 local DEBUG_MODE = false
 local hullTraces = {}
 local debugWaypoints = nil
 local debugLastResult = nil
+local debugFailLine = nil
 
 local engineTraceHull = engine.TraceHull
 
@@ -42,7 +45,12 @@ end
 
 local function traceHullWrapper(startPos, endPos, minHull, maxHull, mask, filter)
 	local result = engineTraceHull(startPos, endPos, minHull, maxHull, mask, filter)
-	table.insert(hullTraces, { startPos = startPos, endPos = result.endpos })
+	local blocked = result.fraction < 0.999
+	table.insert(hullTraces, {
+		startPos = startPos,
+		endPos = result.endpos,
+		blocked = blocked,
+	})
 	return result
 end
 
@@ -78,6 +86,13 @@ local function setDebugResult(isNavigable)
 	end
 end
 
+local function saveDebugFail(fromPos, toPos)
+	if not DEBUG_MODE or not fromPos or not toPos then
+		return
+	end
+	debugFailLine = { from = fromPos, to = toPos }
+end
+
 local function setPathDrawColor(isNavigable)
 	if isNavigable then
 		draw.Color(0, 255, 0, 255)
@@ -102,34 +117,37 @@ local function getSurfaceAngle(surfaceNormal)
 	return math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
 end
 
--- Adjust the direction vector to align with the surface normal
-local function adjustDirectionToSurface(direction, surfaceNormal)
-	direction = Common.Normalize(direction)
+-- Keep XY bearing fixed; only add pitch (Z) from the surface normal
+local function applyPitchToSurface(horizDir, surfaceNormal)
+	local flat = Vector3(horizDir.x, horizDir.y, 0)
+	if flat:Length() < 0.001 then
+		return horizDir
+	end
+	flat = Common.Normalize(flat)
+
+	if not surfaceNormal then
+		return flat
+	end
+
 	local angle = math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
-
 	if angle > MAX_SURFACE_ANGLE then
-		return direction
+		return flat
 	end
 
-	-- Project horizontal direction onto sloped surface
-	-- 1. Get right vector perpendicular to horizontal direction
-	local right = direction:Cross(UP_VECTOR)
-	if right:Length() < 0.0001 then
-		-- Direction is straight up/down, return as-is
-		return direction
-	end
-	right = Common.Normalize(right)
-
-	-- 2. Get forward direction on surface (perpendicular to both right and surface normal)
-	local forward = right:Cross(surfaceNormal)
-	forward = Common.Normalize(forward)
-
-	-- 3. Ensure forward points in same general direction as input
-	if forward:Dot(direction) < 0 then
-		forward = forward * -1
+	local nx, ny, nz = surfaceNormal.x, surfaceNormal.y, surfaceNormal.z
+	if math.abs(nz) < 0.001 then
+		return flat
 	end
 
-	return forward
+	local dz = -(nx * flat.x + ny * flat.y) / nz
+	return Common.Normalize(Vector3(flat.x, flat.y, dz))
+end
+
+local function projectXYOntoGoalLine(x, y, lineOrigin, lineDir)
+	local px = x - lineOrigin.x
+	local py = y - lineOrigin.y
+	local along = px * lineDir.x + py * lineDir.y
+	return lineOrigin.x + lineDir.x * along, lineOrigin.y + lineDir.y * along
 end
 
 -- Find where ray exits node bounds
@@ -244,227 +262,151 @@ local function isPointInNodeBounds(point, node, tolerance)
 	return inX and inY
 end
 
--- Helper: Check if exit point is valid for neighbor connection
--- Tolerance only on opposite axis to shared edge
--- Z check: down up to 450, up to jump/step height based on allowJump
-local function isValidNeighborConnection(currentNode, candidateNode, exitPoint, exitDir, allowJump)
-	local EDGE_TOLERANCE = 16.0 -- Increased for edge alignment
-	local maxUp = allowJump and JUMP_HEIGHT or STEP_HEIGHT
-
-	-- Get ground Z at exit point for both nodes
-	local currentZ = getGroundZFromQuad(exitPoint, currentNode)
-	local candidateZ = getGroundZFromQuad(exitPoint, candidateNode)
-
-	if not currentZ or not candidateZ then
-		if DEBUG_MODE then
-			print(
-				string.format(
-					"[IsNavigable]   FAIL: No ground Z - currentZ=%s, candidateZ=%s",
-					tostring(currentZ),
-					tostring(candidateZ)
-				)
-			)
-		end
-		return false
-	end
-
-	-- Check Z height difference
-	local zDiff = candidateZ - currentZ
-	if zDiff > maxUp or zDiff < -MAX_FALL_DISTANCE then
-		if DEBUG_MODE then
-			print(
-				string.format(
-					"[IsNavigable]   FAIL: Z diff %.1f outside range [%.1f, %.1f]",
-					zDiff,
-					-MAX_FALL_DISTANCE,
-					maxUp
-				)
-			)
-		end
-		return false
-	end
-
-	-- Exit must land on the neighbor's facing edge (not anywhere inside its AABB)
-	local atSharedEdge = false
-	local inSpan = false
-
-	if exitDir == 2 then
-		-- Exiting east: neighbor's west edge (minX)
-		atSharedEdge = math.abs(exitPoint.x - candidateNode._minX) <= EDGE_TOLERANCE
-		inSpan = exitPoint.y >= (candidateNode._minY - TOLERANCE) and exitPoint.y <= (candidateNode._maxY + TOLERANCE)
-	elseif exitDir == 4 then
-		-- Exiting west: neighbor's east edge (maxX)
-		atSharedEdge = math.abs(exitPoint.x - candidateNode._maxX) <= EDGE_TOLERANCE
-		inSpan = exitPoint.y >= (candidateNode._minY - TOLERANCE) and exitPoint.y <= (candidateNode._maxY + TOLERANCE)
-	elseif exitDir == 3 then
-		-- Exiting south: neighbor's north edge (minY)
-		atSharedEdge = math.abs(exitPoint.y - candidateNode._minY) <= EDGE_TOLERANCE
-		inSpan = exitPoint.x >= (candidateNode._minX - TOLERANCE) and exitPoint.x <= (candidateNode._maxX + TOLERANCE)
-	elseif exitDir == 1 then
-		-- Exiting north: neighbor's south edge (maxY)
-		atSharedEdge = math.abs(exitPoint.y - candidateNode._maxY) <= EDGE_TOLERANCE
-		inSpan = exitPoint.x >= (candidateNode._minX - TOLERANCE) and exitPoint.x <= (candidateNode._maxX + TOLERANCE)
-	end
-
-	if DEBUG_MODE then
-		print(
-			string.format(
-				"[IsNavigable]   Edge check dir=%d: exit=(%.1f,%.1f), bounds=[%.1f,%.1f,%.1f,%.1f], atEdge=%s, inSpan=%s",
-				exitDir,
-				exitPoint.x,
-				exitPoint.y,
-				candidateNode._minX,
-				candidateNode._maxX,
-				candidateNode._minY,
-				candidateNode._maxY,
-				tostring(atSharedEdge),
-				tostring(inSpan)
-			)
-		)
-	end
-
-	return atSharedEdge and inSpan
+local function isAreaNode(node)
+	return node and node._minX and node._maxX and node._minY and node._maxY
 end
 
--- Helper: Find neighbor node through connections/doors from exit point
-local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes, respectDoors, allowJump)
+-- Min/max on the axis that varies along the facing wall (shared axis between areas)
+local function getFacingEdgeSpan(area, exitDir)
+	local nw, ne, sw, se = area.nw, area.ne, area.sw, area.se
+	if nw and ne and sw and se then
+		if exitDir == 2 then
+			return math.min(ne.y, se.y), math.max(ne.y, se.y)
+		elseif exitDir == 4 then
+			return math.min(nw.y, sw.y), math.max(nw.y, sw.y)
+		elseif exitDir == 3 then
+			return math.min(sw.x, se.x), math.max(sw.x, se.x)
+		elseif exitDir == 1 then
+			return math.min(nw.x, ne.x), math.max(nw.x, ne.x)
+		end
+	end
+
+	if exitDir == 2 or exitDir == 4 then
+		return area._minY, area._maxY
+	end
+	return area._minX, area._maxX
+end
+
+-- Overlap of both facing edges on the shared axis — the real walkable portal
+local function getSharedPortalSpan(currentNode, neighborNode, exitDir)
+	local aMin, aMax = getFacingEdgeSpan(currentNode, exitDir)
+	local oppDir = OPPOSITE_EXIT_DIR[exitDir]
+	local bMin, bMax = getFacingEdgeSpan(neighborNode, oppDir)
+	local portalMin = math.max(aMin, bMin)
+	local portalMax = math.min(aMax, bMax)
+	if portalMax <= portalMin then
+		return nil, nil
+	end
+	return portalMin, portalMax
+end
+
+local function getSharedAxisCoord(point, exitDir)
+	if exitDir == 2 or exitDir == 4 then
+		return point.y
+	end
+	return point.x
+end
+
+local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
+	local coord = getSharedAxisCoord(exitPoint, exitDir)
+	return coord >= portalMin and coord <= portalMax
+end
+
+-- Per-connection portal on shared axis (door pos ± hull half-width, clipped to edge overlap)
+local function getPortalSpanForConnection(currentNode, neighborNode, exitDir, connection, nodes)
+	local geoMin, geoMax = getSharedPortalSpan(currentNode, neighborNode, exitDir)
+	if not geoMin then
+		return nil, nil
+	end
+
+	local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
+	local connNode = nodes[targetId]
+	if isAreaNode(connNode) then
+		return geoMin, geoMax
+	end
+
+	if connNode and connNode.pos then
+		local coord = getSharedAxisCoord(connNode.pos, exitDir)
+		local portalMin = math.max(geoMin, coord - DOOR_PORTAL_HALF_WIDTH)
+		local portalMax = math.min(geoMax, coord + DOOR_PORTAL_HALF_WIDTH)
+		if portalMax <= portalMin then
+			return nil, nil
+		end
+		return portalMin, portalMax
+	end
+
+	return geoMin, geoMax
+end
+
+local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
+	local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
+	local target = nodes[targetId]
+	if not target then
+		return nil
+	end
+
+	if isAreaNode(target) then
+		if target.id ~= currentNodeId then
+			return target
+		end
+		return nil
+	end
+
+	-- Door id encodes the two areas: "4053_4224_left"
+	local pair = string.match(tostring(targetId), "^(%d+_%d+)_")
+	if pair then
+		local areaA, areaB = string.match(pair, "^(%d+)_(%d+)$")
+		if areaA and areaB then
+			areaA = tonumber(areaA)
+			areaB = tonumber(areaB)
+			if areaA == currentNodeId then
+				return nodes[areaB]
+			end
+			if areaB == currentNodeId then
+				return nodes[areaA]
+			end
+		end
+	end
+
+	return nil
+end
+
+-- Phase 1: exit coord must land in a real connection portal on the shared axis
+local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
 	local dirData = currentNode.c[exitDir]
 	if not dirData or not dirData.connections then
 		return nil
 	end
 
-	local connCount = #dirData.connections
-	-- TOLERANCE removed - using Z-based height checks in isValidNeighborConnection
+	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
 
-	-- Determine search direction based on exit position
-	local searchForward = true
-	if exitDir == 2 or exitDir == 4 then -- East/West (X axis)
-		local midX = (currentNode._minX + currentNode._maxX) * 0.5
-		searchForward = exitPoint.x < midX
-	else -- North/South (Y axis)
-		local midY = (currentNode._minY + currentNode._maxY) * 0.5
-		searchForward = exitPoint.y < midY
-	end
-
-	local start, finish, step = 1, connCount, 1
-	if not searchForward then
-		start, finish, step = connCount, 1, -1
-	end
-
-	for i = start, finish, step do
+	for i = 1, #dirData.connections do
 		local connection = dirData.connections[i]
-		local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
-		local candidate = nodes[targetId]
-
-		if not candidate then
-			goto continue
-		end
-
-		-- Area node with bounds
-		if candidate._minX and candidate._maxX and candidate._minY and candidate._maxY then
-			local checkNode = candidate
-
-			-- If respecting doors, find door between currentNode and candidate
-			if respectDoors then
-				for _, conn in ipairs(dirData.connections) do
-					local tid = (type(conn) == "table") and (conn.node or conn.id) or conn
-					local door = nodes[tid]
-					if door and not door._minX and door.c then
-						-- Check if door connects to candidate
-						for _, ddir in pairs(door.c) do
-							if ddir.connections then
-								for _, dconn in ipairs(ddir.connections) do
-									local did = (type(dconn) == "table") and (dconn.node or dconn.id) or dconn
-									if did == candidate.id then
-										checkNode = door
-										break
-									end
-								end
-							end
-							if checkNode == door then
-								break
-							end
-						end
-						if checkNode == door then
-							break
-						end
-					end
-				end
-			end
-
-			local inBounds = isValidNeighborConnection(currentNode, checkNode, exitPoint, exitDir, allowJump)
-			if DEBUG_MODE then
-				print(
-					string.format(
-						"[IsNavigable]   Check area=%d via %s, bounds=[%.1f,%.1f,%.1f,%.1f], exit=(%.1f,%.1f), inBounds=%s",
-						candidate.id,
-						(checkNode == candidate and "area" or "door"),
-						checkNode._minX,
-						checkNode._maxX,
-						checkNode._minY,
-						checkNode._maxY,
-						exitPoint.x,
-						exitPoint.y,
-						tostring(inBounds)
+		local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
+		if neighborArea then
+			local portalMin, portalMax =
+				getPortalSpanForConnection(currentNode, neighborArea, exitDir, connection, nodes)
+			if portalMin and isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
+				if DEBUG_MODE then
+					print(
+						string.format(
+							"[IsNavigable]   Portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
+							exitDir,
+							neighborArea.id,
+							exitCoord,
+							portalMin,
+							portalMax
+						)
 					)
-				)
-			end
-
-			if inBounds then
-				return candidate
-			end
-
-			-- Door node - traverse through to find area on other side
-		elseif candidate.c then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable]   Conn %d: Door %s, traversing...", i, tostring(targetId)))
-			end
-			for doorDir, doorDirData in pairs(candidate.c) do
-				if doorDirData.connections then
-					for _, doorConn in ipairs(doorDirData.connections) do
-						local areaId = (type(doorConn) == "table") and (doorConn.node or doorConn.id) or doorConn
-						local areaNode = nodes[areaId]
-
-						if DEBUG_MODE then
-							print(
-								string.format(
-									"[IsNavigable]     Door dir %s -> area %s (exists=%s, hasBounds=%s)",
-									tostring(doorDir),
-									tostring(areaId),
-									tostring(areaNode ~= nil),
-									tostring(areaNode and areaNode._minX ~= nil)
-								)
-							)
-						end
-
-						if areaId ~= currentNode.id and areaNode and areaNode._minX then
-							local inBounds =
-								isValidNeighborConnection(currentNode, areaNode, exitPoint, exitDir, allowJump)
-							if DEBUG_MODE then
-								print(
-									string.format(
-										"[IsNavigable]       Check area %s inBounds=%s, bounds=[%.1f,%.1f,%.1f,%.1f]",
-										tostring(areaId),
-										tostring(inBounds),
-										areaNode._minX,
-										areaNode._maxX,
-										areaNode._minY,
-										areaNode._maxY
-									)
-								)
-							end
-							if inBounds then
-								return areaNode
-							end
-						end
-					end
 				end
+				return neighborArea
 			end
 		end
-
-		::continue::
 	end
 
+	if DEBUG_MODE then
+		print(string.format("[IsNavigable] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
+	end
 	return nil
 end
 
@@ -472,33 +414,22 @@ local function runTraceHull(startPos, endPos)
 	return getTraceHull()(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
 end
 
-local function getWaypointNodeId(waypoint)
-	if waypoint.node and waypoint.node.id then
-		return waypoint.node.id
-	end
-	return nil
-end
-
 -- One hull trace across a segment (step height, optional jump retry)
-local function traceOneBigSegment(startPos, endPos, startNormal, allowJump)
+local function traceOneBigSegment(startPos, endPos, _startNormal, allowJump)
 	local toTarget = endPos - startPos
 	if toTarget:Length() < 0.001 then
 		return true
 	end
 
-	local horizDir = Vector3(toTarget.x, toTarget.y, 0)
-	if horizDir:Length() < 0.001 then
+	local horizDist = math.sqrt(toTarget.x * toTarget.x + toTarget.y * toTarget.y)
+	if horizDist < 0.001 then
 		return math.abs(toTarget.z) <= (allowJump and JUMP_HEIGHT or STEP_HEIGHT) + 8
 	end
-
-	horizDir = Common.Normalize(horizDir)
-	local traceDir = adjustDirectionToSurface(horizDir, startNormal or UP_VECTOR)
-	local traceEnd = startPos + traceDir * toTarget:Length()
 
 	local stepHeights = allowJump and { STEP_HEIGHT, JUMP_HEIGHT } or { STEP_HEIGHT }
 	for stepIndex = 1, #stepHeights do
 		local stepVec = Vector3(0, 0, stepHeights[stepIndex])
-		local trace = runTraceHull(startPos + stepVec, traceEnd + stepVec)
+		local trace = runTraceHull(startPos + stepVec, endPos + stepVec)
 		if trace.fraction >= 0.999 then
 			return true
 		end
@@ -510,93 +441,7 @@ local function traceOneBigSegment(startPos, endPos, startNormal, allowJump)
 	return false
 end
 
--- Phase 2: one trace per node, second trace only when crossing into the next node
-local function traceWaypoints(waypoints, allowJump)
-	local traceCount = 0
-	local index = 1
-
-	while index <= #waypoints do
-		local nodeId = getWaypointNodeId(waypoints[index])
-		local nodeStartIndex = index
-		local nodeEndIndex = index
-
-		while nodeEndIndex < #waypoints do
-			local nextNodeId = getWaypointNodeId(waypoints[nodeEndIndex + 1])
-			if nextNodeId ~= nodeId then
-				break
-			end
-			nodeEndIndex = nodeEndIndex + 1
-		end
-
-		local fromWp = waypoints[nodeStartIndex]
-		local toWp = waypoints[nodeEndIndex]
-
-		if DEBUG_MODE then
-			print(
-				string.format(
-					"[IsNavigable] Node trace %s -> %s (node %s)",
-					tostring(nodeStartIndex),
-					tostring(nodeEndIndex),
-					tostring(nodeId)
-				)
-			)
-		end
-
-		if not traceOneBigSegment(fromWp.pos, toWp.pos, fromWp.normal, allowJump) then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: Node %s segment blocked", tostring(nodeId)))
-			end
-			return false
-		end
-		traceCount = traceCount + 1
-
-		if nodeEndIndex < #waypoints then
-			local nextWp = waypoints[nodeEndIndex + 1]
-			local nextNodeId = getWaypointNodeId(nextWp)
-			if nextNodeId ~= nodeId then
-				if DEBUG_MODE then
-					print(
-						string.format(
-							"[IsNavigable] Boundary trace node %s -> %s",
-							tostring(nodeId),
-							tostring(nextNodeId)
-						)
-					)
-				end
-
-				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
-					if DEBUG_MODE then
-						print(
-							string.format(
-								"[IsNavigable] FAIL: Boundary %s -> %s blocked",
-								tostring(nodeId),
-								tostring(nextNodeId)
-							)
-						)
-					end
-					return false
-				end
-				traceCount = traceCount + 1
-			end
-		end
-
-		index = nodeEndIndex + 1
-	end
-
-	if DEBUG_MODE then
-		print(
-			string.format(
-				"[IsNavigable] SUCCESS: Path clear with %d traces (from %d waypoints)",
-				traceCount,
-				#waypoints
-			)
-		)
-	end
-
-	return true
-end
-
--- MAIN FUNCTION - Two phases: 1) verify path through nodes, 2) trace with surface pitch
+-- MAIN FUNCTION - Phase 1: portal check per crossing; hull trace inline (fail fast)
 -- allowJump: if true, will use jump height (72) when step height (18) fails
 function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump)
 	assert(startNode, "CanSkip: startNode required")
@@ -605,6 +450,7 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 
 	if DEBUG_MODE then
 		hullTraces = {}
+		debugFailLine = nil
 	end
 
 	-- ============ PHASE 1: Verify path through nodes ============
@@ -617,6 +463,15 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 	if startZ then
 		currentPos = Vector3(startPos.x, startPos.y, startZ)
 	end
+
+	-- Fixed XY bearing toward goal for the whole march (no horizontal bending)
+	local pathLineOrigin = Vector3(currentPos.x, currentPos.y, 0)
+	local pathLineDelta = Vector3(goalPos.x - pathLineOrigin.x, goalPos.y - pathLineOrigin.y, 0)
+	if pathLineDelta:Length() < 0.001 then
+		setDebugResult(false)
+		return false
+	end
+	local pathLineDir = Common.Normalize(pathLineDelta)
 
 	-- Add start waypoint
 	table.insert(waypoints, {
@@ -641,29 +496,36 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 
 		-- Check if goal reached
 		if isPointInNodeBounds(goalPos, currentNode) then
-			table.insert(waypoints, { pos = goalPos, node = currentNode, normal = nil })
+			local goalZ, goalNormal = getGroundZFromQuad(goalPos, currentNode)
+			local goalWpPos = goalZ and Vector3(goalPos.x, goalPos.y, goalZ) or goalPos
+			if not traceOneBigSegment(currentPos, goalWpPos, goalNormal, allowJump) then
+				if DEBUG_MODE then
+					print(string.format("[IsNavigable] FAIL: Final segment to goal blocked in node %d", currentNode.id))
+				end
+				saveDebugPath(waypoints)
+				saveDebugFail(currentPos, goalWpPos)
+				setDebugResult(false)
+				return false
+			end
+			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = nil })
 			saveDebugPath(waypoints)
-			local navigable = traceWaypoints(waypoints, allowJump)
-			setDebugResult(navigable)
-			return navigable
+			if DEBUG_MODE then
+				print(string.format("[IsNavigable] SUCCESS: reached goal in node %d", currentNode.id))
+			end
+			setDebugResult(true)
+			return true
 		end
 
-		-- Find where we exit current node toward goal
-		local toGoal = goalPos - currentPos
-		-- Horizontal direction to destination (only X/Y matters for heading)
-		local horizDir = Vector3(toGoal.x, toGoal.y, 0)
-		horizDir = Common.Normalize(horizDir)
-
-		-- Get ground normal at current position
-		local groundZ, groundNormal = getGroundZFromQuad(currentPos, currentNode)
-
-		-- Adjust direction to follow surface - only Z changes based on slope
-		local dir = horizDir
-		if groundNormal then
-			dir = adjustDirectionToSurface(horizDir, groundNormal)
+		-- Snap XY onto the fixed goal line (pitch/Z comes from nav quad only)
+		local snappedX, snappedY = projectXYOntoGoalLine(currentPos.x, currentPos.y, pathLineOrigin, pathLineDir)
+		local groundZ, groundNormal = getGroundZFromQuad(Vector3(snappedX, snappedY, currentPos.z), currentNode)
+		if groundZ then
+			currentPos = Vector3(snappedX, snappedY, groundZ)
+		else
+			currentPos = Vector3(snappedX, snappedY, currentPos.z)
 		end
 
-		local exitPoint, exitDist, exitDir = findNodeExit(currentPos, dir, currentNode)
+		local exitPoint, exitDist, exitDir = findNodeExit(currentPos, pathLineDir, currentNode)
 
 		if exitPoint then
 			local exitZ = getGroundZFromQuad(exitPoint, currentNode)
@@ -677,6 +539,7 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 				print(string.format("[IsNavigable] FAIL: No exit found from node %d", currentNode.id))
 			end
 			saveDebugPath(waypoints)
+			saveDebugFail(currentPos, currentPos + pathLineDir * 50)
 			setDebugResult(false)
 			return false
 		end
@@ -694,7 +557,7 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		end
 
 		-- Find neighbor
-		local neighborNode = findNeighborAtExit(currentNode, exitPoint, exitDir, nodes, respectDoors, allowJump)
+		local neighborNode = findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
 
 		if not neighborNode then
 			if DEBUG_MODE then
@@ -707,14 +570,13 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 				)
 			end
 			saveDebugPath(waypoints)
+			saveDebugFail(currentPos, exitPoint)
 			setDebugResult(false)
 			return false
 		end
 
-		-- Calculate entry point clamped to neighbor bounds
-		local entryX = math.max(neighborNode._minX + 0.5, math.min(neighborNode._maxX - 0.5, exitPoint.x))
-		local entryY = math.max(neighborNode._minY + 0.5, math.min(neighborNode._maxY - 0.5, exitPoint.y))
-
+		-- Entry stays on the shared edge / goal line (no independent X/Y clamping)
+		local entryX, entryY = projectXYOntoGoalLine(exitPoint.x, exitPoint.y, pathLineOrigin, pathLineDir)
 		local entryZ, entryNormal = getGroundZFromQuad(Vector3(entryX, entryY, 0), neighborNode)
 
 		if not entryZ then
@@ -722,11 +584,23 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 				print(string.format("[IsNavigable] FAIL: No ground geometry at entry to node %d", neighborNode.id))
 			end
 			saveDebugPath(waypoints)
+			saveDebugFail(currentPos, exitPoint)
 			setDebugResult(false)
 			return false
 		end
 
 		local entryPos = Vector3(entryX, entryY, entryZ)
+
+		-- Fail fast: one hull trace per crossing (stop marching if blocked)
+		if not traceOneBigSegment(currentPos, entryPos, groundNormal, allowJump) then
+			if DEBUG_MODE then
+				print(string.format("[IsNavigable] FAIL: Crossing %d -> %d blocked", currentNode.id, neighborNode.id))
+			end
+			saveDebugPath(waypoints)
+			saveDebugFail(currentPos, entryPos)
+			setDebugResult(false)
+			return false
+		end
 
 		-- Add intermediate waypoint if Z changes significantly (for slopes/hills)
 		local zDiff = math.abs(entryZ - currentPos.z)
@@ -773,13 +647,13 @@ function Navigable.SetDebugResult(isNavigable)
 	setDebugResult(isNavigable)
 end
 
--- Debug: green/red = Phase 1 area path (pass/fail), blue = Phase 2 hull traces
+-- Debug: green/red = area path, blue = clear hull traces, red = blocked hull / portal wall
 function Navigable.DrawDebugTraces()
 	if not DEBUG_MODE then
 		return
 	end
 
-	if debugWaypoints and #debugWaypoints >= 2 and debugLastResult ~= nil then
+	if debugWaypoints and #debugWaypoints >= 1 and debugLastResult ~= nil then
 		setPathDrawColor(debugLastResult)
 
 		for i = 1, #debugWaypoints - 1 do
@@ -799,9 +673,19 @@ function Navigable.DrawDebugTraces()
 		end
 	end
 
-	draw.Color(0, 80, 255, 255)
+	if debugFailLine and debugFailLine.from and debugFailLine.to then
+		draw.Color(255, 0, 0, 255)
+		Common.DrawArrowLine(debugFailLine.from, debugFailLine.to, 12, 22, false)
+		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32))
+	end
+
 	for _, trace in ipairs(hullTraces) do
 		if trace.startPos and trace.endPos then
+			if trace.blocked then
+				draw.Color(255, 0, 0, 255)
+			else
+				draw.Color(0, 80, 255, 255)
+			end
 			Common.DrawArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
 		end
 	end
@@ -813,6 +697,7 @@ function Navigable.SetDebug(enabled)
 		hullTraces = {}
 		debugWaypoints = nil
 		debugLastResult = nil
+		debugFailLine = nil
 	end
 end
 

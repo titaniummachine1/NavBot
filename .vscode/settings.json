@@ -1,10 +1,12 @@
 {
   "files.autoSave": "onFocusChange",
+  "task.allowAutomaticTasks": "on",
   "emeraldwalk.runonsave": {
+    "autoShowOutputPanel": "error",
     "commands": [
       {
-        "match": "NavBot[\\\\/].*\\.lua$",
-        "cmd": "cmd /c \"${workspaceFolder}\\scripts\\run-on-save.cmd\"",
+        "match": ".*[\\\\/]NavBot[\\\\/].*\\.lua$",
+        "cmd": "node \"${workspaceFolder}/scripts/bundle-and-deploy.cjs\"",
         "isAsync": false
       }
     ],

@@ -1,66 +1,55 @@
-// Watch NavBot/**/*.lua → bundle → deploy (no npm dependencies)
+// Watch NavBot/**/*.lua → bundle → deploy (fires on every disk write / auto-save)
 const fs = require("node:fs");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 
-const ROOT = process.cwd();
+const ROOT = path.join(__dirname, "..");
 const NAVBOT_DIR = path.join(ROOT, "NavBot");
+const BUNDLE_SCRIPT = path.join(ROOT, "scripts", "bundle-and-deploy.cjs");
+const DEBOUNCE_MS = 150;
+
 let debounceTimer = null;
 let isRunning = false;
+let runAgain = false;
 
-function runBundleScript() {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [path.join(ROOT, "bundle.js")],
-      { cwd: ROOT },
-      (error, stdout, stderr) => {
-        if (stdout) process.stdout.write(stdout);
-        if (stderr) process.stderr.write(stderr);
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      },
-    );
+function runBundleAndDeploy() {
+  console.log("");
+  console.log("========================================");
+  console.log("[Watch] NavBot bundle + deploy");
+  console.log("========================================");
+
+  const result = spawnSync(process.execPath, [BUNDLE_SCRIPT], {
+    cwd: ROOT,
+    stdio: "inherit",
+    windowsHide: true,
   });
+
+  if (result.status !== 0) {
+    console.log("========================================");
+    console.log("[Watch] FAILED");
+    console.log("========================================");
+    return false;
+  }
+
+  console.log("========================================");
+  console.log("[Watch] OK");
+  console.log("========================================");
+  return true;
 }
 
-function runDeploy() {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [path.join(ROOT, "scripts", "deploy.cjs")],
-      { cwd: ROOT },
-      (error, stdout, stderr) => {
-        if (stdout) process.stdout.write(stdout);
-        if (stderr) process.stderr.write(stderr);
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      },
-    );
-  });
-}
-
-async function bundleAndDeploy() {
+function flushBundleQueue() {
   if (isRunning) {
+    runAgain = true;
     return;
   }
+
   isRunning = true;
-  try {
-    console.log("Bundling NavBot...");
-    await runBundleScript();
-    console.log("Deploying to LMAOBox...");
-    await runDeploy();
-    console.log("Ready.");
-  } catch (error) {
-    console.error("bundle/deploy failed:", error.message);
-  } finally {
-    isRunning = false;
+  runBundleAndDeploy();
+  isRunning = false;
+
+  if (runAgain) {
+    runAgain = false;
+    flushBundleQueue();
   }
 }
 
@@ -68,19 +57,22 @@ function scheduleBundle(reason, filePath) {
   if (debounceTimer) {
     clearTimeout(debounceTimer);
   }
-  debounceTimer = setTimeout(() => {
-    console.log(`${reason}: ${filePath}`);
-    bundleAndDeploy().catch(console.error);
-  }, 400);
+
+  debounceTimer = setTimeout(function () {
+    debounceTimer = null;
+    const rel = path.relative(ROOT, filePath);
+    console.log(`[Watch] ${reason}: ${rel}`);
+    flushBundleQueue();
+  }, DEBOUNCE_MS);
 }
 
 function watchDirectory(dir) {
   if (!fs.existsSync(dir)) {
-    console.error(`Directory missing: ${dir}`);
-    return;
+    console.error(`[Watch] Directory missing: ${dir}`);
+    process.exit(1);
   }
 
-  fs.watch(dir, { recursive: true }, (eventType, filename) => {
+  fs.watch(dir, { recursive: true }, function (eventType, filename) {
     if (!filename || !filename.endsWith(".lua")) {
       return;
     }
@@ -88,8 +80,10 @@ function watchDirectory(dir) {
   });
 }
 
-console.log("Watching NavBot/**/*.lua (bundle + deploy on save)...");
-console.log("Press Ctrl+C to stop.");
+console.log("[Watch] NavBot/**/*.lua → bundle + deploy");
+console.log("[Watch] Saves (incl. focus-change auto-save) update the .lua on disk.");
+console.log("[Watch] Press Ctrl+C to stop.");
+console.log("");
 
 watchDirectory(NAVBOT_DIR);
-bundleAndDeploy().catch(console.error);
+flushBundleQueue();

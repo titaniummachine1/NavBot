@@ -24,6 +24,9 @@ local TestState = {
 	-- Visual data
 	hullTraces = {},
 	lineTraces = {},
+
+	-- Skip re-running CanSkip when nothing meaningful changed
+	lastTestKey = nil,
 }
 
 -- Load Navigable module
@@ -118,6 +121,7 @@ local function OnCreateMove(Cmd)
 
 	-- Check menu state first
 	if not G.Menu.Visuals.IsNavigableTest then
+		TestState.lastTestKey = nil
 		return
 	end
 
@@ -140,16 +144,30 @@ local function OnCreateMove(Cmd)
 	-- F sets / moves the target point (one press per tick edge)
 	if input.IsButtonPressed(KEY_F) then
 		TestState.startPos = TestState.currentPos
+		TestState.lastTestKey = nil
 		return
 	end
 
 	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		-- Get current node for start position
 		local startNode = Node.GetAreaAtPosition(TestState.currentPos)
 
 		if startNode then
-			local startTime, startMemory = BenchmarkStart()
 			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+			local testKey = string.format(
+				"%d|%s|%.0f|%.0f|%.0f|%.0f",
+				startNode.id,
+				allowJump and "j" or "w",
+				TestState.startPos.x,
+				TestState.startPos.y,
+				TestState.currentPos.x,
+				TestState.currentPos.y
+			)
+			if testKey == TestState.lastTestKey then
+				return
+			end
+			TestState.lastTestKey = testKey
+
+			local startTime, startMemory = BenchmarkStart()
 			TestState.isNavigable =
 				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, true, allowJump)
 			Navigable.SetDebugResult(TestState.isNavigable)
@@ -197,7 +215,7 @@ local function OnDraw()
 			270,
 			string.format("Area waypoints: %d | Hull traces: %d", #debugWps, Navigable.GetDebugHullTraceCount())
 		)
-		draw.Text(20, 300, "Green/red = area path | Blue = hull traces")
+		draw.Text(20, 300, "Green/red = area path | Blue = clear hull | Red = wall/blocked")
 	end
 
 	Navigable.DrawDebugTraces()
