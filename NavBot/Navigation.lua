@@ -1,9 +1,9 @@
 --[[
 PERFORMANCE OPTIMIZATION STRATEGY:
 - Heavy validation (accessibility checks) happens at setup time via pruneInvalidConnections()
-- Pathfinding uses Node.GetAdjacentNodesSimple() for speed (no expensive trace checks)
-- Invalid connections are removed during setup, so pathfinding can trust remaining connections
-- This moves computational load to beginning rather than during gameplay
+- A* uses Node.GetAdjacentAreasForPath() — area-to-area only (doors resolve to neighbor areas)
+- Precise walkability uses NavPredict.CanSkip (straight line + door portals + hull traces)
+- Invalid connections are pruned at setup; line checks run at movement time
 ]]
 
 local Navigation = {}
@@ -106,8 +106,7 @@ function Navigation.GetAdjacentNodes(nodeId)
 		return {}
 	end
 
-	-- Get adjacent nodes with the nodes table
-	local neighbors = Node.GetAdjacentNodesSimple(node, G.Navigation.nodes)
+	local neighbors = Node.GetAdjacentAreasForPath(node, G.Navigation.nodes)
 
 	-- Extract node IDs
 	local adjacentIds = {}
@@ -158,7 +157,7 @@ function Navigation.SetCurrentPath(path)
 	-- Use weak values to avoid strong retention of node objects (nodes table holds strong refs)
 	pcall(setmetatable, G.Navigation.path, { __mode = "v" })
 	G.Navigation.currentNodeIndex = 1 -- Start from the first node (start) and work towards goal
-	-- Build door-aware waypoint list for precise movement and visuals
+	-- Build area-center waypoints (door threading via NavPredict at runtime)
 	--ProfilerBegin and ProfilerEnd are not available here, so rely on caller's profiling
 	Navigation.BuildDoorWaypointsFromPath()
 	-- Reset traversal history on new path
@@ -185,7 +184,7 @@ function Navigation.RemoveCurrentNode()
 		end
 		-- currentNodeIndex stays at 1 since we always target the first node in the remaining path
 		G.Navigation.currentNodeIndex = 1
-		-- Rebuild door waypoints to reflect new leading edge
+		-- Rebuild waypoints to reflect new leading edge
 		Navigation.BuildDoorWaypointsFromPath()
 	end
 end
@@ -222,7 +221,7 @@ function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canWalk = pcall(isNavigable.CanSkip, currentPos, nextNode.pos, currentArea, false, allowJump)
+	local success, canWalk = pcall(isNavigable.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
 
 	if success and canWalk then
 		Log:Debug("Next node %d is walkable from current position", nextNode.id)
@@ -265,9 +264,8 @@ end
 -- WAYPOINT BUILDING
 -- ========================================================================
 
--- Build waypoints from mixed area/door path
+-- Area-center waypoints; door threading is handled by NavPredict at movement time
 function Navigation.BuildDoorWaypointsFromPath()
-	-- reuse existing table to avoid churn
 	if not G.Navigation.waypoints then
 		G.Navigation.waypoints = {}
 	else
@@ -281,58 +279,17 @@ function Navigation.BuildDoorWaypointsFromPath()
 		return
 	end
 
-	for i = 1, #path - 1 do
-		local currentNode = path[i]
-		local nextNode = path[i + 1]
-
-		if
-			currentNode
-			and nextNode
-			and (currentNode.pos or Node.IsDoorNode(currentNode))
-			and (nextNode.pos or Node.IsDoorNode(nextNode))
-		then
-			-- Handle different node type transitions
-			if Node.IsDoorNode(currentNode) and Node.IsDoorNode(nextNode) then
-				-- Door to Door: move directly to next door position
-				table.insert(G.Navigation.waypoints, {
-					kind = "door",
-					fromId = currentNode.id,
-					toId = nextNode.id,
-					pos = nextNode.pos,
-				})
-			elseif not Node.IsDoorNode(currentNode) and Node.IsDoorNode(nextNode) then
-				-- Area to Door: move to door position
-				table.insert(G.Navigation.waypoints, {
-					kind = "door",
-					fromId = currentNode.id,
-					toId = nextNode.id,
-					pos = nextNode.pos,
-				})
-			elseif Node.IsDoorNode(currentNode) and not Node.IsDoorNode(nextNode) then
-				-- Door to Area: first move to door position, then to area center
-				table.insert(G.Navigation.waypoints, {
-					kind = "door",
-					fromId = currentNode.id,
-					toId = nextNode.id,
-					pos = currentNode.pos, -- Move to current door position first
-				})
-				table.insert(G.Navigation.waypoints, {
-					pos = nextNode.pos,
-					kind = "center",
-					areaId = nextNode.id,
-				})
-			else
-				-- Area to Area: move to next area center
-				table.insert(G.Navigation.waypoints, {
-					pos = nextNode.pos,
-					kind = "center",
-					areaId = nextNode.id,
-				})
-			end
+	for i = 2, #path do
+		local areaNode = path[i]
+		if areaNode and areaNode.pos and not Node.IsDoorNode(areaNode) then
+			table.insert(G.Navigation.waypoints, {
+				pos = areaNode.pos,
+				kind = "center",
+				areaId = areaNode.id,
+			})
 		end
 	end
 
-	-- Append final precise goal position if available
 	local goalPos = G.Navigation.goalPos
 	if goalPos then
 		table.insert(G.Navigation.waypoints, { pos = goalPos, kind = "goal" })
@@ -546,7 +503,7 @@ function Navigation.FindPath(startNode, goalNode)
 	local verticalDistance = math.abs(goalNode.pos.z - startNode.pos.z)
 
 	-- Try A* pathfinding as primary algorithm (more reliable than D*)
-	local success, path = pcall(AStar.NormalPath, startNode, goalNode, G.Navigation.nodes, Node.GetAdjacentNodesSimple)
+	local success, path = pcall(AStar.NormalPath, startNode, goalNode, G.Navigation.nodes, Node.GetAdjacentAreasForPath)
 
 	if not success then
 		Log:Error("A* pathfinding crashed: %s", tostring(path))
@@ -580,7 +537,6 @@ function Navigation.FindPath(startNode, goalNode)
 		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
 		-- Reset node skipping agents for new path
 		G.Navigation.skipAgents = nil
-		-- Refresh waypoints to reflect current door usage
 		Navigation.BuildDoorWaypointsFromPath()
 		-- Apply PathOptimizer for menu-controlled optimization
 		-- REMOVED: All path optimization now handled by NodeSkipper.CheckContinuousSkip

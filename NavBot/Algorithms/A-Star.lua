@@ -1,6 +1,6 @@
 -- A* Pathfinding Algorithm Implementation
 -- Uses a priority queue (heap) for efficient node exploration
--- Prefers paths through door nodes when distances are similar
+-- Area-only graph; door precision handled by NavPredict at movement time
 
 local Heap = require("NavBot.Algorithms.Heap")
 local Common = require("NavBot.Core.Common")
@@ -127,20 +127,9 @@ local function smoothPath(rawPath)
 
 			-- If direct path is significantly shorter, we can skip waypoints
 			if directDist < waypointDist * 0.8 then
-				-- Check for obstacles (simplified)
-				local hasObstacle = false
-				for k = i, j - 1 do
-					if rawPath[k].isDoor then
-						hasObstacle = true
-						break
-					end
-				end
-
-				if not hasObstacle then
-					i = j - 1 -- Skip to this future waypoint
-					canSkip = false
-					break
-				end
+				i = j - 1
+				canSkip = false
+				break
 			end
 		end
 

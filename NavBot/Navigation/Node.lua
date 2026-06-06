@@ -183,7 +183,58 @@ function Node.RemoveConnection(nodeA, nodeB)
 	end
 end
 
--- Door-aware adjacency: handles areas, doors, and door-to-door connections
+local function resolveConnectionToArea(connection, fromNodeId, nodes)
+	local targetId = ConnectionUtils.GetNodeId(connection)
+	local target = nodes[targetId]
+	if not target then
+		return nil
+	end
+
+	if target.isDoor then
+		if target.areaId == fromNodeId then
+			return nodes[target.targetAreaId]
+		end
+		if target.targetAreaId == fromNodeId then
+			return nodes[target.areaId]
+		end
+		return nil
+	end
+
+	if not target.isDoor and target.id ~= fromNodeId then
+		return target
+	end
+
+	return nil
+end
+
+-- A* / greedy graph: area nodes only — door stubs resolve to neighbor areas
+function Node.GetAdjacentAreasForPath(node, nodes)
+	local neighbors = {}
+	local seenAreaIds = {}
+
+	if not node or node.isDoor or not node.c or not nodes then
+		return neighbors
+	end
+
+	for _, dir in pairs(node.c) do
+		if dir.connections then
+			for _, connection in ipairs(dir.connections) do
+				local areaNode = resolveConnectionToArea(connection, node.id, nodes)
+				if areaNode and areaNode.pos and not seenAreaIds[areaNode.id] then
+					seenAreaIds[areaNode.id] = true
+					neighbors[#neighbors + 1] = {
+						node = areaNode,
+						cost = (node.pos - areaNode.pos):Length(),
+					}
+				end
+			end
+		end
+	end
+
+	return neighbors
+end
+
+-- Raw graph adjacency (includes door nodes) — debug / visuals only
 function Node.GetAdjacentNodesSimple(node, nodes)
 	local neighbors = {}
 
@@ -191,7 +242,7 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 		return neighbors
 	end
 
-	for dirId, dir in pairs(node.c) do
+	for _, dir in pairs(node.c) do
 		if dir.connections then
 			for _, connection in ipairs(dir.connections) do
 				local targetId = ConnectionUtils.GetNodeId(connection)
@@ -199,10 +250,10 @@ function Node.GetAdjacentNodesSimple(node, nodes)
 
 				if targetNode then
 					local cost = (node.pos - targetNode.pos):Length()
-					table.insert(neighbors, {
+					neighbors[#neighbors + 1] = {
 						node = targetNode,
 						cost = cost,
-					})
+					}
 				end
 			end
 		end

@@ -14,10 +14,6 @@ local Log = Common.Log.new("NodeSkipper")
 
 local NodeSkipper = {}
 
-local function isDoorNode(node)
-	return node and not node._minX
-end
-
 local function lockIntentAfterSkip(playerPos)
 	local path = G.Navigation.path
 	if path and path[1] then
@@ -37,11 +33,6 @@ local function skipGoalPos(playerPos, nextNode, afterNext)
 end
 
 local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason, goalOverride)
-	if isDoorNode(currentNode) or isDoorNode(nextNode) then
-		Log:Debug("SKIP blocked (door): %s", reason)
-		return false
-	end
-
 	local currentArea = Node.GetAreaAtPosition(playerPos)
 	if not currentArea then
 		return false
@@ -121,16 +112,6 @@ function NodeSkipper.Tick(playerPos)
 	local maxSkipRange = G.Menu.Main.MaxSkipRange or 500
 	local skipTarget = path[3]
 	if not (skipTarget and skipTarget.pos) then
-		return false
-	end
-
-	if isDoorNode(path[1]) or isDoorNode(path[2]) or isDoorNode(skipTarget) then
-		G.__lastForwardSkipDoorLogTick = G.__lastForwardSkipDoorLogTick or 0
-		local now = globals.TickCount()
-		if now - G.__lastForwardSkipDoorLogTick > 66 then
-			G.__lastForwardSkipDoorLogTick = now
-			Log:Debug("FORWARD SKIP blocked: door node in candidate segment")
-		end
 		return false
 	end
 
