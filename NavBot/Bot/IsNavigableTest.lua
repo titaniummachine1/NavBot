@@ -61,51 +61,6 @@ local function BenchmarkStop(startTime, startMemory)
 	TestState.averageMemoryUsage = totalMemory / #TestState.benchmarkRecords
 end
 
--- Normalize vector
-local function Normalize(vec)
-	return vec / vec:Length()
-end
-
--- Arrow line drawing function
-local function ArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
-	if not (start_pos and end_pos) then
-		return
-	end
-
-	if invert then
-		start_pos, end_pos = end_pos, start_pos
-	end
-
-	local direction = end_pos - start_pos
-	local min_acceptable_length = arrowhead_length + (arrowhead_width / 2)
-	if direction:Length() < min_acceptable_length then
-		local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-		if not (w2s_start and w2s_end) then
-			return
-		end
-		draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		return
-	end
-
-	local normalized_direction = Normalize(direction)
-	local arrow_base = end_pos - normalized_direction * arrowhead_length
-	local perpendicular = Vector3(-normalized_direction.y, normalized_direction.x, 0) * (arrowhead_width / 2)
-
-	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-	local w2s_arrow_base = client.WorldToScreen(arrow_base)
-	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
-	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
-
-	if not (w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2) then
-		return
-	end
-
-	draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp2[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
-	draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
-end
-
 -- Draw 3D box at position
 local function Draw3DBox(size, pos)
 	local halfSize = size / 2
@@ -152,8 +107,15 @@ local function Draw3DBox(size, pos)
 	end
 end
 
+local function syncNavigableDebug()
+	local showDebug = G.Menu.Visuals.IsNavigableTest == true
+	Navigable.SetDebug(showDebug)
+end
+
 -- CreateMove callback
 local function OnCreateMove(Cmd)
+	syncNavigableDebug()
+
 	-- Check menu state first
 	if not G.Menu.Visuals.IsNavigableTest then
 		return
@@ -175,18 +137,12 @@ local function OnCreateMove(Cmd)
 
 	TestState.currentPos = pLocal:GetAbsOrigin()
 
-	-- Shift to reset position
-	if input.IsButtonDown(KEY_LSHIFT) then
+	-- F sets / moves the target point (one press per tick edge)
+	if input.IsButtonPressed(KEY_F) then
 		TestState.startPos = TestState.currentPos
 		return
 	end
 
-	-- Only run test when F key is held
-	if not input.IsButtonDown(KEY_F) then
-		return
-	end
-
-	-- Only run test if we have both positions and they're far enough apart
 	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
 		-- Get current node for start position
 		local startNode = Node.GetAreaAtPosition(TestState.currentPos)
@@ -196,15 +152,19 @@ local function OnCreateMove(Cmd)
 			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
 			TestState.isNavigable =
 				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, true, allowJump)
+			Navigable.SetDebugResult(TestState.isNavigable)
 			BenchmarkStop(startTime, startMemory)
 		else
 			TestState.isNavigable = false
+			Navigable.SetDebugResult(false)
 		end
 	end
 end
 
 -- Draw callback
 local function OnDraw()
+	syncNavigableDebug()
+
 	-- Check menu state first
 	if not G.Menu.Visuals.IsNavigableTest then
 		return
@@ -222,25 +182,24 @@ local function OnDraw()
 		Draw3DBox(10, TestState.startPos)
 	end
 
-	-- Draw navigability test and arrow
-	if TestState.startPos and TestState.currentPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		if TestState.isNavigable then
-			draw.Color(0, 255, 0, 255)
-		else
-			draw.Color(255, 0, 0, 255)
-		end
-		ArrowLine(TestState.currentPos, TestState.startPos, 10, 20, false)
-	end
-
 	-- Draw benchmark info
 	draw.Color(255, 255, 255, 255)
 	draw.Text(20, 120, string.format("IsNavigable Test: %s", G.Menu.Visuals.IsNavigableTest and "ON" or "OFF"))
 	draw.Text(20, 150, string.format("Memory usage: %.2f KB", TestState.averageMemoryUsage))
 	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
 	draw.Text(20, 210, string.format("Result: %s", TestState.isNavigable and "NAVIGABLE" or "NOT NAVIGABLE"))
-	draw.Text(20, 240, "Press SHIFT to set start | Hold F to test")
+	draw.Text(20, 240, "Press F to set target | Walk away to test")
 
-	-- Draw debug traces from Navigable module
+	local debugWps = Navigable.GetDebugWaypoints()
+	if debugWps then
+		draw.Text(
+			20,
+			270,
+			string.format("Area waypoints: %d | Hull traces: %d", #debugWps, Navigable.GetDebugHullTraceCount())
+		)
+		draw.Text(20, 300, "Green/red = area path | Blue = hull traces")
+	end
+
 	Navigable.DrawDebugTraces()
 end
 

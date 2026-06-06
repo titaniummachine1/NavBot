@@ -297,7 +297,7 @@ local function OnDrawMenu()
 		end
 
 		G.Menu.Visuals.IsNavigableTest = TimMenu.Checkbox("IsNavigable Test", G.Menu.Visuals.IsNavigableTest)
-		TimMenu.Tooltip("Test node-based navigation skipping (hold F to test)")
+		TimMenu.Tooltip("Press F to place target point, then walk away to test navigability")
 		TimMenu.NextLine()
 
 		TimMenu.EndSector()

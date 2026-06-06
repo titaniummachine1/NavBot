@@ -45,7 +45,7 @@ __bundle_register("__root", function(require, _LOADED, __bundle_register, __bund
 NavBot Main Entry Point - Minimal and modular design following black box principles
 Delegates all complex logic to focused modules with single responsibilities
 ]]
-
+client.Command("clear", true)
 --[[ Annotations ]]
 ---@alias NavConnection { count: integer, connections: integer[] }
 ---@alias NavNode { id: integer, x: number, y: number, z: number, c: { [1]: NavConnection, [2]: NavConnection, [3]: NavConnection, [4]: NavConnection } }
@@ -663,7 +663,7 @@ local function OnDrawMenu()
 		end
 
 		G.Menu.Visuals.IsNavigableTest = TimMenu.Checkbox("IsNavigable Test", G.Menu.Visuals.IsNavigableTest)
-		TimMenu.Tooltip("Test node-based navigation skipping (hold F to test)")
+		TimMenu.Tooltip("Press F to place target point, then walk away to test navigability")
 		TimMenu.NextLine()
 
 		TimMenu.EndSector()
@@ -1828,11 +1828,8 @@ function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_wi
 	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
 	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
 
-	-- Only draw if all screen positions are valid
+	-- Only draw if all screen positions are valid (uses draw.Color set by caller)
 	if w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2 then
-		-- Set color before drawing
-		draw.Color(255, 255, 255, 255) -- White for arrows
-
 		-- Draw the line from start to the base of the arrow (not all the way to the end)
 		draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
 
@@ -6141,51 +6138,6 @@ local function BenchmarkStop(startTime, startMemory)
 	TestState.averageMemoryUsage = totalMemory / #TestState.benchmarkRecords
 end
 
--- Normalize vector
-local function Normalize(vec)
-	return vec / vec:Length()
-end
-
--- Arrow line drawing function
-local function ArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
-	if not (start_pos and end_pos) then
-		return
-	end
-
-	if invert then
-		start_pos, end_pos = end_pos, start_pos
-	end
-
-	local direction = end_pos - start_pos
-	local min_acceptable_length = arrowhead_length + (arrowhead_width / 2)
-	if direction:Length() < min_acceptable_length then
-		local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-		if not (w2s_start and w2s_end) then
-			return
-		end
-		draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		return
-	end
-
-	local normalized_direction = Normalize(direction)
-	local arrow_base = end_pos - normalized_direction * arrowhead_length
-	local perpendicular = Vector3(-normalized_direction.y, normalized_direction.x, 0) * (arrowhead_width / 2)
-
-	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-	local w2s_arrow_base = client.WorldToScreen(arrow_base)
-	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
-	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
-
-	if not (w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2) then
-		return
-	end
-
-	draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp2[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
-	draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
-end
-
 -- Draw 3D box at position
 local function Draw3DBox(size, pos)
 	local halfSize = size / 2
@@ -6232,8 +6184,15 @@ local function Draw3DBox(size, pos)
 	end
 end
 
+local function syncNavigableDebug()
+	local showDebug = G.Menu.Visuals.IsNavigableTest == true
+	Navigable.SetDebug(showDebug)
+end
+
 -- CreateMove callback
 local function OnCreateMove(Cmd)
+	syncNavigableDebug()
+
 	-- Check menu state first
 	if not G.Menu.Visuals.IsNavigableTest then
 		return
@@ -6255,18 +6214,12 @@ local function OnCreateMove(Cmd)
 
 	TestState.currentPos = pLocal:GetAbsOrigin()
 
-	-- Shift to reset position
-	if input.IsButtonDown(KEY_LSHIFT) then
+	-- F sets / moves the target point (one press per tick edge)
+	if input.IsButtonPressed(KEY_F) then
 		TestState.startPos = TestState.currentPos
 		return
 	end
 
-	-- Only run test when F key is held
-	if not input.IsButtonDown(KEY_F) then
-		return
-	end
-
-	-- Only run test if we have both positions and they're far enough apart
 	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
 		-- Get current node for start position
 		local startNode = Node.GetAreaAtPosition(TestState.currentPos)
@@ -6276,15 +6229,19 @@ local function OnCreateMove(Cmd)
 			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
 			TestState.isNavigable =
 				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, true, allowJump)
+			Navigable.SetDebugResult(TestState.isNavigable)
 			BenchmarkStop(startTime, startMemory)
 		else
 			TestState.isNavigable = false
+			Navigable.SetDebugResult(false)
 		end
 	end
 end
 
 -- Draw callback
 local function OnDraw()
+	syncNavigableDebug()
+
 	-- Check menu state first
 	if not G.Menu.Visuals.IsNavigableTest then
 		return
@@ -6302,25 +6259,24 @@ local function OnDraw()
 		Draw3DBox(10, TestState.startPos)
 	end
 
-	-- Draw navigability test and arrow
-	if TestState.startPos and TestState.currentPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		if TestState.isNavigable then
-			draw.Color(0, 255, 0, 255)
-		else
-			draw.Color(255, 0, 0, 255)
-		end
-		ArrowLine(TestState.currentPos, TestState.startPos, 10, 20, false)
-	end
-
 	-- Draw benchmark info
 	draw.Color(255, 255, 255, 255)
 	draw.Text(20, 120, string.format("IsNavigable Test: %s", G.Menu.Visuals.IsNavigableTest and "ON" or "OFF"))
 	draw.Text(20, 150, string.format("Memory usage: %.2f KB", TestState.averageMemoryUsage))
 	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
 	draw.Text(20, 210, string.format("Result: %s", TestState.isNavigable and "NAVIGABLE" or "NOT NAVIGABLE"))
-	draw.Text(20, 240, "Press SHIFT to set start | Hold F to test")
+	draw.Text(20, 240, "Press F to set target | Walk away to test")
 
-	-- Draw debug traces from Navigable module
+	local debugWps = Navigable.GetDebugWaypoints()
+	if debugWps then
+		draw.Text(
+			20,
+			270,
+			string.format("Area waypoints: %d | Hull traces: %d", #debugWps, Navigable.GetDebugHullTraceCount())
+		)
+		draw.Text(20, 300, "Green/red = area path | Blue = hull traces")
+	end
+
 	Navigable.DrawDebugTraces()
 end
 
@@ -6369,9 +6325,6 @@ __bundle_register("NavBot.Navigation.isWalkable.isNavigable", function(require, 
     Like IsWalkable but uses navmesh awareness to minimize traces
 ]]
 
-local vectordivide = vector.Divide
-local vectorLength = vector.Length
-
 local Navigable = {}
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
@@ -6397,32 +6350,71 @@ local MAX_ITERATIONS = 37
 local TOLERANCE = 16.0
 
 -- Debug
-local DEBUG_MODE = true -- Set to true for debugging (enables traces)
+local DEBUG_MODE = false
 local hullTraces = {}
-local currentTickLogged = -1
+local debugWaypoints = nil
+local debugLastResult = nil
 
 local engineTraceHull = engine.TraceHull
 
+local function shouldHitEntity(entity)
+	local pLocal = G.pLocal and G.pLocal.entity
+	return entity ~= pLocal
+end
+
 local function traceHullWrapper(startPos, endPos, minHull, maxHull, mask, filter)
-	local currentTick = globals.TickCount()
-	if currentTick > currentTickLogged then
-		hullTraces = {}
-		currentTickLogged = currentTick
-	end
-	local result = engineTraceHull(startPos, endPos, minHull, maxHull, mask)
+	local result = engineTraceHull(startPos, endPos, minHull, maxHull, mask, filter)
 	table.insert(hullTraces, { startPos = startPos, endPos = result.endpos })
 	return result
 end
 
-local ZeroVector = Vector3(0, 0, 0)
-
--- Fast check if trace hit anything (no length calculation needed)
-local function didTraceHit(trace)
-	return trace.plane == ZeroVector
+local function getTraceHull()
+	if DEBUG_MODE then
+		return traceHullWrapper
+	end
+	return engineTraceHull
 end
 
+local function snapshotWaypoints(waypoints)
+	local snapshot = {}
+	for i = 1, #waypoints do
+		local wp = waypoints[i]
+		snapshot[i] = {
+			pos = wp.pos,
+			nodeId = wp.node and wp.node.id or nil,
+		}
+	end
+	return snapshot
+end
 
-local TraceHull = DEBUG_MODE and traceHullWrapper or engineTraceHull
+local function saveDebugPath(waypoints)
+	if not DEBUG_MODE then
+		return
+	end
+	debugWaypoints = snapshotWaypoints(waypoints)
+end
+
+local function setDebugResult(isNavigable)
+	if DEBUG_MODE then
+		debugLastResult = isNavigable == true
+	end
+end
+
+local function setPathDrawColor(isNavigable)
+	if isNavigable then
+		draw.Color(0, 255, 0, 255)
+	else
+		draw.Color(255, 0, 0, 255)
+	end
+end
+
+local function drawWorldLine(a, b)
+	local w2sA = client.WorldToScreen(a)
+	local w2sB = client.WorldToScreen(b)
+	if w2sA and w2sB then
+		draw.Line(w2sA[1], w2sA[2], w2sB[1], w2sB[2])
+	end
+end
 
 -- Helper: Get surface angle from normal-- curently unused
 local function getSurfaceAngle(surfaceNormal)
@@ -6431,7 +6423,6 @@ local function getSurfaceAngle(surfaceNormal)
 	end
 	return math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
 end
-
 
 -- Adjust the direction vector to align with the surface normal
 local function adjustDirectionToSurface(direction, surfaceNormal)
@@ -6588,8 +6579,13 @@ local function isValidNeighborConnection(currentNode, candidateNode, exitPoint, 
 
 	if not currentZ or not candidateZ then
 		if DEBUG_MODE then
-			print(string.format("[IsNavigable]   FAIL: No ground Z - currentZ=%s, candidateZ=%s", tostring(currentZ),
-				tostring(candidateZ)))
+			print(
+				string.format(
+					"[IsNavigable]   FAIL: No ground Z - currentZ=%s, candidateZ=%s",
+					tostring(currentZ),
+					tostring(candidateZ)
+				)
+			)
 		end
 		return false
 	end
@@ -6598,38 +6594,58 @@ local function isValidNeighborConnection(currentNode, candidateNode, exitPoint, 
 	local zDiff = candidateZ - currentZ
 	if zDiff > maxUp or zDiff < -MAX_FALL_DISTANCE then
 		if DEBUG_MODE then
-			print(string.format("[IsNavigable]   FAIL: Z diff %.1f outside range [%.1f, %.1f]", zDiff, -
-			MAX_FALL_DISTANCE, maxUp))
+			print(
+				string.format(
+					"[IsNavigable]   FAIL: Z diff %.1f outside range [%.1f, %.1f]",
+					zDiff,
+					-MAX_FALL_DISTANCE,
+					maxUp
+				)
+			)
 		end
 		return false
 	end
 
-	-- Check bounds based on exit direction (tolerance only on opposite axis)
-	if exitDir == 2 or exitDir == 4 then -- East/West - shared X edge
-		-- X must be at the edge (with tolerance), Y can have tolerance
-		local atXEdge = (exitPoint.x >= candidateNode._minX - EDGE_TOLERANCE and exitPoint.x <= candidateNode._maxX + EDGE_TOLERANCE)
-		local inY = exitPoint.y >= (candidateNode._minY - TOLERANCE) and exitPoint.y <= (candidateNode._maxY + TOLERANCE)
-		if DEBUG_MODE then
-			print(string.format(
-				"[IsNavigable]   E/W check: exit=(%.1f,%.1f), node bounds=[%.1f,%.1f,%.1f,%.1f], atXEdge=%s, inY=%s",
-				exitPoint.x, exitPoint.y, candidateNode._minX, candidateNode._maxX, candidateNode._minY,
-				candidateNode._maxY,
-				tostring(atXEdge), tostring(inY)))
-		end
-		return atXEdge and inY
-	else -- North/South - shared Y edge
-		-- Y must be at the edge (with tolerance), X can have tolerance
-		local atYEdge = (exitPoint.y >= candidateNode._minY - EDGE_TOLERANCE and exitPoint.y <= candidateNode._maxY + EDGE_TOLERANCE)
-		local inX = exitPoint.x >= (candidateNode._minX - TOLERANCE) and exitPoint.x <= (candidateNode._maxX + TOLERANCE)
-		if DEBUG_MODE then
-			print(string.format(
-				"[IsNavigable]   N/S check: exit=(%.1f,%.1f), node bounds=[%.1f,%.1f,%.1f,%.1f], atYEdge=%s, inX=%s",
-				exitPoint.x, exitPoint.y, candidateNode._minX, candidateNode._maxX, candidateNode._minY,
-				candidateNode._maxY,
-				tostring(atYEdge), tostring(inX)))
-		end
-		return atYEdge and inX
+	-- Exit must land on the neighbor's facing edge (not anywhere inside its AABB)
+	local atSharedEdge = false
+	local inSpan = false
+
+	if exitDir == 2 then
+		-- Exiting east: neighbor's west edge (minX)
+		atSharedEdge = math.abs(exitPoint.x - candidateNode._minX) <= EDGE_TOLERANCE
+		inSpan = exitPoint.y >= (candidateNode._minY - TOLERANCE) and exitPoint.y <= (candidateNode._maxY + TOLERANCE)
+	elseif exitDir == 4 then
+		-- Exiting west: neighbor's east edge (maxX)
+		atSharedEdge = math.abs(exitPoint.x - candidateNode._maxX) <= EDGE_TOLERANCE
+		inSpan = exitPoint.y >= (candidateNode._minY - TOLERANCE) and exitPoint.y <= (candidateNode._maxY + TOLERANCE)
+	elseif exitDir == 3 then
+		-- Exiting south: neighbor's north edge (minY)
+		atSharedEdge = math.abs(exitPoint.y - candidateNode._minY) <= EDGE_TOLERANCE
+		inSpan = exitPoint.x >= (candidateNode._minX - TOLERANCE) and exitPoint.x <= (candidateNode._maxX + TOLERANCE)
+	elseif exitDir == 1 then
+		-- Exiting north: neighbor's south edge (maxY)
+		atSharedEdge = math.abs(exitPoint.y - candidateNode._maxY) <= EDGE_TOLERANCE
+		inSpan = exitPoint.x >= (candidateNode._minX - TOLERANCE) and exitPoint.x <= (candidateNode._maxX + TOLERANCE)
 	end
+
+	if DEBUG_MODE then
+		print(
+			string.format(
+				"[IsNavigable]   Edge check dir=%d: exit=(%.1f,%.1f), bounds=[%.1f,%.1f,%.1f,%.1f], atEdge=%s, inSpan=%s",
+				exitDir,
+				exitPoint.x,
+				exitPoint.y,
+				candidateNode._minX,
+				candidateNode._maxX,
+				candidateNode._minY,
+				candidateNode._maxY,
+				tostring(atSharedEdge),
+				tostring(inSpan)
+			)
+		)
+	end
+
+	return atSharedEdge and inSpan
 end
 
 -- Helper: Find neighbor node through connections/doors from exit point
@@ -6744,8 +6760,8 @@ local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes, respec
 						end
 
 						if areaId ~= currentNode.id and areaNode and areaNode._minX then
-							local inBounds = isValidNeighborConnection(currentNode, areaNode, exitPoint, exitDir,
-								allowJump)
+							local inBounds =
+								isValidNeighborConnection(currentNode, areaNode, exitPoint, exitDir, allowJump)
 							if DEBUG_MODE then
 								print(
 									string.format(
@@ -6774,264 +6790,121 @@ local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes, respec
 	return nil
 end
 
--- Helper: Trace through waypoints (Phase 2)
--- allowJump: if true, will attempt jump (72 units) when hitting obstacles
-local function traceWaypoints(waypoints, allowJump)
-	local ANGLE_CHANGE_THRESHOLD = 15 -- degrees
-	local traceStart = waypoints[1]
-	local traceCount = 0
+local function runTraceHull(startPos, endPos)
+	return getTraceHull()(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
+end
 
-	for i = 2, #waypoints do
-		local currentWp = waypoints[i]
-		local prevWp = waypoints[i - 1]
+local function getWaypointNodeId(waypoint)
+	if waypoint.node and waypoint.node.id then
+		return waypoint.node.id
+	end
+	return nil
+end
 
-		-- Calculate angle change between consecutive normals
-		local angleChange = 0
-		if prevWp.normal and currentWp.normal then
-			local dotProduct = prevWp.normal:Dot(currentWp.normal)
-			dotProduct = math.max(-1, math.min(1, dotProduct))
-			angleChange = math.deg(math.acos(dotProduct))
+-- One hull trace across a segment (step height, optional jump retry)
+local function traceOneBigSegment(startPos, endPos, startNormal, allowJump)
+	local toTarget = endPos - startPos
+	if toTarget:Length() < 0.001 then
+		return true
+	end
+
+	local horizDir = Vector3(toTarget.x, toTarget.y, 0)
+	if horizDir:Length() < 0.001 then
+		return math.abs(toTarget.z) <= (allowJump and JUMP_HEIGHT or STEP_HEIGHT) + 8
+	end
+
+	horizDir = Common.Normalize(horizDir)
+	local traceDir = adjustDirectionToSurface(horizDir, startNormal or UP_VECTOR)
+	local traceEnd = startPos + traceDir * toTarget:Length()
+
+	local stepHeights = allowJump and { STEP_HEIGHT, JUMP_HEIGHT } or { STEP_HEIGHT }
+	for stepIndex = 1, #stepHeights do
+		local stepVec = Vector3(0, 0, stepHeights[stepIndex])
+		local trace = runTraceHull(startPos + stepVec, traceEnd + stepVec)
+		if trace.fraction >= 0.999 then
+			return true
 		end
-
-		-- Check if this is last waypoint or angle changed significantly
-		local isLastWaypoint = (i == #waypoints)
-		local zDiff = math.abs(currentWp.pos.z - prevWp.pos.z)
-		local shouldTrace = isLastWaypoint or angleChange > ANGLE_CHANGE_THRESHOLD or zDiff > 8
-
-		if shouldTrace then
-			-- Calculate horizontal direction from trace start to current
-			local toTarget = currentWp.pos - traceStart.pos
-			local horizDir = Vector3(toTarget.x, toTarget.y, 0)
-			horizDir = Common.Normalize(horizDir)
-
-			-- Adjust direction using trace start's surface normal
-			local traceDir = horizDir
-			if traceStart.normal then
-				traceDir = adjustDirectionToSurface(horizDir, traceStart.normal)
-				if DEBUG_MODE then
-					print(string.format(
-						"[IsNavigable] Trace using start normal (%.2f, %.2f, %.2f) -> dir (%.2f, %.2f, %.2f)",
-						traceStart.normal.x, traceStart.normal.y, traceStart.normal.z,
-						traceDir.x, traceDir.y, traceDir.z))
-				end
-			else
-				if DEBUG_MODE then
-					print(string.format("[IsNavigable] Trace using flat direction (no start normal)"))
-				end
-			end
-			-- Calculate trace endpoint
-			local traceDist = (currentWp.pos - traceStart.pos):Length()
-			local traceEnd = traceStart.pos + traceDir * traceDist
-
-			-- Check if going significantly downward - if so, don't add upward step offset to end
-			local zDiff = currentWp.pos.z - traceStart.pos.z
-			local isGoingDown = zDiff < -8
-
-			local stepHeightVec = Vector3(0, 0, STEP_HEIGHT)
-			local jumpHeightVec = Vector3(0, 0, JUMP_HEIGHT)
-			local traceSuccess = false
-
-			-- Store the base Z for this segment to prevent height accumulation
-			local baseZ = traceStart.pos.z
-			local currentTracePos = traceStart.pos
-			local currentTraceNormal = traceStart.normal
-
-			-- Try step height first, then jump height if needed
-			local stepHeights = { STEP_HEIGHT, JUMP_HEIGHT }
-			local currentStepIndex = 1
-			local maxRetries = 3
-			local retryCount = 0
-			local hitNode = nil
-			local lastTracePos = nil -- Track last position to detect no progress
-
-			while currentStepIndex <= #stepHeights and retryCount < maxRetries do
-				local stepH = stepHeights[currentStepIndex]
-				local stepVec = Vector3(0, 0, stepH)
-				local useJump = (stepH == JUMP_HEIGHT)
-
-				-- Skip jump attempt if not allowed
-				if useJump and not allowJump then
-					break
-				end
-
-				-- Calculate trace endpoint based on current position
-				local toTarget = traceEnd - currentTracePos
-				local remainingDist = toTarget:Length()
-				if remainingDist < 0.001 then
-					traceSuccess = true
-					break
-				end
-
-				local traceDir = Common.Normalize(toTarget)
-				local currentTraceEnd = currentTracePos + traceDir * remainingDist
-
-				-- Forward trace with current step height
-				-- When going down, keep the trace flush with ground; upward traces include the offset
-				local traceStartPos
-				local traceEndPos
-				if isGoingDown then
-					traceStartPos = currentTracePos
-					traceEndPos = currentTraceEnd
-				else
-					traceStartPos = currentTracePos + stepVec
-					traceEndPos = currentTraceEnd + stepVec
-				end
-				local trace = TraceHull(
-					traceStartPos,
-					traceEndPos,
-					PLAYER_HULL.Min,
-					PLAYER_HULL.Max,
-					MASK_SHOT_HULL
-				)
-
-				traceCount = traceCount + 1
-
-				if didTraceHit(trace) then
-					-- Clear path - reached destination
-					traceSuccess = true
-					break
-				end
-
-				-- Hit something - find what node/area the hit is in
-				local hitPos = trace.endpos
-				local nodes = G.Navigation and G.Navigation.nodes
-
-				if nodes then
-					hitNode = Node.GetAreaAtPosition(hitPos)
-				end
-
-				if not hitNode then
-					-- No valid node at hit position - try next step height
-					if DEBUG_MODE then
-						print(string.format("[IsNavigable] Hit at (%.1f, %.1f, %.1f) not on navmesh, trying next...",
-							hitPos.x, hitPos.y, hitPos.z))
-					end
-					currentStepIndex = currentStepIndex + 1
-					retryCount = retryCount + 1
-					goto continue_retry
-				end
-
-				-- Adjust to ground on the hit node's navmesh
-				local groundZ, groundNormal = getGroundZFromQuad(hitPos, hitNode)
-
-				if not groundZ then
-					-- No ground on this node - try next step height
-					if DEBUG_MODE then
-						print(string.format("[IsNavigable] No ground on node %d at hit, trying next...", hitNode.id))
-					end
-					currentStepIndex = currentStepIndex + 1
-					retryCount = retryCount + 1
-					goto continue_retry
-				end
-
-				local groundPos = Vector3(hitPos.x, hitPos.y, groundZ)
-
-				-- For step height, immediately escalate to jump if the surface is a wall
-				if not useJump and groundNormal then
-					local dotUp = groundNormal:Dot(UP_VECTOR)
-					local surfaceAngle = math.deg(math.acos(dotUp))
-					if surfaceAngle > MAX_SURFACE_ANGLE then
-						if DEBUG_MODE then
-							print(
-								string.format(
-									"[IsNavigable] Surface too steep (%.1f° > %.1f°), switching to jump height",
-									surfaceAngle,
-									MAX_SURFACE_ANGLE
-								)
-							)
-						end
-						currentTracePos = groundPos
-						currentTraceNormal = groundNormal
-						currentStepIndex = currentStepIndex + 1
-						retryCount = retryCount + 1
-						goto continue_retry
-					end
-				end
-
-				-- Clamp Z to prevent climbing too high
-				local maxAllowedZ = baseZ + stepH
-				if groundZ > maxAllowedZ then
-					if DEBUG_MODE then
-						print(string.format("[IsNavigable] Ground too high (%.1f > %.1f), clamping", groundZ, maxAllowedZ))
-					end
-					groundZ = maxAllowedZ
-					groundPos = Vector3(hitPos.x, hitPos.y, groundZ)
-				end
-
-				if DEBUG_MODE then
-					print(string.format("[IsNavigable] Hit on node %d, adjusted to (%.1f, %.1f, %.1f)", hitNode.id,
-						groundPos.x, groundPos.y, groundPos.z))
-				end
-
-				-- Check if we're making progress (XY must change)
-				local dx = groundPos.x - currentTracePos.x
-				local dy = groundPos.y - currentTracePos.y
-				local horizDist = math.sqrt(dx * dx + dy * dy)
-				if horizDist < 0.5 then
-					-- No progress - try next step height
-					if DEBUG_MODE then
-						print(string.format("[IsNavigable] No progress made (horiz=%.2f), trying next step height...",
-							horizDist))
-					end
-					currentTracePos = groundPos
-					currentTraceNormal = groundNormal
-					currentStepIndex = currentStepIndex + 1
-					retryCount = retryCount + 1
-					goto continue_retry
-				end
-
-				-- If using jump, check if we changed nodes
-				if useJump then
-					local nodeAtGround = Node.GetAreaAtPosition(groundPos)
-					if nodeAtGround and nodeAtGround.id == hitNode.id then
-						-- Same node - jump didn't get us past the obstacle
-						if DEBUG_MODE then
-							print(string.format("[IsNavigable] Jump failed: still on node %d, giving up", hitNode.id))
-						end
-						return false
-					else
-						-- Different node - jump succeeded
-						if DEBUG_MODE then
-							print(string.format("[IsNavigable] Jump success: moved to node %d from node %d",
-								nodeAtGround and nodeAtGround.id or -1, hitNode.id))
-						end
-					end
-				end
-
-				-- Update position and continue with same step height (retry)
-				currentTracePos = groundPos
-				currentTraceNormal = groundNormal
-				retryCount = retryCount + 1
-
-				::continue_retry::
-			end
-
-			if not traceSuccess then
-				if DEBUG_MODE then
-					print(
-						string.format(
-							"[IsNavigable] FAIL: Entity blocking segment (trace %d, angle=%.1f°)",
-							traceCount,
-							angleChange
-						)
-					)
-				end
-				return false
-			end
-
-			-- Start next trace segment from current waypoint
-			traceStart = currentWp
+		if DEBUG_MODE and stepIndex < #stepHeights then
+			print(string.format("[IsNavigable] Segment blocked at step %d, trying jump...", stepHeights[stepIndex]))
 		end
 	end
 
+	return false
+end
+
+-- Phase 2: one trace per node, second trace only when crossing into the next node
+local function traceWaypoints(waypoints, allowJump)
+	local traceCount = 0
+	local index = 1
+
+	while index <= #waypoints do
+		local nodeId = getWaypointNodeId(waypoints[index])
+		local nodeStartIndex = index
+		local nodeEndIndex = index
+
+		while nodeEndIndex < #waypoints do
+			local nextNodeId = getWaypointNodeId(waypoints[nodeEndIndex + 1])
+			if nextNodeId ~= nodeId then
+				break
+			end
+			nodeEndIndex = nodeEndIndex + 1
+		end
+
+		local fromWp = waypoints[nodeStartIndex]
+		local toWp = waypoints[nodeEndIndex]
+
+		if DEBUG_MODE then
+			print(string.format(
+				"[IsNavigable] Node trace %s -> %s (node %s)",
+				tostring(nodeStartIndex),
+				tostring(nodeEndIndex),
+				tostring(nodeId)
+			))
+		end
+
+		if not traceOneBigSegment(fromWp.pos, toWp.pos, fromWp.normal, allowJump) then
+			if DEBUG_MODE then
+				print(string.format("[IsNavigable] FAIL: Node %s segment blocked", tostring(nodeId)))
+			end
+			return false
+		end
+		traceCount = traceCount + 1
+
+		if nodeEndIndex < #waypoints then
+			local nextWp = waypoints[nodeEndIndex + 1]
+			local nextNodeId = getWaypointNodeId(nextWp)
+			if nextNodeId ~= nodeId then
+				if DEBUG_MODE then
+					print(string.format(
+						"[IsNavigable] Boundary trace node %s -> %s",
+						tostring(nodeId),
+						tostring(nextNodeId)
+					))
+				end
+
+				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
+					if DEBUG_MODE then
+						print(string.format(
+							"[IsNavigable] FAIL: Boundary %s -> %s blocked",
+							tostring(nodeId),
+							tostring(nextNodeId)
+						))
+					end
+					return false
+				end
+				traceCount = traceCount + 1
+			end
+		end
+
+		index = nodeEndIndex + 1
+	end
+
 	if DEBUG_MODE then
-		print(
-			string.format(
-				"[IsNavigable] SUCCESS: Path clear with %d traces (from %d waypoints)",
-				traceCount,
-				#waypoints
-			)
-		)
+		print(string.format(
+			"[IsNavigable] SUCCESS: Path clear with %d traces (from %d waypoints)",
+			traceCount,
+			#waypoints
+		))
 	end
 
 	return true
@@ -7043,6 +6916,10 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 	assert(startNode, "CanSkip: startNode required")
 	local nodes = G.Navigation and G.Navigation.nodes
 	assert(nodes, "CanSkip: G.Navigation.nodes is nil")
+
+	if DEBUG_MODE then
+		hullTraces = {}
+	end
 
 	-- ============ PHASE 1: Verify path through nodes ============
 	local currentPos = startPos
@@ -7062,12 +6939,27 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		normal = startNormal,
 	})
 
+	local visitedNodes = {}
+
 	-- Traverse to destination (no traces - just verify path exists)
 	for iteration = 1, MAX_ITERATIONS do
+		if visitedNodes[currentNode.id] then
+			if DEBUG_MODE then
+				print(string.format("[IsNavigable] FAIL: Cycle detected at node %d", currentNode.id))
+			end
+			saveDebugPath(waypoints)
+			setDebugResult(false)
+			return false
+		end
+		visitedNodes[currentNode.id] = true
+
 		-- Check if goal reached
 		if isPointInNodeBounds(goalPos, currentNode) then
 			table.insert(waypoints, { pos = goalPos, node = currentNode, normal = nil })
-			return traceWaypoints(waypoints, allowJump)
+			saveDebugPath(waypoints)
+			local navigable = traceWaypoints(waypoints, allowJump)
+			setDebugResult(navigable)
+			return navigable
 		end
 
 		-- Find where we exit current node toward goal
@@ -7087,10 +6979,19 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 
 		local exitPoint, exitDist, exitDir = findNodeExit(currentPos, dir, currentNode)
 
+		if exitPoint then
+			local exitZ = getGroundZFromQuad(exitPoint, currentNode)
+			if exitZ then
+				exitPoint = Vector3(exitPoint.x, exitPoint.y, exitZ)
+			end
+		end
+
 		if not exitPoint or not exitDir then
 			if DEBUG_MODE then
 				print(string.format("[IsNavigable] FAIL: No exit found from node %d", currentNode.id))
 			end
+			saveDebugPath(waypoints)
+			setDebugResult(false)
 			return false
 		end
 
@@ -7119,6 +7020,8 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 					)
 				)
 			end
+			saveDebugPath(waypoints)
+			setDebugResult(false)
 			return false
 		end
 
@@ -7132,6 +7035,8 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 			if DEBUG_MODE then
 				print(string.format("[IsNavigable] FAIL: No ground geometry at entry to node %d", neighborNode.id))
 			end
+			saveDebugPath(waypoints)
+			setDebugResult(false)
 			return false
 		end
 
@@ -7164,25 +7069,65 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 
 	if DEBUG_MODE then
 		print(string.format("[IsNavigable] FAIL: Max iterations (%d) exceeded", MAX_ITERATIONS))
+		saveDebugPath(waypoints)
+		setDebugResult(false)
 	end
 	return false
 end
 
--- Debug
+function Navigable.GetDebugWaypoints()
+	return debugWaypoints
+end
+
+function Navigable.GetDebugHullTraceCount()
+	return #hullTraces
+end
+
+function Navigable.SetDebugResult(isNavigable)
+	setDebugResult(isNavigable)
+end
+
+-- Debug: green/red = Phase 1 area path (pass/fail), blue = Phase 2 hull traces
 function Navigable.DrawDebugTraces()
 	if not DEBUG_MODE then
 		return
 	end
+
+	if debugWaypoints and #debugWaypoints >= 2 and debugLastResult ~= nil then
+		setPathDrawColor(debugLastResult)
+
+		for i = 1, #debugWaypoints - 1 do
+			local a = debugWaypoints[i].pos
+			local b = debugWaypoints[i + 1].pos
+			if a and b then
+				Common.DrawArrowLine(a, b, 8, 14, false)
+			end
+		end
+
+		for i = 1, #debugWaypoints do
+			local wp = debugWaypoints[i]
+			if wp.pos then
+				setPathDrawColor(debugLastResult)
+				drawWorldLine(wp.pos, wp.pos + Vector3(0, 0, 20))
+			end
+		end
+	end
+
+	draw.Color(0, 80, 255, 255)
 	for _, trace in ipairs(hullTraces) do
 		if trace.startPos and trace.endPos then
-			draw.Color(0, 50, 255, 255)
 			Common.DrawArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
 		end
 	end
 end
 
 function Navigable.SetDebug(enabled)
-	DEBUG_MODE = enabled
+	DEBUG_MODE = enabled == true
+	if not DEBUG_MODE then
+		hullTraces = {}
+		debugWaypoints = nil
+		debugLastResult = nil
+	end
 end
 
 return Navigable

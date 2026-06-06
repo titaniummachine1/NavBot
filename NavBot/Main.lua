@@ -2,7 +2,7 @@
 NavBot Main Entry Point - Minimal and modular design following black box principles
 Delegates all complex logic to focused modules with single responsibilities
 ]]
-
+client.Command("clear", true)
 --[[ Annotations ]]
 ---@alias NavConnection { count: integer, connections: integer[] }
 ---@alias NavNode { id: integer, x: number, y: number, z: number, c: { [1]: NavConnection, [2]: NavConnection, [3]: NavConnection, [4]: NavConnection } }

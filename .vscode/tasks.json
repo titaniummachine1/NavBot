@@ -1,14 +1,14 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Run BundleAndDeploy.bat",
-            "type": "shell",
-            "command": "${workspaceFolder}/BundleAndDeploy.bat",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            }
-        }
-    ]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Bundle and Deploy NavBot",
+      "type": "shell",
+      "command": "node scripts/bundle-and-deploy.cjs",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    }
+  ]
 }
