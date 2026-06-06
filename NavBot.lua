@@ -6225,6 +6225,10 @@ local function OnCreateMove(Cmd)
 		return
 	end
 
+	if engine.Con_IsVisible() or engine.IsGameUIVisible() then
+		return
+	end
+
 	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
 		local startNode = Node.GetAreaAtPosition(TestState.currentPos)
 
@@ -6367,8 +6371,6 @@ local MAX_SURFACE_ANGLE = 55
 local MAX_ITERATIONS = 37
 local TOLERANCE = 16.0
 local OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
-local DOOR_PORTAL_HALF_WIDTH = 24
-
 -- Debug
 local DEBUG_MODE = false
 local hullTraces = {}
@@ -6424,6 +6426,17 @@ local function setDebugResult(isNavigable)
 	if DEBUG_MODE then
 		debugLastResult = isNavigable == true
 	end
+end
+
+local function isDebugLogMuted()
+	return engine.Con_IsVisible() or engine.IsGameUIVisible()
+end
+
+local function debugLog(message)
+	if not DEBUG_MODE or isDebugLogMuted() then
+		return
+	end
+	print(message)
 end
 
 local function saveDebugFail(fromPos, toPos)
@@ -6652,32 +6665,6 @@ local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
 	return coord >= portalMin and coord <= portalMax
 end
 
--- Per-connection portal on shared axis (door pos ± hull half-width, clipped to edge overlap)
-local function getPortalSpanForConnection(currentNode, neighborNode, exitDir, connection, nodes)
-	local geoMin, geoMax = getSharedPortalSpan(currentNode, neighborNode, exitDir)
-	if not geoMin then
-		return nil, nil
-	end
-
-	local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
-	local connNode = nodes[targetId]
-	if isAreaNode(connNode) then
-		return geoMin, geoMax
-	end
-
-	if connNode and connNode.pos then
-		local coord = getSharedAxisCoord(connNode.pos, exitDir)
-		local portalMin = math.max(geoMin, coord - DOOR_PORTAL_HALF_WIDTH)
-		local portalMax = math.min(geoMax, coord + DOOR_PORTAL_HALF_WIDTH)
-		if portalMax <= portalMin then
-			return nil, nil
-		end
-		return portalMin, portalMax
-	end
-
-	return geoMin, geoMax
-end
-
 local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
 	local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
 	local target = nodes[targetId]
@@ -6711,7 +6698,7 @@ local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
 	return nil
 end
 
--- Phase 1: exit coord must land in a real connection portal on the shared axis
+-- Phase 1: exit coord inside shared-axis edge overlap for a connected neighbor
 local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
 	local dirData = currentNode.c[exitDir]
 	if not dirData or not dirData.connections then
@@ -6719,34 +6706,42 @@ local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
 	end
 
 	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
+	local checkedNeighborIds = {}
 
 	for i = 1, #dirData.connections do
 		local connection = dirData.connections[i]
 		local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
-		if neighborArea then
-			local portalMin, portalMax =
-				getPortalSpanForConnection(currentNode, neighborArea, exitDir, connection, nodes)
+		if neighborArea and not checkedNeighborIds[neighborArea.id] then
+			checkedNeighborIds[neighborArea.id] = true
+			local portalMin, portalMax = getSharedPortalSpan(currentNode, neighborArea, exitDir)
 			if portalMin and isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
-				if DEBUG_MODE then
-					print(
-						string.format(
-							"[IsNavigable]   Portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
-							exitDir,
-							neighborArea.id,
-							exitCoord,
-							portalMin,
-							portalMax
-						)
+				debugLog(
+					string.format(
+						"[IsNavigable]   Portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
+						exitDir,
+						neighborArea.id,
+						exitCoord,
+						portalMin,
+						portalMax
 					)
-				end
+				)
 				return neighborArea
+			end
+			if portalMin then
+				debugLog(
+					string.format(
+						"[IsNavigable]   Skip area=%d: coord=%.1f outside [%.1f,%.1f]",
+						neighborArea.id,
+						exitCoord,
+						portalMin,
+						portalMax
+					)
+				)
 			end
 		end
 	end
 
-	if DEBUG_MODE then
-		print(string.format("[IsNavigable] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
-	end
+	debugLog(string.format("[IsNavigable] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
 	return nil
 end
 
@@ -6773,8 +6768,8 @@ local function traceOneBigSegment(startPos, endPos, _startNormal, allowJump)
 		if trace.fraction >= 0.999 then
 			return true
 		end
-		if DEBUG_MODE and stepIndex < #stepHeights then
-			print(string.format("[IsNavigable] Segment blocked at step %d, trying jump...", stepHeights[stepIndex]))
+		if stepIndex < #stepHeights then
+			debugLog(string.format("[IsNavigable] Segment blocked at step %d, trying jump...", stepHeights[stepIndex]))
 		end
 	end
 
@@ -6809,21 +6804,17 @@ local function traceWaypoints(waypoints, allowJump)
 		local fromWp = waypoints[nodeStartIndex]
 		local toWp = waypoints[nodeEndIndex]
 
-		if DEBUG_MODE then
-			print(
-				string.format(
-					"[IsNavigable] Phase2 node trace %s -> %s (node %s)",
-					tostring(nodeStartIndex),
-					tostring(nodeEndIndex),
-					tostring(nodeId)
-				)
+		debugLog(
+			string.format(
+				"[IsNavigable] Phase2 node trace %s -> %s (node %s)",
+				tostring(nodeStartIndex),
+				tostring(nodeEndIndex),
+				tostring(nodeId)
 			)
-		end
+		)
 
 		if not traceOneBigSegment(fromWp.pos, toWp.pos, fromWp.normal, allowJump) then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: Phase2 node %s segment blocked", tostring(nodeId)))
-			end
+			debugLog(string.format("[IsNavigable] FAIL: Phase2 node %s segment blocked", tostring(nodeId)))
 			saveDebugFail(fromWp.pos, toWp.pos)
 			return false
 		end
@@ -6833,26 +6824,22 @@ local function traceWaypoints(waypoints, allowJump)
 			local nextWp = waypoints[nodeEndIndex + 1]
 			local nextNodeId = getWaypointNodeId(nextWp)
 			if nextNodeId ~= nodeId then
-				if DEBUG_MODE then
-					print(
+				debugLog(
+					string.format(
+						"[IsNavigable] Phase2 boundary trace %s -> %s",
+						tostring(nodeId),
+						tostring(nextNodeId)
+					)
+				)
+
+				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
+					debugLog(
 						string.format(
-							"[IsNavigable] Phase2 boundary trace %s -> %s",
+							"[IsNavigable] FAIL: Phase2 boundary %s -> %s blocked",
 							tostring(nodeId),
 							tostring(nextNodeId)
 						)
 					)
-				end
-
-				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
-					if DEBUG_MODE then
-						print(
-							string.format(
-								"[IsNavigable] FAIL: Phase2 boundary %s -> %s blocked",
-								tostring(nodeId),
-								tostring(nextNodeId)
-							)
-						)
-					end
 					saveDebugFail(toWp.pos, nextWp.pos)
 					return false
 				end
@@ -6863,9 +6850,7 @@ local function traceWaypoints(waypoints, allowJump)
 		index = nodeEndIndex + 1
 	end
 
-	if DEBUG_MODE then
-		print(string.format("[IsNavigable] Phase2 SUCCESS: %d hull traces (%d waypoints)", traceCount, #waypoints))
-	end
+	debugLog(string.format("[IsNavigable] Phase2 SUCCESS: %d hull traces (%d waypoints)", traceCount, #waypoints))
 
 	return true
 end
@@ -6914,9 +6899,7 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 	-- Traverse to destination (no traces - just verify path exists)
 	for iteration = 1, MAX_ITERATIONS do
 		if visitedNodes[currentNode.id] then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: Cycle detected at node %d", currentNode.id))
-			end
+			debugLog(string.format("[IsNavigable] FAIL: Cycle detected at node %d", currentNode.id))
 			saveDebugPath(waypoints)
 			setDebugResult(false)
 			return false
@@ -6928,15 +6911,13 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 			local goalZ, goalNormal = getGroundZFromQuad(goalPos, currentNode)
 			local goalWpPos = goalZ and Vector3(goalPos.x, goalPos.y, goalZ) or goalPos
 			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = goalNormal })
-			if DEBUG_MODE then
-				print(
-					string.format(
-						"[IsNavigable] Phase1 SUCCESS: goal in node %d (%d waypoints) — starting Phase2",
-						currentNode.id,
-						#waypoints
-					)
+			debugLog(
+				string.format(
+					"[IsNavigable] Phase1 SUCCESS: goal in node %d (%d waypoints) — starting Phase2",
+					currentNode.id,
+					#waypoints
 				)
-			end
+			)
 			saveDebugPath(waypoints)
 			local navigable = traceWaypoints(waypoints, allowJump)
 			setDebugResult(navigable)
@@ -6962,40 +6943,27 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		end
 
 		if not exitPoint or not exitDir then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: No exit found from node %d", currentNode.id))
-			end
+			debugLog(string.format("[IsNavigable] FAIL: No exit found from node %d", currentNode.id))
 			saveDebugPath(waypoints)
 			saveDebugFail(currentPos, currentPos + pathLineDir * 50)
 			setDebugResult(false)
 			return false
 		end
 
-		if DEBUG_MODE then
-			local dirNames = { [1] = "N", [2] = "E", [3] = "S", [4] = "W" }
-			print(
-				string.format(
-					"[IsNavigable] Exit via %s at (%.1f, %.1f)",
-					dirNames[exitDir] or "?",
-					exitPoint.x,
-					exitPoint.y
-				)
+		local dirNames = { [1] = "N", [2] = "E", [3] = "S", [4] = "W" }
+		debugLog(
+			string.format(
+				"[IsNavigable] Exit via %s at (%.1f, %.1f)",
+				dirNames[exitDir] or "?",
+				exitPoint.x,
+				exitPoint.y
 			)
-		end
+		)
 
 		-- Find neighbor
 		local neighborNode = findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
 
 		if not neighborNode then
-			if DEBUG_MODE then
-				print(
-					string.format(
-						"[IsNavigable] FAIL: No neighbor found at exit (%.1f, %.1f)",
-						exitPoint.x,
-						exitPoint.y
-					)
-				)
-			end
 			saveDebugPath(waypoints)
 			saveDebugFail(currentPos, exitPoint)
 			setDebugResult(false)
@@ -7007,9 +6975,7 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 		local entryZ, entryNormal = getGroundZFromQuad(Vector3(entryX, entryY, 0), neighborNode)
 
 		if not entryZ then
-			if DEBUG_MODE then
-				print(string.format("[IsNavigable] FAIL: No ground geometry at entry to node %d", neighborNode.id))
-			end
+			debugLog(string.format("[IsNavigable] FAIL: No ground geometry at entry to node %d", neighborNode.id))
 			saveDebugPath(waypoints)
 			saveDebugFail(currentPos, exitPoint)
 			setDebugResult(false)
@@ -7027,24 +6993,20 @@ function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump
 				local exitPos = Vector3(exitPoint.x, exitPoint.y, exitZ)
 				local _, exitNormal = getGroundZFromQuad(exitPoint, currentNode)
 				table.insert(waypoints, { pos = exitPos, node = currentNode, normal = exitNormal })
-				if DEBUG_MODE then
-					print(string.format("[IsNavigable] Added slope waypoint at exit (Z=%.1f)", exitZ))
-				end
+				debugLog(string.format("[IsNavigable] Added slope waypoint at exit (Z=%.1f)", exitZ))
 			end
 		end
 
 		table.insert(waypoints, { pos = entryPos, node = neighborNode, normal = entryNormal })
 
-		if DEBUG_MODE then
-			print(string.format("[IsNavigable] Crossed to node %d (Z=%.1f)", neighborNode.id, entryZ))
-		end
+		debugLog(string.format("[IsNavigable] Crossed to node %d (Z=%.1f)", neighborNode.id, entryZ))
 
 		currentPos = entryPos
 		currentNode = neighborNode
 	end
 
+	debugLog(string.format("[IsNavigable] FAIL: Max iterations (%d) exceeded", MAX_ITERATIONS))
 	if DEBUG_MODE then
-		print(string.format("[IsNavigable] FAIL: Max iterations (%d) exceeded", MAX_ITERATIONS))
 		saveDebugPath(waypoints)
 		setDebugResult(false)
 	end

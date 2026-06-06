@@ -148,6 +148,10 @@ local function OnCreateMove(Cmd)
 		return
 	end
 
+	if engine.Con_IsVisible() or engine.IsGameUIVisible() then
+		return
+	end
+
 	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
 		local startNode = Node.GetAreaAtPosition(TestState.currentPos)
 
