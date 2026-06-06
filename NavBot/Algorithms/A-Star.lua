@@ -96,66 +96,7 @@ local function reconstructPath(cameFrom, startNode, goalNode)
 	return path
 end
 
-----------------------------------------------------------------
--- Path Smoothing: Remove unnecessary waypoints
-----------------------------------------------------------------
-local function smoothPath(rawPath)
-	if not rawPath or #rawPath < 3 then
-		return rawPath
-	end
-
-	local smoothed = { rawPath[1] } -- Always keep start
-	local i = 2
-
-	while i <= #rawPath do
-		local curr = rawPath[i]
-		local lastKept = smoothed[#smoothed]
-
-		-- Look ahead to see if we can skip waypoints
-		local canSkip = true
-		for j = i + 1, #rawPath do
-			local future = rawPath[j]
-
-			-- Check if the direct path is significantly shorter
-			local directDist = (lastKept.pos - future.pos):Length()
-			local waypointDist = 0
-
-			-- Calculate total distance through waypoints
-			for k = i, j - 1 do
-				waypointDist = waypointDist + (rawPath[k].pos - rawPath[k + 1].pos):Length()
-			end
-
-			-- If direct path is significantly shorter, we can skip waypoints
-			if directDist < waypointDist * 0.8 then
-				i = j - 1
-				canSkip = false
-				break
-			end
-		end
-
-		if canSkip then
-			-- Add current waypoint to smoothed path
-			table.insert(smoothed, curr)
-		end
-		i = i + 1
-	end
-
-	-- Always keep the goal
-	if #smoothed > 0 and smoothed[#smoothed] ~= rawPath[#rawPath] then
-		table.insert(smoothed, rawPath[#rawPath])
-	end
-
-	Log:Debug("Path smoothed: " .. #rawPath .. " -> " .. #smoothed .. " waypoints")
-	return smoothed
-end
-
-local function reconstructAndSmoothPath(cameFrom, startNode, goalNode)
-	local rawPath = reconstructPath(cameFrom, startNode, goalNode)
-	if not rawPath then
-		return nil
-	end
-	return smoothPath(rawPath)
-end
+-- No post-smoothing: shortcuts are validated at runtime by NavPredict.CanSkip (NodeSkipper)
 
 -- A* Module Table
 local AStar = {}
@@ -197,7 +138,7 @@ function AStar.NormalPath(startNode, goalNode, nodes, adjacentFun)
 		end
 
 		if current == goalNode then
-			local path = reconstructAndSmoothPath(cameFrom, startNode, current)
+			local path = reconstructPath(cameFrom, startNode, current)
 			releaseTables(openSetLookup, closedSet, gScore, fScore, cameFrom)
 			return path
 		end

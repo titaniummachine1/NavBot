@@ -7,12 +7,12 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
 local PathSteering = require("NavBot.Navigation.PathSteering")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
-local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 
 local MovementDecisions = {}
 local Log = Common.Log.new("MovementDecisions")
@@ -29,28 +29,9 @@ function MovementDecisions.checkDistanceAndAdvance(userCmd)
 	local result = { shouldContinue = true }
 	local LocalOrigin = G.pLocal.Origin
 
-	-- Per-tick node skipping (runs every tick, NOT throttled)
-	if NodeSkipper.Tick(LocalOrigin) then
-		-- Path changed (nodes skipped), rebuild waypoints to match new path
-		Navigation.BuildDoorWaypointsFromPath()
-		Log:Debug("NodeSkipper modified path - waypoints rebuilt")
-
-		-- If we skipped nodes, we might be far from the new target, or close.
-		-- We should probably update the targetPos immediately for the next frame or this frame's movement execution.
-		-- Current implementation of executeMovement calls getCurrentTarget(), which will get the NEW target.
-		-- So we just need to ensure we don't accidentally "reach" the old target or do weird distance logic this frame.
-	end
-
 	-- Throttled distance calculation for reaching nodes
 	if not WorkManager.attemptWork(DISTANCE_CHECK_COOLDOWN, "distance_check") then
 		return result -- Skip this frame's distance check
-	end
-
-	-- Get current target position
-	local targetPos = MovementDecisions.getCurrentTarget()
-	if not targetPos then
-		result.shouldContinue = false
-		return result
 	end
 
 	-- In FOLLOWING state we don't advance nodes based on reach distance
@@ -58,56 +39,63 @@ function MovementDecisions.checkDistanceAndAdvance(userCmd)
 		return result
 	end
 
+	if MovementDecisions.tryAdvancePathNode(LocalOrigin) then
+		return result
+	end
+
+	local targetPos = MovementDecisions.getCurrentTarget()
+	if not targetPos then
+		result.shouldContinue = false
+		return result
+	end
+
 	local horizontalDist = Common.Distance2D(LocalOrigin, targetPos)
 	local verticalDist = math.abs(LocalOrigin.z - targetPos.z)
 
-	-- Check if we've reached the target
-	local reachedTarget = MovementDecisions.hasReachedTarget(LocalOrigin, targetPos, horizontalDist, verticalDist)
-
-	if reachedTarget then
-		Log:Debug("Reached target - advancing waypoint/node")
-
-		-- Advance waypoint or node
-		if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
-			Navigation.AdvanceWaypoint()
-			-- If no more waypoints, we're done
-			if not Navigation.GetCurrentWaypoint() then
-				Navigation.ClearPath()
-				Log:Info("Reached end of waypoint path")
-				result.shouldContinue = false
-				G.currentState = G.States.IDLE
-				G.lastPathfindingTick = 0
-			end
-		else
-			-- Fallback to node-based advancement
-			MovementDecisions.advanceNode()
+	local path = G.Navigation.path
+	if path and #path == 1 and G.Navigation.goalPos then
+		local goalDist = Common.Distance2D(LocalOrigin, G.Navigation.goalPos)
+		if goalDist < (G.Misc.NodeTouchDistance or 16) then
+			Navigation.ClearPath()
+			Log:Info("Reached final goal")
+			result.shouldContinue = false
+			G.currentState = G.States.IDLE
+			G.lastPathfindingTick = 0
 		end
 	end
 
 	return result
 end
 
+function MovementDecisions.tryAdvancePathNode(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 2 then
+		return false
+	end
+
+	local currentNode = path[1]
+	local nextNode = path[2]
+	if not (currentNode and nextNode and currentNode.pos and nextNode.pos) then
+		return false
+	end
+
+	local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+	if not passed then
+		return false
+	end
+
+	Log:Debug("Advancing path: left node %s (%s)", tostring(currentNode.id), passReason or "?")
+	return MovementDecisions.advanceNode()
+end
+
 -- Helper: Get current target position
 function MovementDecisions.getCurrentTarget()
-	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
-		local currentWaypoint = Navigation.GetCurrentWaypoint()
-		if currentWaypoint then
-			return currentWaypoint.pos
-		end
+	local origin = G.pLocal and G.pLocal.Origin
+	local path = G.Navigation.path
+	if origin and path and #path > 0 then
+		return PathSteering.getMovementTarget(origin, path, G.Navigation.goalPos)
 	end
-
-	-- Path segment: portal / exit toward next node (not area center on large boxes)
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		local currentNode = G.Navigation.path[1]
-		local nextNode = G.Navigation.path[2]
-		local origin = G.pLocal and G.pLocal.Origin
-		if currentNode and origin then
-			return PathSteering.getSteeringPoint(origin, currentNode, nextNode)
-		end
-		return currentNode and currentNode.pos
-	end
-
-	return nil
+	return G.Navigation.goalPos
 end
 
 -- Helper: Check if we've reached the target
@@ -138,10 +126,7 @@ end
 
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
-	previousDistance = nil -- Reset tracking when advancing nodes
-	Log:Debug(tostring(G.Menu.Navigation.Skip_Nodes), #G.Navigation.path)
-
-	Log:Debug("Removing current node (reached target)")
+	previousDistance = nil
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()

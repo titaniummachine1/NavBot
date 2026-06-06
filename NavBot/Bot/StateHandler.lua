@@ -9,7 +9,7 @@ local Node = require("NavBot.Navigation.Node")
 local WorkManager = require("NavBot.WorkManager")
 local GoalFinder = require("NavBot.Bot.GoalFinder")
 local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
-local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local MovementDecisions = require("NavBot.Bot.MovementDecisions")
 
@@ -64,12 +64,13 @@ function StateHandler.handleIdleState()
 			if currentArea then
 				local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
 				local success, canWalk =
-					pcall(isNavigable.CanSkip, G.pLocal.Origin, goalPos, currentArea, false, allowJump)
+					pcall(NavPredict.CanSkip, G.pLocal.Origin, goalPos, currentArea, true, allowJump)
 				if success and canWalk then
 					Log:Info("Direct-walk (short hop), moving immediately (dist: %.1f)", distance)
 					G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
 					G.Navigation.goalPos = goalPos
 					G.Navigation.goalNodeId = goalNode.id
+					Navigation.RebuildApexPath()
 					G.currentState = G.States.MOVING
 					G.lastPathfindingTick = globals.TickCount()
 					return
@@ -152,6 +153,7 @@ function StateHandler.handleIdleState()
 				-- Within stop radius - enter FOLLOWING state and just track position
 				-- DON'T set lastPathfindingTick - this isn't pathfinding, just direct movement
 				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+				Navigation.RebuildApexPath()
 				G.currentState = G.States.FOLLOWING
 				G.Navigation.followingDistance = dist
 				Log:Debug(
@@ -163,6 +165,7 @@ function StateHandler.handleIdleState()
 			else
 				-- Too far - move closer (still direct movement, not pathfinding)
 				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+				Navigation.RebuildApexPath()
 				G.currentState = G.States.MOVING
 				G.Navigation.followingStopRadius = nil
 				Log:Info(
@@ -383,6 +386,7 @@ function StateHandler.handleFollowingState(userCmd)
 	-- Only update if distance changed significantly (>30 units)
 	if distChange > 10 then
 		G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+		Navigation.RebuildApexPath()
 		G.Navigation.followingDistance = currentDist
 		G.Navigation.goalPos = goalPos
 		Log:Debug("Target moved %.0f units, updating position (dist=%.0f)", distChange, currentDist)

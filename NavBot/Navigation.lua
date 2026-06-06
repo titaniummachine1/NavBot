@@ -14,7 +14,8 @@ local Node = require("NavBot.Navigation.Node")
 local AStar = require("NavBot.Algorithms.A-Star")
 local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
-local isNavigable = require("NavBot.Navigation.isWalkable.isNavigable")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
 local Lib = Common.Lib
 local Log = Lib.Utils.Logger.new("NavBot")
 Log.Level = 0
@@ -142,8 +143,21 @@ function Navigation.ClearPath()
 	G.Navigation.currentWaypointIndex = 1
 	-- Clear path traversal history used by stuck analysis
 	G.Navigation.pathHistory = {}
-	-- Reset node skipping state
+	G.Navigation.apexPath = nil
+	G.Navigation.apexIndex = 1
 	NodeSkipper.Reset()
+end
+
+function Navigation.RebuildApexPath()
+	local path = G.Navigation.path
+	if not path or #path == 0 then
+		G.Navigation.apexPath = nil
+		G.Navigation.apexIndex = 1
+		return
+	end
+	local startPos = G.pLocal and G.pLocal.Origin or nil
+	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(path, G.Navigation.goalPos, startPos)
+	G.Navigation.apexIndex = 1
 end
 
 -- Set the current path
@@ -160,10 +174,8 @@ function Navigation.SetCurrentPath(path)
 	-- Build area-center waypoints (door threading via NavPredict at runtime)
 	--ProfilerBegin and ProfilerEnd are not available here, so rely on caller's profiling
 	Navigation.BuildDoorWaypointsFromPath()
-	-- Reset traversal history on new path
+	Navigation.RebuildApexPath()
 	G.Navigation.pathHistory = {}
-	-- Reset node skipping state for new path
-	local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 	NodeSkipper.Reset()
 end
 
@@ -186,10 +198,9 @@ function Navigation.RemoveCurrentNode()
 		G.Navigation.currentNodeIndex = 1
 		-- Rebuild waypoints to reflect new leading edge
 		Navigation.BuildDoorWaypointsFromPath()
+		Navigation.RebuildApexPath()
 	end
 end
-
--- Function to reset the current node ticks
 function Navigation.ResetTickTimer()
 	G.Navigation.currentNodeTicks = 0
 end
@@ -213,7 +224,7 @@ function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
 		return false
 	end
 
-	-- Use isNavigable instead of IsWalkable
+	-- Straight-line walk check via NavPredict.CanSkip
 	local currentArea = Node.GetAreaAtPosition(currentPos)
 	if not currentArea then
 		Log:Debug("CheckNextNodeWalkable: Could not find current area")
@@ -221,7 +232,7 @@ function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canWalk = pcall(isNavigable.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
+	local success, canWalk = pcall(NavPredict.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
 
 	if success and canWalk then
 		Log:Debug("Next node %d is walkable from current position", nextNode.id)
@@ -264,7 +275,7 @@ end
 -- WAYPOINT BUILDING
 -- ========================================================================
 
--- Area-center waypoints; door threading is handled by NavPredict at movement time
+-- Goal-only waypoint list; movement uses PathSteering portal string-pull on G.Navigation.path
 function Navigation.BuildDoorWaypointsFromPath()
 	if not G.Navigation.waypoints then
 		G.Navigation.waypoints = {}
@@ -274,21 +285,6 @@ function Navigation.BuildDoorWaypointsFromPath()
 		end
 	end
 	G.Navigation.currentWaypointIndex = 1
-	local path = G.Navigation.path
-	if not path or #path == 0 then
-		return
-	end
-
-	for i = 2, #path do
-		local areaNode = path[i]
-		if areaNode and areaNode.pos and not Node.IsDoorNode(areaNode) then
-			table.insert(G.Navigation.waypoints, {
-				pos = areaNode.pos,
-				kind = "center",
-				areaId = areaNode.id,
-			})
-		end
-	end
 
 	local goalPos = G.Navigation.goalPos
 	if goalPos then
@@ -538,7 +534,7 @@ function Navigation.FindPath(startNode, goalNode)
 		-- Reset node skipping agents for new path
 		G.Navigation.skipAgents = nil
 		Navigation.BuildDoorWaypointsFromPath()
-		-- Apply PathOptimizer for menu-controlled optimization
+		Navigation.RebuildApexPath()
 		-- REMOVED: All path optimization now handled by NodeSkipper.CheckContinuousSkip
 		-- Reset traversed-node history for new path
 		G.Navigation.pathHistory = {}

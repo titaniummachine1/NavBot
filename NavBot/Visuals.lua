@@ -2,6 +2,7 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local MathUtils = require("NavBot.Utils.MathUtils")
 
 local Visuals = {}
@@ -758,31 +759,34 @@ local function OnDraw()
 		end
 	end
 
-	-- Draw only the actual-followed path using door-aware waypoints, with a live target arrow
 	if G.Menu.Visuals.drawPath then
-		local wps = G.Navigation.waypoints
-		if wps and #wps > 0 then
-			-- Only draw waypoints from current position onward (don't show past waypoints)
-			local currentIdx = G.Navigation.currentWaypointIndex or 1
-			if currentIdx < 1 then
-				currentIdx = 1
+		local path = G.Navigation.path
+		local localPos = G.pLocal and G.pLocal.Origin
+		local goalPos = G.Navigation.goalPos
+		if path and #path > 0 and localPos then
+			local apexes = G.Navigation.apexPath
+			if not apexes or #apexes == 0 then
+				apexes = PathStringPull.ProcessAreaPath(path, goalPos, localPos)
+			end
+			for i = 1, #apexes - 1 do
+				local a = apexes[i].pos
+				local b = apexes[i + 1].pos
+				if a and b then
+					if apexes[i + 1].kind == "center" then
+						draw.Color(255, 200, 0, 180)
+					elseif apexes[i + 1].kind == "portal" then
+						draw.Color(80, 200, 255, 160)
+					else
+						draw.Color(80, 120, 255, 100)
+					end
+					Common.DrawArrowLine(a, b, 14, 10, false)
+				end
 			end
 
-			-- Draw segments from current waypoint to the end
-			for i = currentIdx, #wps - 1 do
-				local a, b = wps[i], wps[i + 1]
-				local aPos = a.pos
-				local bPos = b.pos
-				if not aPos and a.kind == "door" and a.points and #a.points > 0 then
-					aPos = a.points[math.ceil(#a.points / 2)]
-				end
-				if not bPos and b.kind == "door" and b.points and #b.points > 0 then
-					bPos = b.points[math.ceil(#b.points / 2)]
-				end
-				if aPos and bPos then
-					draw.Color(255, 255, 255, 255) -- white route
-					Common.DrawArrowLine(aPos, bPos, 18, 12, false)
-				end
+			local moveTarget = PathStringPull.GetMovementTarget(localPos)
+			if moveTarget then
+				draw.Color(255, 255, 255, 220)
+				Common.DrawArrowLine(localPos, moveTarget, 18, 12, false)
 			end
 		end
 	end
