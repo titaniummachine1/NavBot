@@ -5,6 +5,7 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local Node = require("NavBot.Navigation.Node")
 local WorkManager = require("NavBot.WorkManager")
 local GoalFinder = require("NavBot.Bot.GoalFinder")
@@ -103,7 +104,7 @@ function StateHandler.handleIdleState()
 
 	-- (nodes were already checked above)
 
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 	if not startNode then
 		Log:Warn("Could not find start node")
 		return
@@ -208,7 +209,7 @@ function StateHandler.handlePathfindingState()
 			local goalNodeId = G.Navigation.goalNodeId
 
 			if goalPos and goalNodeId then
-				local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+				local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 				local goalNode = G.Navigation.nodes and G.Navigation.nodes[goalNodeId]
 
 				if startNode and goalNode and startNode.id ~= goalNode.id then
@@ -234,63 +235,14 @@ function StateHandler.handlePathfindingState()
 	end
 end
 
--- Legacy entry point; stuck detection now lives in MovementDecisions.checkStuckState
-function StateHandler.handleStuckState(_userCmd)
-	G.currentState = G.States.MOVING
-	G.Navigation.unwalkableCount = 0
-	G.Navigation.stuckStartTick = nil
-end
-
--- Add cost penalties to connections when stuck
-function StateHandler.addStuckPenalties()
-	local path = G.Navigation.path
-	if not path or #path < 2 then
+-- Force immediate repath (cooldown unless skipCooldown from stuck handler)
+function StateHandler.forceRepath(reason, skipCooldown)
+	if not skipCooldown and not WorkManager.attemptWork(33, "force_repath_cooldown") then
 		return
-	end
-
-	-- Add penalty to current connection (between any two path elements)
-	local currentElement = path[1]
-	local nextElement = path[2]
-
-	if currentElement and nextElement then
-		-- Handle different connection types: node->node, node->door, door->door
-		local fromId = currentElement.id or currentElement.fromId
-		local toId = nextElement.id or nextElement.toId or nextElement.areaId
-
-		if fromId and toId then
-			-- Find and penalize the connection
-			local fromNode = G.Navigation.nodes and G.Navigation.nodes[fromId]
-			local toNode = G.Navigation.nodes and G.Navigation.nodes[toId]
-
-			if fromNode and toNode then
-				local connection = Node.GetConnectionEntry(fromNode, toNode)
-				if connection then
-					connection.cost = (connection.cost or 1) + 50
-					Log:Info(
-						"Added 50 cost penalty to connection "
-							.. tostring(fromId)
-							.. " -> "
-							.. tostring(toId)
-							.. " (stuck penalty)"
-					)
-				end
-			end
-		end
-	end
-end
-
--- Force immediate repath (with cooldown to prevent spam)
-function StateHandler.forceRepath(reason)
-	-- Prevent repath spam with 33 tick cooldown
-	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
-		return -- Still on cooldown, ignore repath request
 	end
 
 	Log:Warn("Force repath triggered: %s", reason)
 
-	-- Clear stuck state
-	G.Navigation.stuckStartTick = nil
-	G.Navigation.unwalkableCount = 0
 	Navigation.ResetTickTimer()
 
 	-- Force immediate repath
@@ -333,7 +285,7 @@ function StateHandler.handleFollowingState(userCmd)
 	end
 
 	-- Check if still on same node
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 	if not startNode or startNode.id ~= goalNode.id then
 		-- No longer on same node - return to IDLE to trigger pathfinding (clear throttle)
 		Log:Debug("Left target node in FOLLOWING state, returning to IDLE")
@@ -351,9 +303,9 @@ function StateHandler.handleFollowingState(userCmd)
 	-- Only update if distance changed significantly (>30 units)
 	if distChange > 10 then
 		G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-		Navigation.RebuildApexPath()
-		G.Navigation.followingDistance = currentDist
 		G.Navigation.goalPos = goalPos
+		PathStringPull.UpdateGoalApex(goalPos)
+		G.Navigation.followingDistance = currentDist
 		Log:Debug("Target moved %.0f units, updating position (dist=%.0f)", distChange, currentDist)
 
 		-- If moved outside stop radius, switch to MOVING

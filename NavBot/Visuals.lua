@@ -2,7 +2,6 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local MathUtils = require("NavBot.Utils.MathUtils")
 
 local Visuals = {}
@@ -67,7 +66,8 @@ local function collectNodesByConnectionDepth(playerPos, maxDepth)
 end
 
 --[[ Functions ]]
-local function Draw3DBox(size, pos)
+local function Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
 	local corners = {
@@ -759,45 +759,31 @@ local function OnDraw()
 		end
 	end
 
+	-- Draw cached apex path + tick-updated target only (never run path logic in Draw)
 	if G.Menu.Visuals.drawPath then
-		local path = G.Navigation.path
 		local localPos = G.pLocal and G.pLocal.Origin
-		local goalPos = G.Navigation.goalPos
-		if path and #path > 0 and localPos then
-			local apexes = G.Navigation.apexPath
-			if not apexes or #apexes == 0 then
-				apexes = PathStringPull.ProcessAreaPath(path, goalPos, localPos)
-			end
+		local apexes = G.Navigation.apexPath
+		if apexes and #apexes > 1 then
 			for i = 1, #apexes - 1 do
-				local a = apexes[i].pos
-				local b = apexes[i + 1].pos
-				if a and b then
-					if apexes[i + 1].kind == "center" then
-						draw.Color(255, 200, 0, 180)
+				local posA = apexes[i].pos
+				local posB = apexes[i + 1].pos
+				if posA and posB then
+					local cr, cg, cb, ca = 80, 120, 255, 100
+					if apexes[i + 1].kind == "drop" then
+						cr, cg, cb, ca = 0, 200, 255, 200
+					elseif apexes[i + 1].kind == "approach" or apexes[i + 1].kind == "same_side_center" then
+						cr, cg, cb, ca = 255, 200, 0, 180
 					elseif apexes[i + 1].kind == "portal" then
-						draw.Color(80, 200, 255, 160)
-					else
-						draw.Color(80, 120, 255, 100)
+						cr, cg, cb, ca = 80, 200, 255, 160
 					end
-					Common.DrawArrowLine(a, b, 14, 10, false)
+					Common.DrawArrowLine(posA, posB, 14, 10, false, cr, cg, cb, ca)
 				end
 			end
-
-			local moveTarget = PathStringPull.GetMovementTarget(localPos)
-			if moveTarget then
-				draw.Color(255, 255, 255, 220)
-				Common.DrawArrowLine(localPos, moveTarget, 18, 12, false)
-			end
 		end
-	end
 
-	-- Draw direct white arrow from player to current target (the position we're walking to)
-	if G.Menu.Visuals.drawPath then
-		local localPos = G.pLocal and G.pLocal.Origin
 		local targetPos = G.Navigation.currentTargetPos
 		if localPos and targetPos then
-			draw.Color(255, 255, 255, 220) -- White arrow to current target
-			Common.DrawArrowLine(localPos, targetPos, 18, 12, false)
+			Common.DrawArrowLine(localPos, targetPos, 18, 12, false, 255, 255, 255, 220)
 		end
 	end
 

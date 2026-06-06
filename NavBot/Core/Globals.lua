@@ -35,8 +35,7 @@ G.Misc = {
 	NodeOvershootTouchDistance = 48,
 	NodeTouchHeight = 82,
 	NodePassProximity = 16,
-	NodePassDirDotThreshold = 0.5, -- intent dot for PathSteering overshoot pass
-	NodePassAngleDegrees = 60, -- legacy bearing pass (unused when PathSteering active)
+	NodePassDirDotThreshold = 0.5, -- intent dot for portal overshoot pass
 	workLimit = 1,
 }
 
@@ -45,17 +44,10 @@ G.Navigation = {
 	nodes = nil,
 	currentNodeIndex = 1, -- Current node we're moving towards (1 = first node in path)
 	currentNodeTicks = 0,
-	stuckStartTick = nil, -- Track when we first entered stuck state
-	FirstAgentNode = 1,
-	SecondAgentNode = 2,
-	lastKnownTargetPosition = nil, -- Remember last position of follow target
-	goalPos = nil, -- Current goal world position
-	goalNodeId = nil, -- Closest node to the goal position
-	navMeshUpdated = false, -- Set when navmesh is rebuilt
-	-- Node skipping system
-	lastSkipCheckTick = 0, -- Last tick when we performed skip check
-	nextNodeCloser = false, -- Flag indicating if next node is closer
-	lowVelocityTicks = 0,
+	lastKnownTargetPosition = nil,
+	goalPos = nil,
+	goalNodeId = nil,
+	navMeshUpdated = false,
 }
 
 -- SmartJump configuration
@@ -103,8 +95,9 @@ G.SmartJump = G.SmartJump
 	}
 
 -- Bot movement tracking (for SmartJump integration)
-G.BotIsMoving = false -- Track if bot is actively moving
-G.BotMovementDirection = Vector3(0, 0, 0) -- Bot's intended movement direction
+G.BotIsMoving = false
+G.BotMovementDirection = Vector3(0, 0, 0)
+G.BotIntendedWishDir = Vector3(0, 0, 0)
 
 -- Memory management and cache tracking
 G.Cache = {
@@ -134,8 +127,7 @@ G.States = {
 	IDLE = "IDLE",
 	PATHFINDING = "PATHFINDING",
 	MOVING = "MOVING",
-	STUCK = "STUCK",
-	FOLLOWING = "FOLLOWING", -- Direct following of dynamic target on same node
+	FOLLOWING = "FOLLOWING",
 }
 
 G.currentState = nil

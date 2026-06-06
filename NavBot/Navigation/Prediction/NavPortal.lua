@@ -1,5 +1,6 @@
---[[ Imported by: NavPredict ]]
+--[[ Imported by: NavPredict, PathStringPull ]]
 
+local G = require("NavBot.Core.Globals")
 local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
 local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
 
@@ -292,6 +293,48 @@ local function tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection,
 		)
 	)
 	return nil
+end
+
+--- Exit edge from connection graph (not center-to-center — avoids corner cuts on stairs/slopes).
+function NavPortal.GetExitDirToNeighbor(currentNode, neighborNode)
+	if not (currentNode and neighborNode and currentNode.c) then
+		return nil
+	end
+
+	local nodes = G.Navigation and G.Navigation.nodes
+	if not nodes then
+		return nil
+	end
+
+	for exitDir = 1, 4 do
+		local dirData = currentNode.c[exitDir]
+		if dirData and dirData.connections then
+			for i = 1, #dirData.connections do
+				local neighborArea = resolveConnectionToNeighborArea(dirData.connections[i], currentNode.id, nodes)
+				if neighborArea and neighborArea.id == neighborNode.id then
+					return exitDir
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+--- Door portal span when doorsOnly and a door connects to neighborNode; else shared edge span.
+function NavPortal.GetPortalSpanForNeighbor(currentNode, neighborNode, exitDir, doorsOnly)
+	if doorsOnly and neighborNode and currentNode.c and exitDir then
+		local nodes = G.Navigation and G.Navigation.nodes
+		if nodes then
+			local candidates = collectDoorCandidates(currentNode, exitDir, nodes)
+			for i = 1, #candidates do
+				if candidates[i].neighborArea.id == neighborNode.id then
+					return candidates[i].portalMin, candidates[i].portalMax
+				end
+			end
+		end
+	end
+	return NavPortal.GetSharedPortalSpan(currentNode, neighborNode, exitDir)
 end
 
 function NavPortal.FindNeighborAtExit(currentNode, exitPoint, exitDir, nodes, doorsOnly)

@@ -15,9 +15,6 @@ local WorkManager = require("NavBot.WorkManager")
 
 -- Profiler removed - not used
 
---[[ Algorithms ]]
-local Greedy = require("NavBot.Algorithms.Greedy")
-
 --[[ Bot Modules ]]
 local StateHandler = require("NavBot.Bot.StateHandler")
 local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
@@ -38,13 +35,7 @@ local Notify, WPlayer = Lib.UI.Notify, Lib.TF2.WPlayer
 local Log = Common.Log.new("NavBot")
 Log.Level = 0
 
--- Make modules globally accessible
-G.Greedy = Greedy
-G.Navigation = Navigation
-
--- Constants for timing and performance
-local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
-local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
+G.CircuitBreaker = CircuitBreaker
 
 -- Initialize current state
 G.currentState = G.States.IDLE
@@ -96,10 +87,6 @@ local function onCreateMove(userCmd)
 		MovementDecisions.handleMovingState(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
-	elseif G.currentState == G.States.STUCK then
-		-- Legacy state: keep walking, repath handled from MOVING.checkStuckState now
-		G.currentState = G.States.MOVING
-		MovementDecisions.handleMovingState(userCmd)
 	end
 
 	-- Work management
@@ -282,13 +269,13 @@ end
 
 --[[ Initialization ]]
 
--- Ensure SmartJump callback runs BEFORE NavBot's callback
 callbacks.Unregister("CreateMove", "ZNavBot.CreateMove")
+callbacks.Unregister("CreateMove", "NavBot.CreateMove")
 callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")
 callbacks.Unregister("Draw", "NavBot.ProfilerDraw")
 
-callbacks.Register("CreateMove", "ZNavBot.CreateMove", onCreateMove) -- Z prefix ensures it runs after SmartJump
+callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed

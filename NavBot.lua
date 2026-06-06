@@ -58,9 +58,6 @@ local WorkManager = require("NavBot.WorkManager")
 
 -- Profiler removed - not used
 
---[[ Algorithms ]]
-local Greedy = require("NavBot.Algorithms.Greedy")
-
 --[[ Bot Modules ]]
 local StateHandler = require("NavBot.Bot.StateHandler")
 local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
@@ -81,13 +78,7 @@ local Notify, WPlayer = Lib.UI.Notify, Lib.TF2.WPlayer
 local Log = Common.Log.new("NavBot")
 Log.Level = 0
 
--- Make modules globally accessible
-G.Greedy = Greedy
-G.Navigation = Navigation
-
--- Constants for timing and performance
-local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
-local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
+G.CircuitBreaker = CircuitBreaker
 
 -- Initialize current state
 G.currentState = G.States.IDLE
@@ -139,10 +130,6 @@ local function onCreateMove(userCmd)
 		MovementDecisions.handleMovingState(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
-	elseif G.currentState == G.States.STUCK then
-		-- Legacy state: keep walking, repath handled from MOVING.checkStuckState now
-		G.currentState = G.States.MOVING
-		MovementDecisions.handleMovingState(userCmd)
 	end
 
 	-- Work management
@@ -325,13 +312,13 @@ end
 
 --[[ Initialization ]]
 
--- Ensure SmartJump callback runs BEFORE NavBot's callback
 callbacks.Unregister("CreateMove", "ZNavBot.CreateMove")
+callbacks.Unregister("CreateMove", "NavBot.CreateMove")
 callbacks.Unregister("DrawModel", "NavBot.DrawModel")
 callbacks.Unregister("FireGameEvent", "NavBot.FireGameEvent")
 callbacks.Unregister("Draw", "NavBot.ProfilerDraw")
 
-callbacks.Register("CreateMove", "ZNavBot.CreateMove", onCreateMove) -- Z prefix ensures it runs after SmartJump
+callbacks.Register("CreateMove", "NavBot.CreateMove", onCreateMove)
 callbacks.Register("DrawModel", "NavBot.DrawModel", onDrawModel)
 callbacks.Register("FireGameEvent", "NavBot.FireGameEvent", onGameEvent)
 -- Profiler removed
@@ -470,6 +457,10 @@ local function OnDrawMenu()
 		G.Menu.Navigation.StopDistance = G.Menu.Navigation.StopDistance or 50
 		G.Menu.Navigation.StopDistance = TimMenu.Slider("Stop Distance", G.Menu.Navigation.StopDistance, 20, 200, 5)
 		TimMenu.Tooltip("Distance to stop from dynamic targets like payload (FOLLOWING state)")
+		TimMenu.NextLine()
+
+		G.Menu.Navigation.MoveDebug = TimMenu.Checkbox("Nav Move Debug Logs", G.Menu.Navigation.MoveDebug or false)
+		TimMenu.Tooltip("seg, feet area, advance block reason, apex target, speed — every ~0.5s")
 		TimMenu.NextLine()
 
 		G.Menu.Navigation.WalkableMode = G.Menu.Navigation.WalkableMode or "Smooth"
@@ -689,8 +680,7 @@ G.Misc = {
 	NodeOvershootTouchDistance = 48,
 	NodeTouchHeight = 82,
 	NodePassProximity = 16,
-	NodePassDirDotThreshold = 0.5, -- intent dot for PathSteering overshoot pass
-	NodePassAngleDegrees = 60, -- legacy bearing pass (unused when PathSteering active)
+	NodePassDirDotThreshold = 0.5, -- intent dot for portal overshoot pass
 	workLimit = 1,
 }
 
@@ -699,17 +689,10 @@ G.Navigation = {
 	nodes = nil,
 	currentNodeIndex = 1, -- Current node we're moving towards (1 = first node in path)
 	currentNodeTicks = 0,
-	stuckStartTick = nil, -- Track when we first entered stuck state
-	FirstAgentNode = 1,
-	SecondAgentNode = 2,
-	lastKnownTargetPosition = nil, -- Remember last position of follow target
-	goalPos = nil, -- Current goal world position
-	goalNodeId = nil, -- Closest node to the goal position
-	navMeshUpdated = false, -- Set when navmesh is rebuilt
-	-- Node skipping system
-	lastSkipCheckTick = 0, -- Last tick when we performed skip check
-	nextNodeCloser = false, -- Flag indicating if next node is closer
-	lowVelocityTicks = 0,
+	lastKnownTargetPosition = nil,
+	goalPos = nil,
+	goalNodeId = nil,
+	navMeshUpdated = false,
 }
 
 -- SmartJump configuration
@@ -757,8 +740,9 @@ G.SmartJump = G.SmartJump
 	}
 
 -- Bot movement tracking (for SmartJump integration)
-G.BotIsMoving = false -- Track if bot is actively moving
-G.BotMovementDirection = Vector3(0, 0, 0) -- Bot's intended movement direction
+G.BotIsMoving = false
+G.BotMovementDirection = Vector3(0, 0, 0)
+G.BotIntendedWishDir = Vector3(0, 0, 0)
 
 -- Memory management and cache tracking
 G.Cache = {
@@ -788,8 +772,7 @@ G.States = {
 	IDLE = "IDLE",
 	PATHFINDING = "PATHFINDING",
 	MOVING = "MOVING",
-	STUCK = "STUCK",
-	FOLLOWING = "FOLLOWING", -- Direct following of dynamic target on same node
+	FOLLOWING = "FOLLOWING",
 }
 
 G.currentState = nil
@@ -823,6 +806,7 @@ defaultconfig = {
 		Skip_Nodes = true, --skips nodes if it can go directly to ones closer to target.
 		StopDistance = 50, -- Distance to stop from target when following (FOLLOWING state)
 		WalkableMode = "Smooth", -- "Smooth" uses 18-unit steps, "Aggressive" allows 72-unit jumps
+		MoveDebug = false, -- NavMove console lines: segment, feet area, block reason, apex target
 		CleanupConnections = true, -- Cleanup invalid connections during map load (disable to prevent crashes)
 		AllowExpensiveChecks = true, -- Allow expensive walkability checks for proper stair/ramp connections
 	},
@@ -1757,12 +1741,30 @@ function Common.Dot(a, b)
 end
 
 -- Arrow line drawing function (moved from Visuals.lua and ISWalkable.lua)
-function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
+function Common.DrawArrowLine(
+	start_pos,
+	end_pos,
+	arrowhead_length,
+	arrowhead_width,
+	invert,
+	colorR,
+	colorG,
+	colorB,
+	colorA
+)
 	assert(start_pos and end_pos, "Common.DrawArrowLine: start_pos and end_pos are required")
 	assert(
 		arrowhead_length and arrowhead_width,
 		"Common.DrawArrowLine: arrowhead_length and arrowhead_width are required"
 	)
+	assert(
+		colorR and colorG and colorB and colorA,
+		"Common.DrawArrowLine: colorR, colorG, colorB, colorA is required (Lmaobox draw API)"
+	)
+	if not start_pos.Length or not end_pos.Length then
+		return
+	end
+	draw.Color(colorR, colorG, colorB, colorA)
 
 	-- If invert is true, swap start_pos and end_pos
 	if invert then
@@ -1800,7 +1802,6 @@ function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_wi
 	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
 	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
 
-	-- Only draw if all screen positions are valid (uses draw.Color set by caller)
 	if w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2 then
 		-- Draw the line from start to the base of the arrow (not all the way to the end)
 		draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
@@ -1882,7 +1883,8 @@ function Common.Drawing.WorldToScreen(worldPos)
 	return client.WorldToScreen(worldPos)
 end
 
-function Common.Drawing.Draw3DBox(size, pos)
+function Common.Drawing.Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
 	local corners = {
@@ -2157,7 +2159,6 @@ __bundle_register("NavBot.Visuals", function(require, _LOADED, __bundle_register
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local MathUtils = require("NavBot.Utils.MathUtils")
 
 local Visuals = {}
@@ -2222,7 +2223,8 @@ local function collectNodesByConnectionDepth(playerPos, maxDepth)
 end
 
 --[[ Functions ]]
-local function Draw3DBox(size, pos)
+local function Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
 	local corners = {
@@ -2914,45 +2916,31 @@ local function OnDraw()
 		end
 	end
 
+	-- Draw cached apex path + tick-updated target only (never run path logic in Draw)
 	if G.Menu.Visuals.drawPath then
-		local path = G.Navigation.path
 		local localPos = G.pLocal and G.pLocal.Origin
-		local goalPos = G.Navigation.goalPos
-		if path and #path > 0 and localPos then
-			local apexes = G.Navigation.apexPath
-			if not apexes or #apexes == 0 then
-				apexes = PathStringPull.ProcessAreaPath(path, goalPos, localPos)
-			end
+		local apexes = G.Navigation.apexPath
+		if apexes and #apexes > 1 then
 			for i = 1, #apexes - 1 do
-				local a = apexes[i].pos
-				local b = apexes[i + 1].pos
-				if a and b then
-					if apexes[i + 1].kind == "center" then
-						draw.Color(255, 200, 0, 180)
+				local posA = apexes[i].pos
+				local posB = apexes[i + 1].pos
+				if posA and posB then
+					local cr, cg, cb, ca = 80, 120, 255, 100
+					if apexes[i + 1].kind == "drop" then
+						cr, cg, cb, ca = 0, 200, 255, 200
+					elseif apexes[i + 1].kind == "approach" or apexes[i + 1].kind == "same_side_center" then
+						cr, cg, cb, ca = 255, 200, 0, 180
 					elseif apexes[i + 1].kind == "portal" then
-						draw.Color(80, 200, 255, 160)
-					else
-						draw.Color(80, 120, 255, 100)
+						cr, cg, cb, ca = 80, 200, 255, 160
 					end
-					Common.DrawArrowLine(a, b, 14, 10, false)
+					Common.DrawArrowLine(posA, posB, 14, 10, false, cr, cg, cb, ca)
 				end
 			end
-
-			local moveTarget = PathStringPull.GetMovementTarget(localPos)
-			if moveTarget then
-				draw.Color(255, 255, 255, 220)
-				Common.DrawArrowLine(localPos, moveTarget, 18, 12, false)
-			end
 		end
-	end
 
-	-- Draw direct white arrow from player to current target (the position we're walking to)
-	if G.Menu.Visuals.drawPath then
-		local localPos = G.pLocal and G.pLocal.Origin
 		local targetPos = G.Navigation.currentTargetPos
 		if localPos and targetPos then
-			draw.Color(255, 255, 255, 220) -- White arrow to current target
-			Common.DrawArrowLine(localPos, targetPos, 18, 12, false)
+			Common.DrawArrowLine(localPos, targetPos, 18, 12, false, 255, 255, 255, 220)
 		end
 	end
 
@@ -3276,426 +3264,6 @@ function MathUtils.RoundTo(value, decimals)
 end
 
 return MathUtils
-
-end)
-__bundle_register("NavBot.Navigation.PathStringPull", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-    PathStringPull — process A* area path once after search (Unity-style string pull)
-    Built once from player position at path-find time; runtime only walks cached apexes.
-]]
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
-local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
-local NavGeometry = require("NavBot.Navigation.Prediction.NavGeometry")
-local NavPortal = require("NavBot.Navigation.Prediction.NavPortal")
-local Node = require("NavBot.Navigation.Node")
-
-local PathStringPull = {}
-
-local WALL_BAND = 32
-local APEX_TOUCH = 16
-local PORTAL_PLANE_MARGIN = 8
-
-local function horizontalDir(from, to)
-	local dx = to.x - from.x
-	local dy = to.y - from.y
-	local len = math.sqrt(dx * dx + dy * dy)
-	if len < 0.001 then
-		return nil
-	end
-	return Vector3(dx / len, dy / len, 0)
-end
-
-local function horizontalUnit(vec)
-	if not vec then
-		return nil
-	end
-	local flat = Vector3(vec.x, vec.y, 0)
-	local len = flat:Length2D()
-	if len < 0.001 then
-		return nil
-	end
-	return flat / len
-end
-
-local function getPassDirDotThreshold()
-	return G.Misc.NodePassDirDotThreshold or 0.5
-end
-
-local function getTouchDistance()
-	return G.Misc.NodeTouchDistance or APEX_TOUCH
-end
-
-local function getOvershootTouchDistance()
-	return G.Misc.NodeOvershootTouchDistance or 48
-end
-
-local function getGroundZOnNode(pos, node)
-	if not node.nw or not node.ne or not node.sw then
-		return node._floorZ or node.pos.z
-	end
-
-	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
-	local dx = pos.x - nw.x
-	local dy = pos.y - nw.y
-	local dxNe = ne.x - nw.x
-	local dySe = se.y - nw.y
-	local inTri1 = (dxNe ~= 0 or dySe ~= 0) and (dx / dxNe + dy / dySe) <= 1.0
-
-	local v0, v1, v2 = nw, ne, se
-	if not inTri1 then
-		v0, v1, v2 = nw, se, sw
-	end
-
-	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
-	if math.abs(denom) < 0.0001 then
-		return v0.z
-	end
-
-	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
-	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
-	local w2 = 1.0 - w0 - w1
-	return w0 * v0.z + w1 * v1.z + w2 * v2.z
-end
-
-local function withGroundZ(point, node)
-	if not point or not node then
-		return point
-	end
-	return Vector3(point.x, point.y, getGroundZOnNode(point, node))
-end
-
-local function getExitDirBetween(area, nextArea)
-	local dir = horizontalDir(area.pos, nextArea.pos)
-	if not dir then
-		return nil
-	end
-	local _exitPt, _dist, exitDir = NavGeometry.FindNodeExit(area.pos, dir, area)
-	return exitDir
-end
-
-local function hasDoorOnExitEdge(area, exitDir)
-	if not exitDir or not area.c then
-		return false
-	end
-
-	local nodes = G.Navigation and G.Navigation.nodes
-	if not nodes then
-		return false
-	end
-
-	local dirData = area.c[exitDir]
-	if not dirData or not dirData.connections then
-		return false
-	end
-
-	for i = 1, #dirData.connections do
-		local targetId = ConnectionUtils.GetNodeId(dirData.connections[i])
-		local target = nodes[targetId]
-		if target and target.isDoor then
-			return true
-		end
-		local idStr = tostring(targetId)
-		if string.find(idStr, "_left") or string.find(idStr, "_middle") or string.find(idStr, "_right") then
-			return true
-		end
-	end
-
-	return false
-end
-
-local function isOnExitWall(point, area, exitDir)
-	if not point or not area._minX or not exitDir then
-		return false
-	end
-
-	if exitDir == 3 then
-		return point.y >= area._maxY - WALL_BAND
-	end
-	if exitDir == 1 then
-		return point.y <= area._minY + WALL_BAND
-	end
-	if exitDir == 2 then
-		return point.x >= area._maxX - WALL_BAND
-	end
-	if exitDir == 4 then
-		return point.x <= area._minX + WALL_BAND
-	end
-
-	return false
-end
-
-local function needsCenterBeforePortal(fromPoint, area, exitDir)
-	if not hasDoorOnExitEdge(area, exitDir) then
-		return false
-	end
-	return isOnExitWall(fromPoint, area, exitDir)
-end
-
-local function getPortalPoint(area, nextArea, exitDir)
-	if not exitDir then
-		return withGroundZ(nextArea.pos, area)
-	end
-
-	local portalMin, portalMax = NavPortal.GetSharedPortalSpan(area, nextArea, exitDir)
-	if not portalMin then
-		return withGroundZ(nextArea.pos, area)
-	end
-
-	local mid = (portalMin + portalMax) * 0.5
-	local x
-	local y
-	local z = area.pos.z
-
-	if exitDir == 2 then
-		x = area._maxX
-		y = mid
-	elseif exitDir == 4 then
-		x = area._minX
-		y = mid
-	elseif exitDir == 3 then
-		x = mid
-		y = area._maxY
-	else
-		x = mid
-		y = area._minY
-	end
-
-	return withGroundZ(Vector3(x, y, z), area)
-end
-
-local function pushApex(apexes, pos, kind, areaId, nextAreaId, passDir)
-	if not pos then
-		return
-	end
-
-	local last = apexes[#apexes]
-	if last and Common.Distance2D(last.pos, pos) < 4 then
-		return
-	end
-
-	apexes[#apexes + 1] = {
-		pos = pos,
-		kind = kind,
-		areaId = areaId,
-		nextAreaId = nextAreaId,
-		passDir = passDir,
-	}
-end
-
-local function findSegmentPortalApex(currentId, nextId)
-	local apexes = G.Navigation.apexPath
-	if not apexes then
-		return nil
-	end
-
-	for i = 1, #apexes do
-		local apex = apexes[i]
-		if apex.kind == "portal" and apex.areaId == currentId and apex.nextAreaId == nextId then
-			return apex, i
-		end
-	end
-
-	return nil
-end
-
-local function hasCrossedPortalPlane(playerPos, portalPos, passDir, margin)
-	if not (playerPos and portalPos and passDir) then
-		return false
-	end
-
-	local dx = playerPos.x - portalPos.x
-	local dy = playerPos.y - portalPos.y
-	return (dx * passDir.x + dy * passDir.y) >= (margin or PORTAL_PLANE_MARGIN)
-end
-
-local function hasPortalTouch(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local touch = getTouchDistance()
-	if Common.Distance2D(playerPos, portalPos) > touch then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
-local function hasPortalOvershoot(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local dist2D = Common.Distance2D(playerPos, portalPos)
-	if dist2D > getOvershootTouchDistance() then
-		return false
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not (track and track.nodeId == currentNode.id and track.dirToTarget) then
-		return false
-	end
-
-	local dirNow = horizontalDir(playerPos, portalPos)
-	if not dirNow then
-		dirNow = horizontalUnit(G.BotIntendedWishDir)
-	end
-	if not dirNow then
-		return false
-	end
-
-	local dirDot = track.dirToTarget:Dot(dirNow)
-	if dirDot >= getPassDirDotThreshold() then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
-local function hasPassedPortalApex(playerPos, apex, currentNode)
-	if not (apex and apex.pos) then
-		return false
-	end
-
-	if apex.kind ~= "portal" then
-		return Common.Distance2D(playerPos, apex.pos) <= getTouchDistance()
-	end
-
-	if hasPortalTouch(playerPos, apex.pos, currentNode) then
-		return true
-	end
-	if apex.passDir and hasCrossedPortalPlane(playerPos, apex.pos, apex.passDir) then
-		return true
-	end
-	if hasPortalOvershoot(playerPos, apex.pos, currentNode) then
-		return true
-	end
-
-	return false
-end
-
---- Run once after A* — startPos is player position at path-find time.
-function PathStringPull.ProcessAreaPath(areaPath, goalPos, startPos)
-	local apexes = {}
-
-	if not areaPath or #areaPath == 0 then
-		if goalPos then
-			pushApex(apexes, goalPos, "goal", nil, nil, nil)
-		end
-		return apexes
-	end
-
-	local lastPos = startPos or areaPath[1].pos
-
-	for i = 1, #areaPath - 1 do
-		local area = areaPath[i]
-		local nextArea = areaPath[i + 1]
-		if not (area and nextArea and area.pos and nextArea.pos) then
-			goto continue_segment
-		end
-
-		local exitDir = getExitDirBetween(area, nextArea)
-		local portalPos = getPortalPoint(area, nextArea, exitDir)
-		local passDir = horizontalDir(portalPos, withGroundZ(nextArea.pos, nextArea))
-
-		if needsCenterBeforePortal(lastPos, area, exitDir) then
-			pushApex(apexes, withGroundZ(area.pos, area), "center", area.id, nextArea.id, nil)
-			lastPos = area.pos
-		end
-
-		pushApex(apexes, portalPos, "portal", area.id, nextArea.id, passDir)
-		lastPos = portalPos
-
-		::continue_segment::
-	end
-
-	if goalPos then
-		pushApex(apexes, goalPos, "goal", nil, nil, nil)
-	end
-
-	return apexes
-end
-
-function PathStringPull.GetMovementTarget(playerPos)
-	local apexes = G.Navigation.apexPath
-	if not apexes or #apexes == 0 then
-		return G.Navigation.goalPos
-	end
-
-	local path = G.Navigation.path
-	local currentNode = path and path[1]
-	local idx = G.Navigation.apexIndex or 1
-
-	while idx <= #apexes do
-		local apex = apexes[idx]
-		if not hasPassedPortalApex(playerPos, apex, currentNode) then
-			break
-		end
-		idx = idx + 1
-	end
-
-	if idx > #apexes then
-		idx = #apexes
-	end
-
-	G.Navigation.apexIndex = idx
-	return apexes[idx].pos
-end
-
-function PathStringPull.HasEnteredNextArea(playerPos, nextArea)
-	if not nextArea then
-		return false
-	end
-	local playerArea = Node.GetAreaAtPosition(playerPos)
-	return playerArea ~= nil and playerArea.id == nextArea.id
-end
-
---- True when we effectively walked through the segment portal (plane, touch, or overshoot dot).
-function PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
-	if not (currentNode and nextNode) then
-		return false, nil
-	end
-
-	local portalApex = findSegmentPortalApex(currentNode.id, nextNode.id)
-	local portalPos = portalApex and portalApex.pos
-	local passDir = portalApex and portalApex.passDir
-
-	local crossedPlane = portalPos and passDir and hasCrossedPortalPlane(playerPos, portalPos, passDir)
-	local portalTouch = portalPos and hasPortalTouch(playerPos, portalPos, currentNode)
-	local portalOvershoot = portalPos and hasPortalOvershoot(playerPos, portalPos, currentNode)
-	local portalPassed = crossedPlane or portalTouch or portalOvershoot
-
-	if portalPassed then
-		if crossedPlane then
-			return true, "portal_plane"
-		end
-		if portalTouch then
-			return true, "portal_touch"
-		end
-		return true, "portal_overshoot"
-	end
-
-	local insideNext = PathStringPull.HasEnteredNextArea(playerPos, nextNode)
-	if insideNext then
-		if not portalApex then
-			return true, "inside_next"
-		end
-		if portalPassed then
-			return true, "inside_next"
-		end
-		-- Overlap: only advance when we've left the current area bbox
-		if not AreaSpatial.IsWithinArea(playerPos, currentNode) then
-			return true, "inside_next"
-		end
-	end
-
-	return false, nil
-end
-
-return PathStringPull
 
 end)
 __bundle_register("NavBot.Navigation.Node", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -4883,19 +4451,34 @@ __bundle_register("NavBot.Navigation.AreaSpatial", function(require, _LOADED, __
 --  AreaSpatial.lua  ·  AABB distance, containment, and grid indexing
 --##########################################################################
 --
---  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps only tilt
---  the floor plane. Containment = horizontal AABB + vertical band above floor.
+--  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps tilt the floor.
+--  Containment = horizontal AABB + vertical band above local floor (82 up, 8 down).
+
+local G = require("NavBot.Core.Globals")
+local NavGeometry = require("NavBot.Navigation.Prediction.NavGeometry")
 
 local AreaSpatial = {}
 
 local GRID_CELL_SIZE = 256
 
--- Upright player slack relative to area floor (matches G.Misc.NodeTouchHeight ≈ 82)
 AreaSpatial.Z_PAD_BELOW = 8
 AreaSpatial.Z_PAD_ABOVE = 82
 
 local Z_PAD_BELOW = AreaSpatial.Z_PAD_BELOW
-local Z_PAD_ABOVE = AreaSpatial.Z_PAD_ABOVE
+
+local function getZPadAbove()
+	return (G.Misc and G.Misc.NodeTouchHeight) or AreaSpatial.Z_PAD_ABOVE
+end
+
+local function getLocalFloorZ(pos, node)
+	if node.nw and node.ne and node.sw and node.se then
+		local z = NavGeometry.GetGroundZFromQuad(pos, node)
+		if z then
+			return z
+		end
+	end
+	return node._floorZ
+end
 
 --- Precompute floor Z and vertical query band on a normalized node.
 function AreaSpatial.PrecomputeVerticalBounds(node)
@@ -4903,13 +4486,14 @@ function AreaSpatial.PrecomputeVerticalBounds(node)
 		return
 	end
 
-	local floorZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
-	node._floorZ = floorZ
-	node._minZ = floorZ - Z_PAD_BELOW
-	node._maxZ = floorZ + Z_PAD_ABOVE
+	local minZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	local maxZ = math.max(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	node._floorZ = minZ
+	node._minZ = minZ - Z_PAD_BELOW
+	node._maxZ = maxZ + getZPadAbove()
 end
 
---- Horizontal axis-aligned footprint + vertical band (82 up, 8 down from floor).
+--- Horizontal AABB + vertical band (NodeTouchHeight above local floor, 8 below).
 function AreaSpatial.IsWithinArea(pos, node)
 	if not node or not node._minX then
 		return false
@@ -4922,13 +4506,14 @@ function AreaSpatial.IsWithinArea(pos, node)
 		return false
 	end
 
-	local floorZ = node._floorZ
+	local floorZ = getLocalFloorZ(pos, node)
 	if not floorZ then
 		return true
 	end
 
+	local zPadAbove = getZPadAbove()
 	local heightAboveFloor = pos.z - floorZ
-	return heightAboveFloor <= Z_PAD_ABOVE and heightAboveFloor >= -Z_PAD_BELOW
+	return heightAboveFloor <= zPadAbove and heightAboveFloor >= -Z_PAD_BELOW
 end
 
 --- Squared distance from a point to the XY footprint + Z query band (0 if inside).
@@ -5076,6 +4661,142 @@ function AreaSpatial.GetGridCellSize()
 end
 
 return AreaSpatial
+
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavGeometry", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPortal, NavPredict ]]
+
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local Common = require("NavBot.Core.Common")
+
+local NavGeometry = {}
+
+local UP_VECTOR = NavConstants.UP_VECTOR
+
+function NavGeometry.ProjectXYOntoGoalLine(x, y, lineOrigin, lineDir)
+	local px = x - lineOrigin.x
+	local py = y - lineOrigin.y
+	local along = px * lineDir.x + py * lineDir.y
+	return lineOrigin.x + lineDir.x * along, lineOrigin.y + lineDir.y * along
+end
+
+function NavGeometry.FindNodeExit(startPos, dir, node)
+	local minX, maxX = node._minX, node._maxX
+	local minY, maxY = node._minY, node._maxY
+
+	local tMin = math.huge
+	local exitX, exitY
+	local exitDir = nil
+
+	if dir.x > 0 then
+		local t = (maxX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = maxX
+			exitY = startPos.y + dir.y * t
+			exitDir = 2
+		end
+	elseif dir.x < 0 then
+		local t = (minX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = minX
+			exitY = startPos.y + dir.y * t
+			exitDir = 4
+		end
+	end
+
+	if dir.y > 0 then
+		local t = (maxY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = maxY
+			exitDir = 3
+		end
+	elseif dir.y < 0 then
+		local t = (minY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = minY
+			exitDir = 1
+		end
+	end
+
+	if tMin == math.huge then
+		return nil, nil, nil
+	end
+	return Vector3(exitX, exitY, startPos.z), tMin, exitDir
+end
+
+function NavGeometry.GetGroundZFromQuad(pos, node)
+	if not (node.nw and node.ne and node.sw and node.se) then
+		return nil, nil
+	end
+
+	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
+	local dx = pos.x - nw.x
+	local dy = pos.y - nw.y
+	local dx_ne = ne.x - nw.x
+	local dy_se = se.y - nw.y
+	local inTriangle1 = (dx / dx_ne + dy / dy_se) <= 1.0
+
+	local v0, v1, v2
+	if inTriangle1 then
+		v0, v1, v2 = nw, ne, se
+	else
+		v0, v1, v2 = nw, se, sw
+	end
+
+	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
+	if math.abs(denom) < 0.0001 then
+		return v0.z, UP_VECTOR
+	end
+
+	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
+	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
+	local w2 = 1.0 - w0 - w1
+	local z = w0 * v0.z + w1 * v1.z + w2 * v2.z
+
+	local edge1 = v1 - v0
+	local edge2 = v2 - v0
+	local normal = edge1:Cross(edge2)
+	normal = Common.Normalize(normal)
+	if not normal then
+		normal = UP_VECTOR
+	end
+
+	return z, normal
+end
+
+function NavGeometry.IsPointInNodeBounds(point, node, tolerance)
+	tolerance = tolerance or 0
+	local inX = point.x >= (node._minX - tolerance) and point.x <= (node._maxX + tolerance)
+	local inY = point.y >= (node._minY - tolerance) and point.y <= (node._maxY + tolerance)
+	return inX and inY
+end
+
+return NavGeometry
+
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavConstants", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavGeometry, NavTrace, NavPredict ]]
+
+local NavConstants = {}
+
+NavConstants.PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
+NavConstants.STEP_HEIGHT = 18
+NavConstants.JUMP_HEIGHT = 72
+NavConstants.MAX_FALL_DISTANCE = 250
+NavConstants.UP_VECTOR = Vector3(0, 0, 1)
+NavConstants.MAX_ITERATIONS = 37
+NavConstants.OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
+NavConstants.SLOPE_WAYPOINT_Z_DIFF = 8
+NavConstants.DOOR_HALF_WIDTH = 12 -- matches DoorGeometry HITBOX_WIDTH / 2
+NavConstants.DOOR_SNAP_TOLERANCE = 24 -- snap straight-line exit onto nearest door portal
+
+return NavConstants
 
 end)
 __bundle_register("NavBot.Navigation.Setup.Phase3_KDTree", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -6264,678 +5985,6 @@ return {
 }
 
 end)
-__bundle_register("NavBot.Navigation.Prediction.NavPortal", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[ Imported by: NavPredict ]]
-
-local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
-local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
-
-local NavPortal = {}
-
-local OPPOSITE_EXIT_DIR = NavConstants.OPPOSITE_EXIT_DIR
-local DOOR_HALF_WIDTH = NavConstants.DOOR_HALF_WIDTH
-local DOOR_SNAP_TOLERANCE = NavConstants.DOOR_SNAP_TOLERANCE
-
-local function isAreaNode(node)
-	return node and node._minX and node._maxX and node._minY and node._maxY
-end
-
-local function getConnectionId(connection)
-	if type(connection) == "table" then
-		return connection.node or connection.id
-	end
-	return connection
-end
-
-local function getFacingEdgeSpan(area, exitDir)
-	local nw, ne, sw, se = area.nw, area.ne, area.sw, area.se
-	if nw and ne and sw and se then
-		if exitDir == 2 then
-			return math.min(ne.y, se.y), math.max(ne.y, se.y)
-		elseif exitDir == 4 then
-			return math.min(nw.y, sw.y), math.max(nw.y, sw.y)
-		elseif exitDir == 3 then
-			return math.min(sw.x, se.x), math.max(sw.x, se.x)
-		elseif exitDir == 1 then
-			return math.min(nw.x, ne.x), math.max(nw.x, ne.x)
-		end
-	end
-
-	if exitDir == 2 or exitDir == 4 then
-		return area._minY, area._maxY
-	end
-	return area._minX, area._maxX
-end
-
-function NavPortal.GetSharedPortalSpan(currentNode, neighborNode, exitDir)
-	local aMin, aMax = getFacingEdgeSpan(currentNode, exitDir)
-	local oppDir = OPPOSITE_EXIT_DIR[exitDir]
-	local bMin, bMax = getFacingEdgeSpan(neighborNode, oppDir)
-	local portalMin = math.max(aMin, bMin)
-	local portalMax = math.min(aMax, bMax)
-	if portalMax <= portalMin then
-		return nil, nil
-	end
-	return portalMin, portalMax
-end
-
-local function getSharedAxisCoord(point, exitDir)
-	if exitDir == 2 or exitDir == 4 then
-		return point.y
-	end
-	return point.x
-end
-
-local function setSharedAxisCoord(point, exitDir, coord)
-	if exitDir == 2 or exitDir == 4 then
-		return Vector3(point.x, coord, point.z)
-	end
-	return Vector3(coord, point.y, point.z)
-end
-
-local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
-	local coord = getSharedAxisCoord(exitPoint, exitDir)
-	return coord >= portalMin and coord <= portalMax
-end
-
-local function distanceToSpan(coord, portalMin, portalMax)
-	if coord < portalMin then
-		return portalMin - coord
-	end
-	if coord > portalMax then
-		return coord - portalMax
-	end
-	return 0
-end
-
-local function clampToSpan(coord, portalMin, portalMax)
-	if coord < portalMin then
-		return portalMin
-	end
-	if coord > portalMax then
-		return portalMax
-	end
-	return coord
-end
-
-local function getDoorPortalSpan(doorNode, exitDir)
-	if not doorNode or not doorNode.pos then
-		return nil, nil
-	end
-	local center = getSharedAxisCoord(doorNode.pos, exitDir)
-	return center - DOOR_HALF_WIDTH, center + DOOR_HALF_WIDTH
-end
-
-local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
-	local targetId = getConnectionId(connection)
-	local target = nodes[targetId]
-	if not target then
-		return nil
-	end
-
-	if target.isDoor then
-		if target.areaId == currentNodeId then
-			return nodes[target.targetAreaId]
-		end
-		if target.targetAreaId == currentNodeId then
-			return nodes[target.areaId]
-		end
-	end
-
-	if isAreaNode(target) then
-		if target.id ~= currentNodeId then
-			return target
-		end
-		return nil
-	end
-
-	local pair = string.match(tostring(targetId), "^(%d+_%d+)_")
-	if pair then
-		local areaA, areaB = string.match(pair, "^(%d+)_(%d+)$")
-		if areaA and areaB then
-			areaA = tonumber(areaA)
-			areaB = tonumber(areaB)
-			if areaA == currentNodeId then
-				return nodes[areaB]
-			end
-			if areaB == currentNodeId then
-				return nodes[areaA]
-			end
-		end
-	end
-
-	return nil
-end
-
-local function logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, doorsOnly, doorId)
-	if doorsOnly and doorId then
-		NavDebug.Log(
-			string.format(
-				"[NavPredict]   Door portal dir=%d door=%s area=%d: coord=%.1f span=[%.1f,%.1f]",
-				exitDir,
-				tostring(doorId),
-				neighborArea.id,
-				exitCoord,
-				portalMin,
-				portalMax
-			)
-		)
-	else
-		NavDebug.Log(
-			string.format(
-				"[NavPredict]   Edge portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
-				exitDir,
-				neighborArea.id,
-				exitCoord,
-				portalMin,
-				portalMax
-			)
-		)
-	end
-end
-
-local function collectDoorCandidates(currentNode, exitDir, nodes)
-	local dirData = currentNode.c[exitDir]
-	if not dirData or not dirData.connections then
-		return {}
-	end
-
-	local candidates = {}
-	for i = 1, #dirData.connections do
-		local connection = dirData.connections[i]
-		local connectionId = getConnectionId(connection)
-		local doorNode = nodes[connectionId]
-		if doorNode and doorNode.isDoor then
-			local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
-			local portalMin, portalMax = getDoorPortalSpan(doorNode, exitDir)
-			if neighborArea and portalMin then
-				candidates[#candidates + 1] = {
-					connectionId = connectionId,
-					neighborArea = neighborArea,
-					portalMin = portalMin,
-					portalMax = portalMax,
-				}
-			end
-		end
-	end
-	return candidates
-end
-
-local function findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
-	local candidates = collectDoorCandidates(currentNode, exitDir, nodes)
-	if #candidates == 0 then
-		return nil, nil
-	end
-
-	for i = 1, #candidates do
-		local candidate = candidates[i]
-		NavDebug.RecordPortalSpan(currentNode, exitDir, candidate.portalMin, candidate.portalMax, true)
-		if isExitInPortal(exitPoint, exitDir, candidate.portalMin, candidate.portalMax) then
-			logPortalResult(
-				exitCoord,
-				exitDir,
-				candidate.neighborArea,
-				candidate.portalMin,
-				candidate.portalMax,
-				true,
-				candidate.connectionId
-			)
-			return candidate.neighborArea, nil
-		end
-	end
-
-	local bestCandidate = nil
-	local bestDistance = math.huge
-	for i = 1, #candidates do
-		local candidate = candidates[i]
-		local distance = distanceToSpan(exitCoord, candidate.portalMin, candidate.portalMax)
-		if distance < bestDistance then
-			bestDistance = distance
-			bestCandidate = candidate
-		end
-	end
-
-	if bestCandidate and bestDistance <= DOOR_SNAP_TOLERANCE then
-		local snappedCoord = clampToSpan(exitCoord, bestCandidate.portalMin, bestCandidate.portalMax)
-		local snappedExit = setSharedAxisCoord(exitPoint, exitDir, snappedCoord)
-		NavDebug.Log(
-			string.format(
-				"[NavPredict]   Door snap dir=%d door=%s area=%d: %.1f -> %.1f (dist=%.1f) span=[%.1f,%.1f]",
-				exitDir,
-				tostring(bestCandidate.connectionId),
-				bestCandidate.neighborArea.id,
-				exitCoord,
-				snappedCoord,
-				bestDistance,
-				bestCandidate.portalMin,
-				bestCandidate.portalMax
-			)
-		)
-		return bestCandidate.neighborArea, snappedExit
-	end
-
-	for i = 1, #candidates do
-		local candidate = candidates[i]
-		NavDebug.Log(
-			string.format(
-				"[NavPredict]   Skip door=%s area=%d: coord=%.1f outside [%.1f,%.1f]",
-				tostring(candidate.connectionId),
-				candidate.neighborArea.id,
-				exitCoord,
-				candidate.portalMin,
-				candidate.portalMax
-			)
-		)
-	end
-	return nil, nil
-end
-
-local function tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
-	local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
-	if not neighborArea or checkedNeighborIds[neighborArea.id] then
-		return nil
-	end
-	checkedNeighborIds[neighborArea.id] = true
-
-	local portalMin, portalMax = NavPortal.GetSharedPortalSpan(currentNode, neighborArea, exitDir)
-	if not portalMin then
-		return nil
-	end
-
-	NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, false)
-
-	if isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
-		logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, false, nil)
-		return neighborArea
-	end
-
-	NavDebug.Log(
-		string.format(
-			"[NavPredict]   Skip area=%d: coord=%.1f outside [%.1f,%.1f]",
-			neighborArea.id,
-			exitCoord,
-			portalMin,
-			portalMax
-		)
-	)
-	return nil
-end
-
-function NavPortal.FindNeighborAtExit(currentNode, exitPoint, exitDir, nodes, doorsOnly)
-	local dirData = currentNode.c[exitDir]
-	if not dirData or not dirData.connections then
-		return nil, nil
-	end
-
-	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
-
-	if doorsOnly then
-		local neighborArea, snappedExit = findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
-		if neighborArea then
-			return neighborArea, snappedExit
-		end
-		NavDebug.Log(
-			string.format("[NavPredict] FAIL: coord %.1f not in any door portal on dir %d (wall)", exitCoord, exitDir)
-		)
-		return nil, nil
-	end
-
-	local checkedNeighborIds = {}
-	for i = 1, #dirData.connections do
-		local connection = dirData.connections[i]
-		local neighborArea =
-			tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
-		if neighborArea then
-			return neighborArea, nil
-		end
-	end
-
-	NavDebug.Log(string.format("[NavPredict] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
-	return nil, nil
-end
-
-return NavPortal
-
-end)
-__bundle_register("NavBot.Navigation.Prediction.NavDebug", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[ Imported by: NavPortal, NavTrace, NavPredict, isNavigable ]]
-
-local Common = require("NavBot.Core.Common")
-
-local NavDebug = {}
-
-local enabled = false
-local hullTraces = {}
-local portalSpans = {}
-local debugWaypoints = nil
-local debugLastResult = nil
-local debugFailLine = nil
-
-local function isLogMuted()
-	return engine.Con_IsVisible() or engine.IsGameUIVisible()
-end
-
-function NavDebug.IsEnabled()
-	return enabled
-end
-
-function NavDebug.SetEnabled(value)
-	enabled = value == true
-	if not enabled then
-		hullTraces = {}
-		portalSpans = {}
-		debugWaypoints = nil
-		debugLastResult = nil
-		debugFailLine = nil
-	end
-end
-
-function NavDebug.Log(message)
-	if not enabled or isLogMuted() then
-		return
-	end
-	print(message)
-end
-
-function NavDebug.BeginRun()
-	if not enabled then
-		return
-	end
-	hullTraces = {}
-	portalSpans = {}
-	debugFailLine = nil
-end
-
-function NavDebug.SavePath(waypoints)
-	if not enabled then
-		return
-	end
-	local snapshot = {}
-	for i = 1, #waypoints do
-		local wp = waypoints[i]
-		snapshot[i] = {
-			pos = wp.pos,
-			nodeId = wp.node and wp.node.id or nil,
-		}
-	end
-	debugWaypoints = snapshot
-end
-
-function NavDebug.SetResult(isNavigable)
-	if enabled then
-		debugLastResult = isNavigable == true
-	end
-end
-
-function NavDebug.SaveFail(fromPos, toPos)
-	if not enabled or not fromPos or not toPos then
-		return
-	end
-	debugFailLine = { from = fromPos, to = toPos }
-end
-
-function NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, isDoorPortal)
-	if not enabled or not currentNode then
-		return
-	end
-	table.insert(portalSpans, {
-		node = currentNode,
-		exitDir = exitDir,
-		portalMin = portalMin,
-		portalMax = portalMax,
-		isDoorPortal = isDoorPortal == true,
-	})
-end
-
-function NavDebug.RecordHullTrace(startPos, endPos, blocked)
-	if not enabled then
-		return
-	end
-	table.insert(hullTraces, {
-		startPos = startPos,
-		endPos = endPos,
-		blocked = blocked,
-	})
-end
-
-function NavDebug.GetWaypoints()
-	return debugWaypoints
-end
-
-function NavDebug.GetHullTraceCount()
-	return #hullTraces
-end
-
-local function drawWorldLine(a, b)
-	local w2sA = client.WorldToScreen(a)
-	local w2sB = client.WorldToScreen(b)
-	if w2sA and w2sB then
-		draw.Line(w2sA[1], w2sA[2], w2sB[1], w2sB[2])
-	end
-end
-
-local function setPathDrawColor(isNavigable)
-	if isNavigable then
-		draw.Color(0, 255, 0, 255)
-	else
-		draw.Color(255, 0, 0, 255)
-	end
-end
-
-function NavDebug.Draw()
-	if not enabled then
-		return
-	end
-
-	if debugWaypoints and #debugWaypoints >= 1 and debugLastResult ~= nil then
-		setPathDrawColor(debugLastResult)
-
-		for i = 1, #debugWaypoints - 1 do
-			local a = debugWaypoints[i].pos
-			local b = debugWaypoints[i + 1].pos
-			if a and b then
-				Common.DrawArrowLine(a, b, 8, 14, false)
-			end
-		end
-
-		for i = 1, #debugWaypoints do
-			local wp = debugWaypoints[i]
-			if wp.pos then
-				setPathDrawColor(debugLastResult)
-				drawWorldLine(wp.pos, wp.pos + Vector3(0, 0, 20))
-			end
-		end
-	end
-
-	if debugFailLine and debugFailLine.from and debugFailLine.to then
-		draw.Color(255, 0, 0, 255)
-		Common.DrawArrowLine(debugFailLine.from, debugFailLine.to, 12, 22, false)
-		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32))
-	end
-
-	for _, portal in ipairs(portalSpans) do
-		local node = portal.node
-		local z = node.pos and node.pos.z or 0
-		local wallPos
-		if portal.exitDir == 2 then
-			wallPos = node._maxX
-		elseif portal.exitDir == 4 then
-			wallPos = node._minX
-		elseif portal.exitDir == 3 then
-			wallPos = node._maxY
-		else
-			wallPos = node._minY
-		end
-
-		if portal.isDoorPortal then
-			draw.Color(255, 200, 0, 255)
-		else
-			draw.Color(0, 200, 255, 255)
-		end
-
-		local a
-		local b
-		if portal.exitDir == 2 or portal.exitDir == 4 then
-			a = Vector3(wallPos, portal.portalMin, z)
-			b = Vector3(wallPos, portal.portalMax, z)
-		else
-			a = Vector3(portal.portalMin, wallPos, z)
-			b = Vector3(portal.portalMax, wallPos, z)
-		end
-		drawWorldLine(a, b)
-	end
-
-	for _, trace in ipairs(hullTraces) do
-		if trace.startPos and trace.endPos then
-			if trace.blocked then
-				draw.Color(255, 0, 0, 255)
-			else
-				draw.Color(0, 80, 255, 255)
-			end
-			Common.DrawArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
-		end
-	end
-end
-
-return NavDebug
-
-end)
-__bundle_register("NavBot.Navigation.Prediction.NavConstants", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[ Imported by: NavGeometry, NavTrace, NavPredict ]]
-
-local NavConstants = {}
-
-NavConstants.PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
-NavConstants.STEP_HEIGHT = 18
-NavConstants.JUMP_HEIGHT = 72
-NavConstants.MAX_FALL_DISTANCE = 250
-NavConstants.UP_VECTOR = Vector3(0, 0, 1)
-NavConstants.MAX_ITERATIONS = 37
-NavConstants.OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
-NavConstants.SLOPE_WAYPOINT_Z_DIFF = 8
-NavConstants.DOOR_HALF_WIDTH = 12 -- matches DoorGeometry HITBOX_WIDTH / 2
-NavConstants.DOOR_SNAP_TOLERANCE = 24 -- snap straight-line exit onto nearest door portal
-
-return NavConstants
-
-end)
-__bundle_register("NavBot.Navigation.Prediction.NavGeometry", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[ Imported by: NavPortal, NavPredict ]]
-
-local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
-local Common = require("NavBot.Core.Common")
-
-local NavGeometry = {}
-
-local UP_VECTOR = NavConstants.UP_VECTOR
-
-function NavGeometry.ProjectXYOntoGoalLine(x, y, lineOrigin, lineDir)
-	local px = x - lineOrigin.x
-	local py = y - lineOrigin.y
-	local along = px * lineDir.x + py * lineDir.y
-	return lineOrigin.x + lineDir.x * along, lineOrigin.y + lineDir.y * along
-end
-
-function NavGeometry.FindNodeExit(startPos, dir, node)
-	local minX, maxX = node._minX, node._maxX
-	local minY, maxY = node._minY, node._maxY
-
-	local tMin = math.huge
-	local exitX, exitY
-	local exitDir = nil
-
-	if dir.x > 0 then
-		local t = (maxX - startPos.x) / dir.x
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = maxX
-			exitY = startPos.y + dir.y * t
-			exitDir = 2
-		end
-	elseif dir.x < 0 then
-		local t = (minX - startPos.x) / dir.x
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = minX
-			exitY = startPos.y + dir.y * t
-			exitDir = 4
-		end
-	end
-
-	if dir.y > 0 then
-		local t = (maxY - startPos.y) / dir.y
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = startPos.x + dir.x * t
-			exitY = maxY
-			exitDir = 3
-		end
-	elseif dir.y < 0 then
-		local t = (minY - startPos.y) / dir.y
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = startPos.x + dir.x * t
-			exitY = minY
-			exitDir = 1
-		end
-	end
-
-	if tMin == math.huge then
-		return nil, nil, nil
-	end
-	return Vector3(exitX, exitY, startPos.z), tMin, exitDir
-end
-
-function NavGeometry.GetGroundZFromQuad(pos, node)
-	if not (node.nw and node.ne and node.sw and node.se) then
-		return nil, nil
-	end
-
-	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
-	local dx = pos.x - nw.x
-	local dy = pos.y - nw.y
-	local dx_ne = ne.x - nw.x
-	local dy_se = se.y - nw.y
-	local inTriangle1 = (dx / dx_ne + dy / dy_se) <= 1.0
-
-	local v0, v1, v2
-	if inTriangle1 then
-		v0, v1, v2 = nw, ne, se
-	else
-		v0, v1, v2 = nw, se, sw
-	end
-
-	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
-	if math.abs(denom) < 0.0001 then
-		return v0.z, UP_VECTOR
-	end
-
-	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
-	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
-	local w2 = 1.0 - w0 - w1
-	local z = w0 * v0.z + w1 * v1.z + w2 * v2.z
-
-	local edge1 = v1 - v0
-	local edge2 = v2 - v0
-	local normal = edge1:Cross(edge2)
-	normal = Common.Normalize(normal)
-	if not normal then
-		normal = UP_VECTOR
-	end
-
-	return z, normal
-end
-
-function NavGeometry.IsPointInNodeBounds(point, node, tolerance)
-	tolerance = tolerance or 0
-	local inX = point.x >= (node._minX - tolerance) and point.x <= (node._maxX + tolerance)
-	local inY = point.y >= (node._minY - tolerance) and point.y <= (node._maxY + tolerance)
-	return inX and inY
-end
-
-return NavGeometry
-
-end)
 __bundle_register("NavBot.Bot.IsNavigableTest", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
     IsNavigable Test Suite
@@ -7004,7 +6053,8 @@ local function BenchmarkStop(startTime, startMemory)
 end
 
 -- Draw 3D box at position
-local function Draw3DBox(size, pos)
+local function Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	local corners = {
 		Vector3(-halfSize, -halfSize, -halfSize),
@@ -7203,6 +6253,8 @@ local IsNavigableTest = {
 }
 
 -- Auto-register callbacks
+callbacks.Unregister("CreateMove", "IsNavigableTest_CreateMove")
+callbacks.Unregister("Draw", "IsNavigableTest_Draw")
 callbacks.Register("CreateMove", "IsNavigableTest_CreateMove", OnCreateMove)
 callbacks.Register("Draw", "IsNavigableTest_Draw", OnDraw)
 
@@ -7547,9 +6599,599 @@ end
 return NavTrace
 
 end)
+__bundle_register("NavBot.Navigation.Prediction.NavDebug", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPortal, NavTrace, NavPredict, isNavigable ]]
+
+local Common = require("NavBot.Core.Common")
+
+local NavDebug = {}
+
+local enabled = false
+local hullTraces = {}
+local portalSpans = {}
+local debugWaypoints = nil
+local debugLastResult = nil
+local debugFailLine = nil
+
+local function isLogMuted()
+	return engine.Con_IsVisible() or engine.IsGameUIVisible()
+end
+
+function NavDebug.IsEnabled()
+	return enabled
+end
+
+function NavDebug.SetEnabled(value)
+	enabled = value == true
+	if not enabled then
+		hullTraces = {}
+		portalSpans = {}
+		debugWaypoints = nil
+		debugLastResult = nil
+		debugFailLine = nil
+	end
+end
+
+function NavDebug.Log(message)
+	if not enabled or isLogMuted() then
+		return
+	end
+	print(message)
+end
+
+function NavDebug.BeginRun()
+	if not enabled then
+		return
+	end
+	hullTraces = {}
+	portalSpans = {}
+	debugFailLine = nil
+end
+
+function NavDebug.SavePath(waypoints)
+	if not enabled then
+		return
+	end
+	local snapshot = {}
+	for i = 1, #waypoints do
+		local wp = waypoints[i]
+		snapshot[i] = {
+			pos = wp.pos,
+			nodeId = wp.node and wp.node.id or nil,
+		}
+	end
+	debugWaypoints = snapshot
+end
+
+function NavDebug.SetResult(isNavigable)
+	if enabled then
+		debugLastResult = isNavigable == true
+	end
+end
+
+function NavDebug.SaveFail(fromPos, toPos)
+	if not enabled or not fromPos or not toPos then
+		return
+	end
+	debugFailLine = { from = fromPos, to = toPos }
+end
+
+function NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, isDoorPortal)
+	if not enabled or not currentNode then
+		return
+	end
+	table.insert(portalSpans, {
+		node = currentNode,
+		exitDir = exitDir,
+		portalMin = portalMin,
+		portalMax = portalMax,
+		isDoorPortal = isDoorPortal == true,
+	})
+end
+
+function NavDebug.RecordHullTrace(startPos, endPos, blocked)
+	if not enabled then
+		return
+	end
+	table.insert(hullTraces, {
+		startPos = startPos,
+		endPos = endPos,
+		blocked = blocked,
+	})
+end
+
+function NavDebug.GetWaypoints()
+	return debugWaypoints
+end
+
+function NavDebug.GetHullTraceCount()
+	return #hullTraces
+end
+
+local function drawWorldLine(a, b, r, g, b, a)
+	draw.Color(r, g, b, a)
+	local w2sA = client.WorldToScreen(a)
+	local w2sB = client.WorldToScreen(b)
+	if w2sA and w2sB then
+		draw.Line(w2sA[1], w2sA[2], w2sB[1], w2sB[2])
+	end
+end
+
+local function getPathDrawColor(isNavigable)
+	if isNavigable then
+		return 0, 255, 0, 255
+	end
+	return 255, 0, 0, 255
+end
+
+function NavDebug.Draw()
+	if not enabled then
+		return
+	end
+
+	if debugWaypoints and #debugWaypoints >= 1 and debugLastResult ~= nil then
+		local pathR, pathG, pathB, pathA = getPathDrawColor(debugLastResult)
+
+		for i = 1, #debugWaypoints - 1 do
+			local a = debugWaypoints[i].pos
+			local b = debugWaypoints[i + 1].pos
+			if a and b then
+				Common.DrawArrowLine(a, b, 8, 14, false, pathR, pathG, pathB, pathA)
+			end
+		end
+
+		for i = 1, #debugWaypoints do
+			local wp = debugWaypoints[i]
+			if wp.pos then
+				drawWorldLine(wp.pos, wp.pos + Vector3(0, 0, 20), pathR, pathG, pathB, pathA)
+			end
+		end
+	end
+
+	if debugFailLine and debugFailLine.from and debugFailLine.to then
+		Common.DrawArrowLine(debugFailLine.from, debugFailLine.to, 12, 22, false, 255, 0, 0, 255)
+		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32), 255, 0, 0, 255)
+	end
+
+	for _, portal in ipairs(portalSpans) do
+		local node = portal.node
+		local z = node.pos and node.pos.z or 0
+		local wallPos
+		if portal.exitDir == 2 then
+			wallPos = node._maxX
+		elseif portal.exitDir == 4 then
+			wallPos = node._minX
+		elseif portal.exitDir == 3 then
+			wallPos = node._maxY
+		else
+			wallPos = node._minY
+		end
+
+		local portalR, portalG, portalB, portalA
+		if portal.isDoorPortal then
+			portalR, portalG, portalB, portalA = 255, 200, 0, 255
+		else
+			portalR, portalG, portalB, portalA = 0, 200, 255, 255
+		end
+
+		local a
+		local b
+		if portal.exitDir == 2 or portal.exitDir == 4 then
+			a = Vector3(wallPos, portal.portalMin, z)
+			b = Vector3(wallPos, portal.portalMax, z)
+		else
+			a = Vector3(portal.portalMin, wallPos, z)
+			b = Vector3(portal.portalMax, wallPos, z)
+		end
+		drawWorldLine(a, b, portalR, portalG, portalB, portalA)
+	end
+
+	for _, trace in ipairs(hullTraces) do
+		if trace.startPos and trace.endPos then
+			local traceR, traceG, traceB, traceA
+			if trace.blocked then
+				traceR, traceG, traceB, traceA = 255, 0, 0, 255
+			else
+				traceR, traceG, traceB, traceA = 0, 80, 255, 255
+			end
+			Common.DrawArrowLine(
+				trace.startPos,
+				trace.endPos - Vector3(0, 0, 0.5),
+				10,
+				20,
+				false,
+				traceR,
+				traceG,
+				traceB,
+				traceA
+			)
+		end
+	end
+end
+
+return NavDebug
+
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavPortal", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPredict, PathStringPull ]]
+
+local G = require("NavBot.Core.Globals")
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
+
+local NavPortal = {}
+
+local OPPOSITE_EXIT_DIR = NavConstants.OPPOSITE_EXIT_DIR
+local DOOR_HALF_WIDTH = NavConstants.DOOR_HALF_WIDTH
+local DOOR_SNAP_TOLERANCE = NavConstants.DOOR_SNAP_TOLERANCE
+
+local function isAreaNode(node)
+	return node and node._minX and node._maxX and node._minY and node._maxY
+end
+
+local function getConnectionId(connection)
+	if type(connection) == "table" then
+		return connection.node or connection.id
+	end
+	return connection
+end
+
+local function getFacingEdgeSpan(area, exitDir)
+	local nw, ne, sw, se = area.nw, area.ne, area.sw, area.se
+	if nw and ne and sw and se then
+		if exitDir == 2 then
+			return math.min(ne.y, se.y), math.max(ne.y, se.y)
+		elseif exitDir == 4 then
+			return math.min(nw.y, sw.y), math.max(nw.y, sw.y)
+		elseif exitDir == 3 then
+			return math.min(sw.x, se.x), math.max(sw.x, se.x)
+		elseif exitDir == 1 then
+			return math.min(nw.x, ne.x), math.max(nw.x, ne.x)
+		end
+	end
+
+	if exitDir == 2 or exitDir == 4 then
+		return area._minY, area._maxY
+	end
+	return area._minX, area._maxX
+end
+
+function NavPortal.GetSharedPortalSpan(currentNode, neighborNode, exitDir)
+	local aMin, aMax = getFacingEdgeSpan(currentNode, exitDir)
+	local oppDir = OPPOSITE_EXIT_DIR[exitDir]
+	local bMin, bMax = getFacingEdgeSpan(neighborNode, oppDir)
+	local portalMin = math.max(aMin, bMin)
+	local portalMax = math.min(aMax, bMax)
+	if portalMax <= portalMin then
+		return nil, nil
+	end
+	return portalMin, portalMax
+end
+
+local function getSharedAxisCoord(point, exitDir)
+	if exitDir == 2 or exitDir == 4 then
+		return point.y
+	end
+	return point.x
+end
+
+local function setSharedAxisCoord(point, exitDir, coord)
+	if exitDir == 2 or exitDir == 4 then
+		return Vector3(point.x, coord, point.z)
+	end
+	return Vector3(coord, point.y, point.z)
+end
+
+local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
+	local coord = getSharedAxisCoord(exitPoint, exitDir)
+	return coord >= portalMin and coord <= portalMax
+end
+
+local function distanceToSpan(coord, portalMin, portalMax)
+	if coord < portalMin then
+		return portalMin - coord
+	end
+	if coord > portalMax then
+		return coord - portalMax
+	end
+	return 0
+end
+
+local function clampToSpan(coord, portalMin, portalMax)
+	if coord < portalMin then
+		return portalMin
+	end
+	if coord > portalMax then
+		return portalMax
+	end
+	return coord
+end
+
+local function getDoorPortalSpan(doorNode, exitDir)
+	if not doorNode or not doorNode.pos then
+		return nil, nil
+	end
+	local center = getSharedAxisCoord(doorNode.pos, exitDir)
+	return center - DOOR_HALF_WIDTH, center + DOOR_HALF_WIDTH
+end
+
+local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
+	local targetId = getConnectionId(connection)
+	local target = nodes[targetId]
+	if not target then
+		return nil
+	end
+
+	if target.isDoor then
+		if target.areaId == currentNodeId then
+			return nodes[target.targetAreaId]
+		end
+		if target.targetAreaId == currentNodeId then
+			return nodes[target.areaId]
+		end
+	end
+
+	if isAreaNode(target) then
+		if target.id ~= currentNodeId then
+			return target
+		end
+		return nil
+	end
+
+	local pair = string.match(tostring(targetId), "^(%d+_%d+)_")
+	if pair then
+		local areaA, areaB = string.match(pair, "^(%d+)_(%d+)$")
+		if areaA and areaB then
+			areaA = tonumber(areaA)
+			areaB = tonumber(areaB)
+			if areaA == currentNodeId then
+				return nodes[areaB]
+			end
+			if areaB == currentNodeId then
+				return nodes[areaA]
+			end
+		end
+	end
+
+	return nil
+end
+
+local function logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, doorsOnly, doorId)
+	if doorsOnly and doorId then
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Door portal dir=%d door=%s area=%d: coord=%.1f span=[%.1f,%.1f]",
+				exitDir,
+				tostring(doorId),
+				neighborArea.id,
+				exitCoord,
+				portalMin,
+				portalMax
+			)
+		)
+	else
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Edge portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
+				exitDir,
+				neighborArea.id,
+				exitCoord,
+				portalMin,
+				portalMax
+			)
+		)
+	end
+end
+
+local function collectDoorCandidates(currentNode, exitDir, nodes)
+	local dirData = currentNode.c[exitDir]
+	if not dirData or not dirData.connections then
+		return {}
+	end
+
+	local candidates = {}
+	for i = 1, #dirData.connections do
+		local connection = dirData.connections[i]
+		local connectionId = getConnectionId(connection)
+		local doorNode = nodes[connectionId]
+		if doorNode and doorNode.isDoor then
+			local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
+			local portalMin, portalMax = getDoorPortalSpan(doorNode, exitDir)
+			if neighborArea and portalMin then
+				candidates[#candidates + 1] = {
+					connectionId = connectionId,
+					neighborArea = neighborArea,
+					portalMin = portalMin,
+					portalMax = portalMax,
+				}
+			end
+		end
+	end
+	return candidates
+end
+
+local function findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
+	local candidates = collectDoorCandidates(currentNode, exitDir, nodes)
+	if #candidates == 0 then
+		return nil, nil
+	end
+
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		NavDebug.RecordPortalSpan(currentNode, exitDir, candidate.portalMin, candidate.portalMax, true)
+		if isExitInPortal(exitPoint, exitDir, candidate.portalMin, candidate.portalMax) then
+			logPortalResult(
+				exitCoord,
+				exitDir,
+				candidate.neighborArea,
+				candidate.portalMin,
+				candidate.portalMax,
+				true,
+				candidate.connectionId
+			)
+			return candidate.neighborArea, nil
+		end
+	end
+
+	local bestCandidate = nil
+	local bestDistance = math.huge
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		local distance = distanceToSpan(exitCoord, candidate.portalMin, candidate.portalMax)
+		if distance < bestDistance then
+			bestDistance = distance
+			bestCandidate = candidate
+		end
+	end
+
+	if bestCandidate and bestDistance <= DOOR_SNAP_TOLERANCE then
+		local snappedCoord = clampToSpan(exitCoord, bestCandidate.portalMin, bestCandidate.portalMax)
+		local snappedExit = setSharedAxisCoord(exitPoint, exitDir, snappedCoord)
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Door snap dir=%d door=%s area=%d: %.1f -> %.1f (dist=%.1f) span=[%.1f,%.1f]",
+				exitDir,
+				tostring(bestCandidate.connectionId),
+				bestCandidate.neighborArea.id,
+				exitCoord,
+				snappedCoord,
+				bestDistance,
+				bestCandidate.portalMin,
+				bestCandidate.portalMax
+			)
+		)
+		return bestCandidate.neighborArea, snappedExit
+	end
+
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Skip door=%s area=%d: coord=%.1f outside [%.1f,%.1f]",
+				tostring(candidate.connectionId),
+				candidate.neighborArea.id,
+				exitCoord,
+				candidate.portalMin,
+				candidate.portalMax
+			)
+		)
+	end
+	return nil, nil
+end
+
+local function tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
+	local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
+	if not neighborArea or checkedNeighborIds[neighborArea.id] then
+		return nil
+	end
+	checkedNeighborIds[neighborArea.id] = true
+
+	local portalMin, portalMax = NavPortal.GetSharedPortalSpan(currentNode, neighborArea, exitDir)
+	if not portalMin then
+		return nil
+	end
+
+	NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, false)
+
+	if isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
+		logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, false, nil)
+		return neighborArea
+	end
+
+	NavDebug.Log(
+		string.format(
+			"[NavPredict]   Skip area=%d: coord=%.1f outside [%.1f,%.1f]",
+			neighborArea.id,
+			exitCoord,
+			portalMin,
+			portalMax
+		)
+	)
+	return nil
+end
+
+--- Exit edge from connection graph (not center-to-center — avoids corner cuts on stairs/slopes).
+function NavPortal.GetExitDirToNeighbor(currentNode, neighborNode)
+	if not (currentNode and neighborNode and currentNode.c) then
+		return nil
+	end
+
+	local nodes = G.Navigation and G.Navigation.nodes
+	if not nodes then
+		return nil
+	end
+
+	for exitDir = 1, 4 do
+		local dirData = currentNode.c[exitDir]
+		if dirData and dirData.connections then
+			for i = 1, #dirData.connections do
+				local neighborArea = resolveConnectionToNeighborArea(dirData.connections[i], currentNode.id, nodes)
+				if neighborArea and neighborArea.id == neighborNode.id then
+					return exitDir
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+--- Door portal span when doorsOnly and a door connects to neighborNode; else shared edge span.
+function NavPortal.GetPortalSpanForNeighbor(currentNode, neighborNode, exitDir, doorsOnly)
+	if doorsOnly and neighborNode and currentNode.c and exitDir then
+		local nodes = G.Navigation and G.Navigation.nodes
+		if nodes then
+			local candidates = collectDoorCandidates(currentNode, exitDir, nodes)
+			for i = 1, #candidates do
+				if candidates[i].neighborArea.id == neighborNode.id then
+					return candidates[i].portalMin, candidates[i].portalMax
+				end
+			end
+		end
+	end
+	return NavPortal.GetSharedPortalSpan(currentNode, neighborNode, exitDir)
+end
+
+function NavPortal.FindNeighborAtExit(currentNode, exitPoint, exitDir, nodes, doorsOnly)
+	local dirData = currentNode.c[exitDir]
+	if not dirData or not dirData.connections then
+		return nil, nil
+	end
+
+	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
+
+	if doorsOnly then
+		local neighborArea, snappedExit = findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
+		if neighborArea then
+			return neighborArea, snappedExit
+		end
+		NavDebug.Log(
+			string.format("[NavPredict] FAIL: coord %.1f not in any door portal on dir %d (wall)", exitCoord, exitDir)
+		)
+		return nil, nil
+	end
+
+	local checkedNeighborIds = {}
+	for i = 1, #dirData.connections do
+		local connection = dirData.connections[i]
+		local neighborArea =
+			tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
+		if neighborArea then
+			return neighborArea, nil
+		end
+	end
+
+	NavDebug.Log(string.format("[NavPredict] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
+	return nil, nil
+end
+
+return NavPortal
+
+end)
 __bundle_register("NavBot.Bot.SmartJump", function(require, _LOADED, __bundle_register, __bundle_modules)
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
+local NavMath = require("NavBot.Utils.NavMath")
 local Log = Common.Log.new("SmartJump")
 
 Log.Level = 0
@@ -7597,6 +7239,7 @@ local SmartJump = {}
 local MAX_PATH_SIM_SEGMENTS = 16
 local SJ_DEBUG_INTERVAL = 22
 local PATH_NODE_ARRIVAL_DIST = 16
+local JUMP_DIR_MIN_DOT = 0.7
 
 local function sjDebugThrottled(key, msg, ...)
 	if not (G.Menu.SmartJump and G.Menu.SmartJump.Debug) then
@@ -7639,11 +7282,7 @@ local function isBotPathfollowing(cmd)
 	if isManualOverride(cmd) then
 		return false
 	end
-	if
-		G.currentState ~= G.States.MOVING
-		and G.currentState ~= G.States.FOLLOWING
-		and G.currentState ~= G.States.STUCK
-	then
+	if G.currentState ~= G.States.MOVING and G.currentState ~= G.States.FOLLOWING then
 		return false
 	end
 	return true
@@ -7652,13 +7291,14 @@ end
 local function getPathSimTargets()
 	local targets = {}
 	local arrival = G.Misc and G.Misc.NodeTouchDistance or PATH_NODE_ARRIVAL_DIST
+	local apexes = G.Navigation.apexPath
+	local startIdx = G.Navigation.apexIndex or 1
 
-	if G.Navigation.waypoints and #G.Navigation.waypoints > 0 then
-		local startIdx = G.Navigation.currentWaypointIndex or 1
-		for i = startIdx, #G.Navigation.waypoints do
-			local wp = G.Navigation.waypoints[i]
-			if wp and wp.pos then
-				targets[#targets + 1] = wp.pos
+	if apexes then
+		for i = startIdx, #apexes do
+			local apex = apexes[i]
+			if apex and apex.pos then
+				targets[#targets + 1] = apex.pos
 			end
 			if #targets >= MAX_PATH_SIM_SEGMENTS then
 				return targets, arrival
@@ -7666,27 +7306,25 @@ local function getPathSimTargets()
 		end
 	end
 
-	if G.Navigation.path then
-		for i = 1, #G.Navigation.path do
-			local node = G.Navigation.path[i]
-			if node and node.pos then
-				targets[#targets + 1] = node.pos
-			end
-			if #targets >= MAX_PATH_SIM_SEGMENTS then
-				break
-			end
-		end
+	if #targets == 0 and G.Navigation.goalPos then
+		targets[1] = G.Navigation.goalPos
 	end
 
 	return targets, arrival
 end
 
-local function horizontalDirTo(fromPos, toPos)
-	local delta = Vector3(toPos.x - fromPos.x, toPos.y - fromPos.y, 0)
-	if delta:Length2D() < 0.01 then
-		return nil
+local horizontalDirTo = NavMath.horizontalDir2D
+
+local function isWalkDirectionPreserved(intendedDir, velocity)
+	if not intendedDir then
+		return false
 	end
-	return Common.Normalize(delta)
+	local len2d = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+	if len2d < 1 then
+		return true
+	end
+	local dot = (velocity.x / len2d) * intendedDir.x + (velocity.y / len2d) * intendedDir.y
+	return dot >= JUMP_DIR_MIN_DOT
 end
 
 -- ============================================================================
@@ -7871,6 +7509,11 @@ local function runSimulationTicks(pLocal, pLocalPos, initialVelocity, jumpPeakTi
 					sjDebugThrottled("payload_skip", "path sim: skip jump near payload")
 					return false
 				end
+				local intendedDir = Common.Normalize(Vector3(initialVelocity.x, initialVelocity.y, 0))
+				if not isWalkDirectionPreserved(intendedDir, newVelocity) then
+					sjDebugThrottled("jump_dir", "path sim: jump rejected — wall deflected velocity")
+					return false
+				end
 
 				G.SmartJump.PredPos = newPos
 				G.SmartJump.HitObstacle = true
@@ -7898,7 +7541,11 @@ local function SmartJumpDetectionPath(pLocal)
 	end
 
 	local currentVel = pLocal:EstimateAbsVelocity()
-	local horizontalSpeed = math.max(currentVel:Length2D(), 450)
+	local horizontalSpeed = currentVel:Length2D()
+	if horizontalSpeed < 1 then
+		return false
+	end
+
 	local tickInterval = globals.TickInterval()
 	if tickInterval <= 0 then
 		tickInterval = 1 / 66.67
@@ -7907,18 +7554,13 @@ local function SmartJumpDetectionPath(pLocal)
 
 	local targetIndex = 1
 	local currentPos = pLocalPos
-	local moveDir = horizontalDirTo(currentPos, targets[targetIndex])
-	if not moveDir then
-		return false
-	end
-
-	local currentVelocity = moveDir * horizontalSpeed
+	local currentVelocity = Vector3(currentVel.x, currentVel.y, currentVel.z)
 
 	for _ = 1, jumpPeakTicks do
 		local targetPos = targets[targetIndex]
-		local toTarget = horizontalDirTo(currentPos, targetPos)
-		if toTarget then
-			currentVelocity = toTarget * horizontalSpeed
+		local walkDir = horizontalDirTo(currentPos, targetPos)
+		if walkDir then
+			currentVelocity = Vector3(walkDir.x * horizontalSpeed, walkDir.y * horizontalSpeed, currentVelocity.z)
 		end
 
 		local dist2d = (Vector3(targetPos.x - currentPos.x, targetPos.y - currentPos.y, 0)):Length2D()
@@ -7928,9 +7570,9 @@ local function SmartJumpDetectionPath(pLocal)
 				sjDebugThrottled("path_end", "path sim: reached end of path (%d nodes)", #targets)
 				break
 			end
-			local nextDir = horizontalDirTo(currentPos, targets[targetIndex])
-			if nextDir then
-				currentVelocity = nextDir * horizontalSpeed
+			walkDir = horizontalDirTo(currentPos, targets[targetIndex])
+			if walkDir then
+				currentVelocity = Vector3(walkDir.x * horizontalSpeed, walkDir.y * horizontalSpeed, currentVelocity.z)
 			end
 		end
 
@@ -7952,19 +7594,24 @@ local function SmartJumpDetectionPath(pLocal)
 				if isNearPayload(newPos) or isNearPayload(currentPos) then
 					return false
 				end
-				G.SmartJump.PredPos = newPos
-				G.SmartJump.HitObstacle = true
-				sjDebugThrottled(
-					"path_jump",
-					"path sim: jump node %d/%d tick %d lip=%.0f",
-					targetIndex,
-					#targets,
-					simTick,
-					(G.SmartJump.LastObstacleHeight or newPos.z) - newPos.z
-				)
-				return true
+				if not isWalkDirectionPreserved(walkDir, newVelocity) then
+					sjDebugThrottled("jump_dir", "path sim: jump rejected — wall deflected velocity")
+				else
+					G.SmartJump.PredPos = newPos
+					G.SmartJump.HitObstacle = true
+					sjDebugThrottled(
+						"path_jump",
+						"path sim: jump node %d/%d tick %d lip=%.0f",
+						targetIndex,
+						#targets,
+						simTick,
+						(G.SmartJump.LastObstacleHeight or newPos.z) - newPos.z
+					)
+					return true
+				end
+			else
+				return false
 			end
-			return false
 		end
 
 		currentPos = newPos
@@ -8087,7 +7734,10 @@ function SmartJump.Main(cmd)
 			SJ.jumpState = SJC.STATE_PREPARE_JUMP
 			Log:Debug("SmartJump: Crouched movement with obstacle detected, initiating jump")
 		else
-			Log:Debug("SmartJump: Crouched movement but no obstacle detected, staying idle")
+			sjDebugThrottled(
+				"crouch_no_obstacle",
+				"SmartJump: Crouched movement but no obstacle detected, staying idle"
+			)
 		end
 	end
 
@@ -8137,7 +7787,8 @@ function SmartJump.Main(cmd)
 						G.SmartJump.LastObstacleHeight
 					)
 				else
-					Log:Debug(
+					sjDebugThrottled(
+						"staying_ducked",
 						"SmartJump: Staying ducked - no obstacle detected at height %.1f",
 						G.SmartJump.LastObstacleHeight
 					)
@@ -8192,14 +7843,6 @@ end
 -- ============================================================================
 -- VISUALIZATION AND CALLBACKS
 -- ============================================================================
-
-local function OnCreateMoveStandalone(cmd)
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or (not pLocal:IsAlive()) then
-		return
-	end
-	SmartJump.Main(cmd)
-end
 
 local function OnDrawSmartJump()
 	local pLocal = entities.GetLocalPlayer()
@@ -8299,11 +7942,66 @@ end
 -- ============================================================================
 
 callbacks.Unregister("CreateMove", "SmartJump.Standalone")
-callbacks.Register("CreateMove", "SmartJump.Standalone", OnCreateMoveStandalone)
 callbacks.Unregister("Draw", "SmartJump.Visual")
 callbacks.Register("Draw", "SmartJump.Visual", OnDrawSmartJump)
 
 return SmartJump
+
+end)
+__bundle_register("NavBot.Utils.NavMath", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+NavMath — shared 2D nav geometry (single source; do not duplicate in path modules)
+]]
+
+local Common = require("NavBot.Core.Common")
+
+local NavMath = {}
+
+function NavMath.horizontalDir2D(from, to)
+	if not (from and to) then
+		return nil
+	end
+	local dx = to.x - from.x
+	local dy = to.y - from.y
+	local len = math.sqrt(dx * dx + dy * dy)
+	if len < 0.001 then
+		return nil
+	end
+	return Vector3(dx / len, dy / len, 0)
+end
+
+function NavMath.horizontalUnit2D(vec)
+	if not vec then
+		return nil
+	end
+	local flat = Vector3(vec.x, vec.y, 0)
+	local len = flat:Length2D()
+	if len < 0.001 then
+		return nil
+	end
+	return flat / len
+end
+
+function NavMath.sharedAxisCoord(point, exitDir)
+	if exitDir == 2 or exitDir == 4 then
+		return point.y
+	end
+	return point.x
+end
+
+function NavMath.isCoordInSpan(coord, spanMin, spanMax, tolerance)
+	if not coord or not spanMin or not spanMax then
+		return false
+	end
+	local margin = tolerance or 0
+	return coord >= (spanMin - margin) and coord <= (spanMax + margin)
+end
+
+function NavMath.distance2D(a, b)
+	return Common.Distance2D(a, b)
+end
+
+return NavMath
 
 end)
 __bundle_register("NavBot.Bot.HealthLogic", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -8352,35 +8050,33 @@ return HealthLogic
 end)
 __bundle_register("NavBot.Bot.MovementDecisions", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
-Movement Decision System - Composition-based bot behavior
-Handles all movement decisions while ensuring walkTo is always called
+Movement Decision System — portal apex steering, segment advance, stuck repath
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
-local PathSteering = require("NavBot.Navigation.PathSteering")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
-local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local NavMoveDebug = require("NavBot.Bot.NavMoveDebug")
 local SmartJump = require("NavBot.Bot.SmartJump")
+local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
 local WorkManager = require("NavBot.WorkManager")
 
 local MovementDecisions = {}
 local Log = Common.Log.new("MovementDecisions")
 
--- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
-
--- Constants for timing and performance
-local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
-local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
-local WALKABILITY_CHECK_COOLDOWN = 5 -- ticks (~83ms) between expensive walkability checks
+local DISTANCE_CHECK_COOLDOWN = 3
 local STUCK_SPEED_RATIO = 0.8
 local STUCK_GRACE_TICKS = 33
 local STUCK_SAME_NODE_TICKS = 200
 local STUCK_SLOW_REPATH_TICKS = 132
+
+local cachedTargetTick = -1
+local cachedTargetPos = nil
+local lastSegmentAdvanceTick = -1
 
 local function getPlayerSpeed2D(pLocal)
 	local velocity = pLocal:EstimateAbsVelocity()
@@ -8398,45 +8094,51 @@ local function isBelowStuckSpeedThreshold(speed2D, maxSpeed)
 end
 
 local function triggerStuckRepath(reason)
-	local StateHandler = require("NavBot.Bot.StateHandler")
-	WorkManager.setWorkCooldown("node_skipping", STUCK_SLOW_REPATH_TICKS)
-	StateHandler.addStuckPenalties()
-	StateHandler.forceRepath(reason)
 	G.Navigation.slowSpeedTicks = 0
 	G.Navigation.currentNodeTicks = 0
-end
 
--- Decision: Check if we've reached the target and advance waypoints/nodes
-function MovementDecisions.checkDistanceAndAdvance(userCmd)
-	local result = { shouldContinue = true }
-	local LocalOrigin = G.pLocal.Origin
-
-	-- Throttled distance calculation for reaching nodes
-	if not WorkManager.attemptWork(DISTANCE_CHECK_COOLDOWN, "distance_check") then
-		return result -- Skip this frame's distance check
+	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
+		return
 	end
 
-	-- In FOLLOWING state we don't advance nodes based on reach distance
+	local path = G.Navigation.path
+	if path and path[1] and path[2] then
+		CircuitBreaker.addFailure(path[1], path[2])
+	end
+	NodeSkipper.BlockSkippingForTicks(STUCK_SLOW_REPATH_TICKS)
+
+	-- Lazy: StateHandler also requires MovementDecisions (circular if at module top).
+	local StateHandler = require("NavBot.Bot.StateHandler")
+	StateHandler.forceRepath(reason, true)
+end
+
+function MovementDecisions.checkDistanceAndAdvance(_userCmd)
+	local result = { shouldContinue = true }
+	local localOrigin = G.pLocal.Origin
+
+	if not WorkManager.attemptWork(DISTANCE_CHECK_COOLDOWN, "distance_check") then
+		return result
+	end
+
 	if G.currentState == G.States.FOLLOWING then
 		return result
 	end
 
-	if MovementDecisions.tryAdvancePathNode(LocalOrigin) then
-		return result
+	if Navigation.AlignPathIfDesynced(localOrigin) then
+		MovementDecisions.resetTargetCache()
+		local path = G.Navigation.path
+		if path and path[1] and G.pLocal and G.pLocal.Origin then
+			PathStringPull.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+		end
+		local feetArea = path and path[1] and path[1].id
+		NavMoveDebug.OnPathAligned(feetArea, path and #path or 0)
 	end
 
-	local targetPos = MovementDecisions.getCurrentTarget()
-	if not targetPos then
-		result.shouldContinue = false
-		return result
-	end
-
-	local horizontalDist = Common.Distance2D(LocalOrigin, targetPos)
-	local verticalDist = math.abs(LocalOrigin.z - targetPos.z)
+	MovementDecisions.tryAdvancePathNode(localOrigin)
 
 	local path = G.Navigation.path
 	if path and #path == 1 and G.Navigation.goalPos then
-		local goalDist = Common.Distance2D(LocalOrigin, G.Navigation.goalPos)
+		local goalDist = Common.Distance2D(localOrigin, G.Navigation.goalPos)
 		if goalDist < (G.Misc.NodeTouchDistance or 16) then
 			Navigation.ClearPath()
 			Log:Info("Reached final goal")
@@ -8450,6 +8152,11 @@ function MovementDecisions.checkDistanceAndAdvance(userCmd)
 end
 
 function MovementDecisions.tryAdvancePathNode(playerPos)
+	local tick = globals.TickCount()
+	if tick == lastSegmentAdvanceTick then
+		return false
+	end
+
 	local path = G.Navigation.path
 	if not path or #path < 2 then
 		return false
@@ -8461,63 +8168,57 @@ function MovementDecisions.tryAdvancePathNode(playerPos)
 		return false
 	end
 
-	local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
-	if not passed then
+	local canAdvance, advanceReason = NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
+	if not canAdvance then
+		NavMoveDebug.OnAdvanceBlocked(playerPos, currentNode, nextNode, advanceReason)
 		return false
 	end
 
-	Log:Debug("Advancing path: left node %s (%s)", tostring(currentNode.id), passReason or "?")
+	lastSegmentAdvanceTick = tick
+	Log:Debug("Advancing path: left node %s (%s)", tostring(currentNode.id), advanceReason or "?")
+	NavMoveDebug.OnAdvanced(currentNode.id, advanceReason)
+	NodeSkipper.NoteAdvance(playerPos, advanceReason)
 	return MovementDecisions.advanceNode()
 end
 
--- Helper: Get current target position
 function MovementDecisions.getCurrentTarget()
+	local tick = globals.TickCount()
+	if tick == cachedTargetTick and cachedTargetPos then
+		return cachedTargetPos
+	end
+
 	local origin = G.pLocal and G.pLocal.Origin
 	local path = G.Navigation.path
+	local target
 	if origin and path and #path > 0 then
-		return PathSteering.getMovementTarget(origin, path, G.Navigation.goalPos)
-	end
-	return G.Navigation.goalPos
-end
-
--- Helper: Check if we've reached the target
-function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance or 16
-	local touchHeight = G.Misc.NodeTouchHeight or 82
-	if G.Navigation.path and #G.Navigation.path > 1 then
-		local currentNode = G.Navigation.path[1]
-		local nextNode = G.Navigation.path[2]
-		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
+		target = PathStringPull.GetMovementTarget(origin)
+	else
+		target = G.Navigation.goalPos
 	end
 
-	-- Mid-air: origin high but still inside nav area vertical band
-	local currentNode = G.Navigation.path and G.Navigation.path[1]
-	if currentNode and not Node.IsDoorNode(currentNode) then
-		if horizontalDist < reachDist and AreaSpatial.IsWithinArea(origin, currentNode) then
-			return true
-		end
-	end
-
-	return (horizontalDist < reachDist) and (verticalDist <= touchHeight)
+	cachedTargetTick = tick
+	cachedTargetPos = target
+	return target
 end
 
--- Reset distance tracking (call when path changes)
-function MovementDecisions.resetDistanceTracking()
-	previousDistance = nil
+function MovementDecisions.resetTargetCache()
+	cachedTargetTick = -1
+	cachedTargetPos = nil
+	lastSegmentAdvanceTick = -1
 end
 
--- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
-	previousDistance = nil
+	MovementDecisions.resetTargetCache()
 	G.Navigation.slowSpeedTicks = 0
 	G.Navigation.currentNodeTicks = 0
+	G.Navigation.lastStuckTargetDist2D = nil
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
 
 	local path = G.Navigation.path
 	if path and path[1] and G.pLocal and G.pLocal.Origin then
-		PathSteering.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+		PathStringPull.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
 	end
 
 	if #G.Navigation.path == 0 then
@@ -8528,11 +8229,9 @@ function MovementDecisions.advanceNode()
 		return false
 	end
 
-	return true -- Continue moving
+	return true
 end
 
--- Only start stuck checks after speed stays below 80% max for STUCK_GRACE_TICKS.
--- Never switch to STUCK state (that stops walkTo); repath while still moving.
 function MovementDecisions.checkStuckState()
 	if not G.Menu.Main.EnableWalking then
 		return
@@ -8548,7 +8247,20 @@ function MovementDecisions.checkStuckState()
 
 	if not isBelowStuckSpeedThreshold(speed2D, maxSpeed) then
 		G.Navigation.slowSpeedTicks = 0
+		G.Navigation.lastStuckTargetDist2D = nil
 		return
+	end
+
+	local origin = G.pLocal.Origin
+	local targetPos = PathStringPull.GetCachedApexTarget()
+	if origin and targetPos then
+		local targetDist2D = Common.Distance2D(origin, targetPos)
+		local lastDist = G.Navigation.lastStuckTargetDist2D
+		if lastDist and targetDist2D < lastDist - 12 then
+			G.Navigation.slowSpeedTicks = 0
+			G.Navigation.currentNodeTicks = 0
+		end
+		G.Navigation.lastStuckTargetDist2D = targetDist2D
 	end
 
 	G.Navigation.slowSpeedTicks = (G.Navigation.slowSpeedTicks or 0) + 1
@@ -8566,11 +8278,17 @@ function MovementDecisions.checkStuckState()
 		end
 
 		if G.Navigation.currentNodeTicks > STUCK_SAME_NODE_TICKS then
+			local path = G.Navigation.path
+			local seg = path
+					and path[1]
+					and path[2]
+					and string.format("%s->%s", tostring(path[1].id), tostring(path[2].id))
+				or tostring(currentNodeId)
 			Log:Warn(
-				"STUCK: Same node %s for %d ticks below %.0f%% speed, repathing",
-				tostring(currentNodeId),
+				"STUCK: seg=%s for %d ticks below %d pct speed, repathing",
+				seg,
 				G.Navigation.currentNodeTicks,
-				STUCK_SPEED_RATIO * 100
+				math.floor(STUCK_SPEED_RATIO * 100)
 			)
 			triggerStuckRepath("Same node too long while slow")
 			return
@@ -8579,37 +8297,25 @@ function MovementDecisions.checkStuckState()
 
 	if G.Navigation.slowSpeedTicks > STUCK_GRACE_TICKS + STUCK_SLOW_REPATH_TICKS then
 		Log:Warn(
-			"STUCK: Speed %.1f below %.0f%% max for %d ticks, repathing",
+			"STUCK: Speed %.1f below %d pct max for %d ticks, repathing",
 			speed2D,
-			STUCK_SPEED_RATIO * 100,
+			math.floor(STUCK_SPEED_RATIO * 100),
 			G.Navigation.slowSpeedTicks
 		)
 		triggerStuckRepath("Slow for extended period")
 	end
 end
 
--- Decision: Handle debug logging (throttled)
 function MovementDecisions.handleDebugLogging()
-	-- Throttled debug logging
-	G.__lastMoveDebugTick = G.__lastMoveDebugTick or 0
-	local now = globals.TickCount()
-
-	if now - G.__lastMoveDebugTick > DEBUG_LOG_COOLDOWN then
-		local targetPos = MovementDecisions.getCurrentTarget()
-		if targetPos then
-			local pathLen = G.Navigation.path and #G.Navigation.path or 0
-			Log:Debug("MOVING: pathLen=%d", pathLen)
-		end
-		G.__lastMoveDebugTick = now
-	end
+	local pLocal = G.pLocal and G.pLocal.entity
+	local speed2D = pLocal and getPlayerSpeed2D(pLocal) or 0
+	NavMoveDebug.Tick(G.pLocal and G.pLocal.Origin, speed2D)
 end
 
--- Decision: Handle SmartJump execution
 function MovementDecisions.handleSmartJump(userCmd)
 	SmartJump.Main(userCmd)
 end
 
--- Movement Execution: Always called at the end
 function MovementDecisions.executeMovement(userCmd)
 	local targetPos = MovementDecisions.getCurrentTarget()
 	if not targetPos then
@@ -8617,7 +8323,6 @@ function MovementDecisions.executeMovement(userCmd)
 		return
 	end
 
-	-- Always execute movement regardless of decision cooldowns
 	if G.Menu.Main.EnableWalking then
 		MovementController.walkTo(userCmd, G.pLocal.entity, targetPos)
 	else
@@ -8626,38 +8331,33 @@ function MovementDecisions.executeMovement(userCmd)
 	end
 end
 
--- Main composition function: Run all decisions then always execute movement
 function MovementDecisions.handleMovingState(userCmd)
-	-- Early validation
 	if not G.Navigation.path or #G.Navigation.path == 0 then
 		Log:Warn("No path available, returning to IDLE state")
 		G.currentState = G.States.IDLE
 		return
 	end
 
-	-- Update movement direction for SmartJump
 	local targetPos = MovementDecisions.getCurrentTarget()
 	if targetPos then
-		local LocalOrigin = G.pLocal.Origin
-		local direction = targetPos - LocalOrigin
-		G.BotMovementDirection = direction:Length() > 0 and Common.Normalize(direction) or Vector3(0, 0, 0)
+		local localOrigin = G.pLocal.Origin
+		local direction = targetPos - localOrigin
+		if direction:Length() > 0 then
+			G.BotMovementDirection = Common.Normalize(direction)
+			G.BotIntendedWishDir = G.BotMovementDirection
+		else
+			G.BotMovementDirection = Vector3(0, 0, 0)
+			G.BotIntendedWishDir = Vector3(0, 0, 0)
+		end
 		G.BotIsMoving = true
 		G.Navigation.currentTargetPos = targetPos
 	end
 
-	-- Handle camera rotation
 	MovementController.handleCameraRotation(userCmd, targetPos)
-
-	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
-	NodeSkipper.Tick(G.pLocal.Origin)
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
-
-	-- ALWAYS execute movement at the end, regardless of decision outcomes
 	MovementDecisions.executeMovement(userCmd)
-
-	-- Handle SmartJump after walkTo
 	MovementDecisions.handleSmartJump(userCmd)
 end
 
@@ -8672,6 +8372,7 @@ __bundle_register("NavBot.Bot.StateHandler", function(require, _LOADED, __bundle
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local Node = require("NavBot.Navigation.Node")
 local WorkManager = require("NavBot.WorkManager")
 local GoalFinder = require("NavBot.Bot.GoalFinder")
@@ -8770,7 +8471,7 @@ function StateHandler.handleIdleState()
 
 	-- (nodes were already checked above)
 
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 	if not startNode then
 		Log:Warn("Could not find start node")
 		return
@@ -8875,7 +8576,7 @@ function StateHandler.handlePathfindingState()
 			local goalNodeId = G.Navigation.goalNodeId
 
 			if goalPos and goalNodeId then
-				local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+				local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 				local goalNode = G.Navigation.nodes and G.Navigation.nodes[goalNodeId]
 
 				if startNode and goalNode and startNode.id ~= goalNode.id then
@@ -8901,63 +8602,14 @@ function StateHandler.handlePathfindingState()
 	end
 end
 
--- Legacy entry point; stuck detection now lives in MovementDecisions.checkStuckState
-function StateHandler.handleStuckState(_userCmd)
-	G.currentState = G.States.MOVING
-	G.Navigation.unwalkableCount = 0
-	G.Navigation.stuckStartTick = nil
-end
-
--- Add cost penalties to connections when stuck
-function StateHandler.addStuckPenalties()
-	local path = G.Navigation.path
-	if not path or #path < 2 then
+-- Force immediate repath (cooldown unless skipCooldown from stuck handler)
+function StateHandler.forceRepath(reason, skipCooldown)
+	if not skipCooldown and not WorkManager.attemptWork(33, "force_repath_cooldown") then
 		return
-	end
-
-	-- Add penalty to current connection (between any two path elements)
-	local currentElement = path[1]
-	local nextElement = path[2]
-
-	if currentElement and nextElement then
-		-- Handle different connection types: node->node, node->door, door->door
-		local fromId = currentElement.id or currentElement.fromId
-		local toId = nextElement.id or nextElement.toId or nextElement.areaId
-
-		if fromId and toId then
-			-- Find and penalize the connection
-			local fromNode = G.Navigation.nodes and G.Navigation.nodes[fromId]
-			local toNode = G.Navigation.nodes and G.Navigation.nodes[toId]
-
-			if fromNode and toNode then
-				local connection = Node.GetConnectionEntry(fromNode, toNode)
-				if connection then
-					connection.cost = (connection.cost or 1) + 50
-					Log:Info(
-						"Added 50 cost penalty to connection "
-							.. tostring(fromId)
-							.. " -> "
-							.. tostring(toId)
-							.. " (stuck penalty)"
-					)
-				end
-			end
-		end
-	end
-end
-
--- Force immediate repath (with cooldown to prevent spam)
-function StateHandler.forceRepath(reason)
-	-- Prevent repath spam with 33 tick cooldown
-	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
-		return -- Still on cooldown, ignore repath request
 	end
 
 	Log:Warn("Force repath triggered: %s", reason)
 
-	-- Clear stuck state
-	G.Navigation.stuckStartTick = nil
-	G.Navigation.unwalkableCount = 0
 	Navigation.ResetTickTimer()
 
 	-- Force immediate repath
@@ -9000,7 +8652,7 @@ function StateHandler.handleFollowingState(userCmd)
 	end
 
 	-- Check if still on same node
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	local startNode = Navigation.GetPathStartNode(G.pLocal.Origin)
 	if not startNode or startNode.id ~= goalNode.id then
 		-- No longer on same node - return to IDLE to trigger pathfinding (clear throttle)
 		Log:Debug("Left target node in FOLLOWING state, returning to IDLE")
@@ -9018,9 +8670,9 @@ function StateHandler.handleFollowingState(userCmd)
 	-- Only update if distance changed significantly (>30 units)
 	if distChange > 10 then
 		G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-		Navigation.RebuildApexPath()
-		G.Navigation.followingDistance = currentDist
 		G.Navigation.goalPos = goalPos
+		PathStringPull.UpdateGoalApex(goalPos)
+		G.Navigation.followingDistance = currentDist
 		Log:Debug("Target moved %.0f units, updating position (dist=%.0f)", distChange, currentDist)
 
 		-- If moved outside stop radius, switch to MOVING
@@ -9510,25 +9162,13 @@ local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
 local AStar = require("NavBot.Algorithms.A-Star")
-local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
-local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
 local Lib = Common.Lib
 local Log = Lib.Utils.Logger.new("NavBot")
 Log.Level = 0
-
--- Constants
-local STEP_HEIGHT = 18
-local UP_VECTOR = Vector3(0, 0, 1)
-local DROP_HEIGHT = 144 -- Define your constants outside the function
-local HULL_MIN = G.pLocal.vHitbox.Min
-local HULL_MAX = G.pLocal.vHitbox.Max
-local TRACE_MASK = MASK_PLAYERSOLID
-local TICK_RATE = 66
-local GROUND_TRACE_OFFSET_START = Vector3(0, 0, 5)
-local GROUND_TRACE_OFFSET_END = Vector3(0, 0, -67)
-local MAX_SLOPE_ANGLE = 55 -- Maximum angle (in degrees) that is climbable
 
 -- Add a connection between two nodes
 function Navigation.AddConnection(nodeA, nodeB)
@@ -9636,18 +9276,14 @@ end
 function Navigation.ClearPath()
 	G.Navigation.path = {}
 	G.Navigation.currentNodeIndex = 1
-	-- Also clear door/center/goal waypoints to avoid stale movement/visuals
-	G.Navigation.waypoints = {}
-	G.Navigation.currentWaypointIndex = 1
-	-- Clear path traversal history used by stuck analysis
-	G.Navigation.pathHistory = {}
 	G.Navigation.apexPath = nil
 	G.Navigation.apexIndex = 1
 	G.Navigation.slowSpeedTicks = 0
+	PathStringPull.ResetApexAdvanceTick()
 	NodeSkipper.Reset()
 end
 
-function Navigation.RebuildApexPath()
+function Navigation.RebuildApexPath(blockSkipAfterSet)
 	local path = G.Navigation.path
 	if not path or #path == 0 then
 		G.Navigation.apexPath = nil
@@ -9657,6 +9293,10 @@ function Navigation.RebuildApexPath()
 	local startPos = G.pLocal and G.pLocal.Origin or nil
 	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(path, G.Navigation.goalPos, startPos)
 	G.Navigation.apexIndex = 1
+	PathStringPull.ResetApexAdvanceTick()
+	if blockSkipAfterSet then
+		NodeSkipper.BlockSkippingAfterPathSet()
+	end
 end
 
 -- Set the current path
@@ -9669,12 +9309,8 @@ function Navigation.SetCurrentPath(path)
 	G.Navigation.path = path
 	-- Use weak values to avoid strong retention of node objects (nodes table holds strong refs)
 	pcall(setmetatable, G.Navigation.path, { __mode = "v" })
-	G.Navigation.currentNodeIndex = 1 -- Start from the first node (start) and work towards goal
-	-- Build area-center waypoints (door threading via NavPredict at runtime)
-	--ProfilerBegin and ProfilerEnd are not available here, so rely on caller's profiling
-	Navigation.BuildDoorWaypointsFromPath()
-	Navigation.RebuildApexPath()
-	G.Navigation.pathHistory = {}
+	G.Navigation.currentNodeIndex = 1
+	Navigation.RebuildApexPath(true)
 	NodeSkipper.Reset()
 end
 
@@ -9682,22 +9318,11 @@ end
 function Navigation.RemoveCurrentNode()
 	G.Navigation.currentNodeTicks = 0
 	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Remove the first node (current node we just reached)
 		local reached = table.remove(G.Navigation.path, 1)
-		-- Track reached nodes from last to first
-		if reached then
-			G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-			table.insert(G.Navigation.pathHistory, 1, reached)
-			-- Bound history size
-			if #G.Navigation.pathHistory > 32 then
-				table.remove(G.Navigation.pathHistory)
-			end
+		if reached and reached.id then
+			PathStringPull.ConsumeNodeApexes(reached.id)
 		end
-		-- currentNodeIndex stays at 1 since we always target the first node in the remaining path
 		G.Navigation.currentNodeIndex = 1
-		-- Rebuild waypoints to reflect new leading edge
-		Navigation.BuildDoorWaypointsFromPath()
-		Navigation.RebuildApexPath()
 	end
 end
 function Navigation.ResetTickTimer()
@@ -9709,246 +9334,8 @@ function Navigation.ResetNodeSkipping()
 end
 
 -- ========================================================================
--- NODE VALIDATION & CHECKS
+-- NODE QUERIES (path)
 -- ========================================================================
-
--- Check if next node is walkable from current position
-function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
-	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
-		Log:Debug(
-			"CheckNextNodeWalkable: Invalid node data - currentNode=%s, nextNode=%s",
-			tostring(currentNode and currentNode.id),
-			tostring(nextNode and nextNode.id)
-		)
-		return false
-	end
-
-	-- Straight-line walk check via NavPredict.CanSkip
-	local currentArea = Node.GetAreaAtPosition(currentPos)
-	if not currentArea then
-		Log:Debug("CheckNextNodeWalkable: Could not find current area")
-		return false
-	end
-
-	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canWalk = pcall(NavPredict.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
-
-	if success and canWalk then
-		Log:Debug("Next node %d is walkable from current position", nextNode.id)
-		return true
-	else
-		Log:Debug("Next node %d is not walkable from current position", nextNode.id)
-		return false
-	end
-end
-
--- Check if next node is closer than current node
-function Navigation.CheckNextNodeCloser(currentPos, currentNode, nextNode)
-	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
-		Log:Debug(
-			"CheckNextNodeCloser: Invalid node data - currentNode=%s, nextNode=%s",
-			tostring(currentNode and currentNode.id),
-			tostring(nextNode and nextNode.id)
-		)
-		return false
-	end
-
-	local distanceToCurrent = Common.Distance2D(currentPos, currentNode.pos)
-	local distanceToNext = Common.Distance2D(currentPos, nextNode.pos)
-
-	if distanceToNext < distanceToCurrent then
-		Log:Debug("Next node %d is closer (%.2f < %.2f)", nextNode.id, distanceToNext, distanceToCurrent)
-		return true
-	else
-		Log:Debug(
-			"Current node %d is closer or equal (%.2f >= %.2f)",
-			currentNode.id,
-			distanceToCurrent,
-			distanceToNext
-		)
-		return false
-	end
-end
-
--- ========================================================================
--- WAYPOINT BUILDING
--- ========================================================================
-
--- Goal-only waypoint list; movement uses PathSteering portal string-pull on G.Navigation.path
-function Navigation.BuildDoorWaypointsFromPath()
-	if not G.Navigation.waypoints then
-		G.Navigation.waypoints = {}
-	else
-		for i = #G.Navigation.waypoints, 1, -1 do
-			G.Navigation.waypoints[i] = nil
-		end
-	end
-	G.Navigation.currentWaypointIndex = 1
-
-	local goalPos = G.Navigation.goalPos
-	if goalPos then
-		table.insert(G.Navigation.waypoints, { pos = goalPos, kind = "goal" })
-	end
-end
-
-function Navigation.GetCurrentWaypoint()
-	local wpList = G.Navigation.waypoints
-	local idx = G.Navigation.currentWaypointIndex or 1
-	if wpList and idx and wpList[idx] then
-		return wpList[idx]
-	end
-	return nil
-end
-
-function Navigation.AdvanceWaypoint()
-	local wpList = G.Navigation.waypoints
-	local idx = G.Navigation.currentWaypointIndex or 1
-	if not (wpList and wpList[idx]) then
-		return
-	end
-	local current = wpList[idx]
-
-	-- FIXED: Reset timer when reaching ANY waypoint on path, not just center
-	-- This ensures node skipping timer resets when reaching any point on the path
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Reset the node timer when we reach any waypoint
-		Navigation.ResetTickTimer()
-		-- Reset node skipping cooldowns when reaching waypoints
-		-- SCRAPPED: Don't reset cooldowns on waypoint reach - let agent-based system run on its own schedule
-		-- local NodeSkipper = require("NavBot.Bot.NodeSkipper")
-		-- NodeSkipper.ResetWalkabilityCooldown()
-		-- If we reached a center of the next area, advance the area path too
-		-- if current.kind == "center" then
-		-- 	-- path[1] is previous area; popping it moves us into the new area
-		-- 	Navigation.RemoveCurrentNode()
-		-- end
-	end
-
-	G.Navigation.currentWaypointIndex = idx + 1
-end
-
-function Navigation.SkipWaypoints(count)
-	local wpList = G.Navigation.waypoints
-	if not wpList then
-		return
-	end
-	local idx = (G.Navigation.currentWaypointIndex or 1) + (count or 1)
-	if idx < 1 then
-		idx = 1
-	end
-	if idx > #wpList + 1 then
-		idx = #wpList + 1
-	end
-
-	-- FIXED: Reset timer when skipping ANY waypoints on path
-	-- This ensures node skipping timer resets when skipping any points on the path
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Reset the node timer when we skip waypoints
-		Navigation.ResetTickTimer()
-		-- If we skip over a center, reflect area progression
-		local current = G.Navigation.waypoints[G.Navigation.currentWaypointIndex or 1]
-		if current and current.kind ~= "center" then
-			for j = (G.Navigation.currentWaypointIndex or 1), math.min(idx - 1, #wpList) do
-				if wpList[j].kind == "center" and G.Navigation.path and #G.Navigation.path > 0 then
-					Navigation.RemoveCurrentNode()
-				end
-			end
-		end
-	end
-
-	G.Navigation.currentWaypointIndex = idx
-end
-
--- Function to convert degrees to radians
-local function degreesToRadians(degrees)
-	return degrees * math.pi / 180
-end
-
--- Checks for an obstruction between two points using a hull trace.
-local function isPathClear(startPos, endPos)
-	local traceResult = engine.TraceHull(startPos, endPos, HULL_MIN, HULL_MAX, MASK_PLAYERSOLID_BRUSHONLY)
-	return traceResult
-end
-
--- Checks if the ground is stable at a given position.
-local function isGroundStable(position)
-	local groundTraceResult = engine.TraceLine(
-		position + GROUND_TRACE_OFFSET_START,
-		position + GROUND_TRACE_OFFSET_END,
-		MASK_PLAYERSOLID_BRUSHONLY
-	)
-	return groundTraceResult.fraction < 1
-end
-
--- Function to get the ground normal at a given position
-local function getGroundNormal(position)
-	local groundTraceResult = engine.TraceLine(
-		position + GROUND_TRACE_OFFSET_START,
-		position + GROUND_TRACE_OFFSET_END,
-		MASK_PLAYERSOLID_BRUSHONLY
-	)
-	return groundTraceResult.plane
-end
-
--- Precomputed up vector and max slope angle in radians
-local MAX_SLOPE_ANGLE_RAD = degreesToRadians(MAX_SLOPE_ANGLE)
-
--- Function to get forward speed by class
-function Navigation.GetMaxSpeed(entity)
-	return entity:GetPropFloat("m_flMaxspeed")
-end
-
--- Function to compute the move direction
-local function ComputeMove(pCmd, a, b)
-	local diff = b - a
-	if diff:Length() == 0 then
-		return Vector3(0, 0, 0)
-	end
-
-	local x = diff.x
-	local y = diff.y
-	local vSilent = Vector3(x, y, 0)
-
-	local ang = vSilent:Angles()
-	local cYaw = pCmd:GetViewAngles().yaw
-	local yaw = math.rad(ang.y - cYaw)
-	local move = Vector3(math.cos(yaw), -math.sin(yaw), 0)
-
-	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity) + 1
-	return move * maxSpeed
-end
-
--- Function to implement fast stop
-local function FastStop(pCmd, pLocal)
-	local velocity = pLocal:GetVelocity()
-	velocity.z = 0
-	local speed = velocity:Length2D()
-
-	if speed < 1 then
-		pCmd:SetForwardMove(0)
-		pCmd:SetSideMove(0)
-		return
-	end
-
-	local accel = 5.5
-	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity)
-	local playerSurfaceFriction = 1.0
-	local max_accelspeed = accel * (1 / TICK_RATE) * maxSpeed * playerSurfaceFriction
-
-	local wishspeed
-	if speed - max_accelspeed <= -1 then
-		wishspeed = max_accelspeed / (speed / (accel * (1 / TICK_RATE)))
-	else
-		wishspeed = max_accelspeed
-	end
-
-	local ndir = (velocity * -1):Angles()
-	ndir.y = pCmd:GetViewAngles().y - ndir.y
-	ndir = ndir:ToVector()
-
-	pCmd:SetForwardMove(ndir.x * wishspeed)
-	pCmd:SetSideMove(ndir.y * wishspeed)
-end
 
 ---@param pos Vector3|{ x:number, y:number, z:number }
 ---@return Node|nil
@@ -9981,7 +9368,86 @@ function Navigation.GetAreaAtPosition(pos)
 	return n
 end
 
--- Main pathfinding function - FIXED TO USE DUAL A* SYSTEM
+--- Repath start: exact area under feet first (avoids KD-tree backtrack on stacked nav).
+function Navigation.GetPathStartNode(pos)
+	local area = Navigation.GetAreaAtPosition(pos)
+	if area then
+		return area
+	end
+	return Navigation.GetClosestNode(pos)
+end
+
+--- After A* only: drop prefix until player area is path[1] (fixes wrong start node).
+function Navigation.AlignPathPrefixToPlayer(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 1 or not playerPos then
+		return false
+	end
+
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if not playerArea then
+		return false
+	end
+
+	local targetIndex = nil
+	for i = 1, #path do
+		if path[i].id == playerArea.id then
+			targetIndex = i
+			break
+		end
+	end
+
+	if not targetIndex or targetIndex <= 1 then
+		return false
+	end
+
+	local popped = 0
+	while targetIndex > 1 and #path > 1 do
+		local removed = table.remove(path, 1)
+		if removed and removed.id then
+			PathStringPull.ConsumeNodeApexes(removed.id)
+		end
+		targetIndex = targetIndex - 1
+		popped = popped + 1
+	end
+
+	G.Navigation.currentNodeIndex = 1
+	if popped > 0 then
+		Log:Info("Aligned path prefix to area %s (pathLen=%d, popped=%d)", tostring(playerArea.id), #path, popped)
+	end
+	return popped > 0
+end
+
+--- Feet are on path[i] with i>1 but path[1] is stale — trim prefix (desync recovery only).
+function Navigation.AlignPathIfDesynced(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 2 or not playerPos then
+		return false
+	end
+
+	local pLocal = G.pLocal and G.pLocal.entity
+	if pLocal and not GroundMovement.isOnGround(pLocal) then
+		return false
+	end
+
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if not playerArea then
+		return false
+	end
+
+	if path[1] and path[1].id == playerArea.id then
+		return false
+	end
+
+	for i = 2, #path do
+		if path[i].id == playerArea.id then
+			return Navigation.AlignPathPrefixToPlayer(playerPos)
+		end
+	end
+
+	return false
+end
+
 ---@param startNode Node
 ---@param goalNode Node
 function Navigation.FindPath(startNode, goalNode)
@@ -9994,10 +9460,6 @@ function Navigation.FindPath(startNode, goalNode)
 		return Navigation
 	end
 
-	local horizontalDistance = math.abs(goalNode.pos.x - startNode.pos.x) + math.abs(goalNode.pos.y - startNode.pos.y)
-	local verticalDistance = math.abs(goalNode.pos.z - startNode.pos.z)
-
-	-- Try A* pathfinding as primary algorithm (more reliable than D*)
 	local success, path = pcall(AStar.NormalPath, startNode, goalNode, G.Navigation.nodes, Node.GetAdjacentAreasForPath)
 
 	if not success then
@@ -10005,11 +9467,7 @@ function Navigation.FindPath(startNode, goalNode)
 		G.Navigation.path = nil
 		Navigation.pathFailed = true
 		Navigation.pathFound = false
-
-		-- Add circuit breaker penalty for this failed connection
-		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
-			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
-		end
+		CircuitBreaker.addFailure(startNode, goalNode)
 		return Navigation
 	end
 
@@ -10020,23 +9478,17 @@ function Navigation.FindPath(startNode, goalNode)
 		G.Navigation.path = nil
 		Navigation.pathFailed = true
 		Navigation.pathFound = false
-
-		-- Add circuit breaker penalty for this failed connection
-		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
-			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
-		end
+		CircuitBreaker.addFailure(startNode, goalNode)
 	else
 		Log:Info("Path found from %d to %d with %d nodes", startNode.id, goalNode.id, #G.Navigation.path)
 		Navigation.pathFound = true
 		Navigation.pathFailed = false
 		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
-		-- Reset node skipping agents for new path
-		G.Navigation.skipAgents = nil
-		Navigation.BuildDoorWaypointsFromPath()
-		Navigation.RebuildApexPath()
-		-- REMOVED: All path optimization now handled by NodeSkipper.CheckContinuousSkip
-		-- Reset traversed-node history for new path
-		G.Navigation.pathHistory = {}
+		local origin = G.pLocal and G.pLocal.Origin
+		if origin then
+			Navigation.AlignPathPrefixToPlayer(origin)
+		end
+		Navigation.RebuildApexPath(true)
 	end
 
 	return Navigation
@@ -10045,171 +9497,828 @@ end
 return Navigation
 
 end)
-__bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
+__bundle_register("NavBot.Navigation.PathStringPull", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
-Node Skipper — runs every tick; skip current node when NavPredict.CanSkip passes (no doors-only).
-Door portals are reserved for PathStringPull at path-build time.
+    PathStringPull — process A* area path once after search (Unity-style string pull)
+    Built once from player position at path-find time; runtime only walks cached apexes.
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
-local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local PathSteering = require("NavBot.Navigation.PathSteering")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
-
-local Log = Common.Log.new("NodeSkipper")
-
-local NodeSkipper = {}
-
-local lastBlockedLogKey = nil
-local lastBlockedLogTick = 0
-local BLOCKED_LOG_INTERVAL = 66
-
-local function lockIntentAfterSkip(playerPos)
-	local path = G.Navigation.path
-	if path and path[1] then
-		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
-	end
-end
-
-local function rebuildApexPath(playerPos)
-	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(G.Navigation.path, G.Navigation.goalPos, playerPos)
-	G.Navigation.apexIndex = 1
-end
-
-local function logSkipBlocked(currentNode, nextNode, reason)
-	local key = tostring(currentNode.id) .. "->" .. tostring(nextNode.id) .. ":" .. reason
-	local now = globals.TickCount()
-	if key == lastBlockedLogKey and (now - lastBlockedLogTick) < BLOCKED_LOG_INTERVAL then
-		return
-	end
-	lastBlockedLogKey = key
-	lastBlockedLogTick = now
-	Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
-end
-
-local function canSkipSegment(playerPos, goalPos, fromAreaNode, allowJump)
-	if not fromAreaNode then
-		return false
-	end
-	-- doorsOnly=false for skipping; doors-only mode is for string-pull apex build
-	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, false, allowJump)
-	return success and canSkip == true
-end
-
-local function trySkipCurrentNode(playerPos, currentNode, nextNode)
-	local goalPos = nextNode.pos
-	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-
-	if not canSkipSegment(playerPos, goalPos, currentNode, allowJump) then
-		logSkipBlocked(currentNode, nextNode, "not_walkable")
-		return false
-	end
-
-	local missedNode = table.remove(G.Navigation.path, 1)
-	G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-	table.insert(G.Navigation.pathHistory, 1, missedNode)
-	while #G.Navigation.pathHistory > 32 do
-		table.remove(G.Navigation.pathHistory)
-	end
-
-	G.Navigation.lastSkipTick = globals.TickCount()
-	G.Navigation.currentNodeIndex = 1
-	rebuildApexPath(playerPos)
-	Log:Info("Skipped node %s, targeting %s", tostring(missedNode.id), tostring(nextNode.id))
-	return true
-end
-
-function NodeSkipper.Reset()
-	G.Navigation.nodePassTrack = nil
-	lastBlockedLogKey = nil
-	lastBlockedLogTick = 0
-end
-
-function NodeSkipper.Tick(playerPos)
-	assert(playerPos, "Tick: playerPos missing")
-
-	if not G.Menu.Navigation.Skip_Nodes then
-		return false
-	end
-
-	local path = G.Navigation.path
-	if not path or #path < 2 then
-		return false
-	end
-
-	local currentNode = path[1]
-	local nextNode = path[2]
-	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
-		return false
-	end
-
-	if trySkipCurrentNode(playerPos, currentNode, nextNode) then
-		lockIntentAfterSkip(playerPos)
-		return true
-	end
-
-	return false
-end
-
-return NodeSkipper
-
-end)
-__bundle_register("NavBot.Navigation.PathSteering", function(require, _LOADED, __bundle_register, __bundle_modules)
---##########################################################################
---  PathSteering.lua  ·  Pass detection + intent (movement via PathStringPull)
---##########################################################################
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local Node = require("NavBot.Navigation.Node")
+local NavMath = require("NavBot.Utils.NavMath")
 local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
+local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local NavGeometry = require("NavBot.Navigation.Prediction.NavGeometry")
+local NavPortal = require("NavBot.Navigation.Prediction.NavPortal")
+local Node = require("NavBot.Navigation.Node")
 
-local PathSteering = {}
+local OPPOSITE_EXIT_DIR = NavConstants.OPPOSITE_EXIT_DIR
+local DROP_Z_THRESHOLD = NavConstants.STEP_HEIGHT
+
+local PathStringPull = {}
+
+-- String-pull uses door hitbox portals (same as NavPredict doorsOnly mode)
+local STRING_PULL_DOORS_ONLY = true
+
+local WALL_BAND = 32
+local APEX_TOUCH = 16
+local PORTAL_PLANE_MARGIN = 8
+-- One tolerance for portal shared-axis checks (walk, skip, pass) — avoids per-case drift
+local PORTAL_SPAN_TOLERANCE = 24
+local APPROACH_STEP = 16
+local MAX_APPROACH_BACK = 400
+local DROP_WALK_OFF = 64
+
+local apexAdvanceTick = -1
+
+local horizontalDir = NavMath.horizontalDir2D
+local horizontalUnit = NavMath.horizontalUnit2D
+local getSharedAxisCoord = NavMath.sharedAxisCoord
 
 local function getPassDirDotThreshold()
 	return G.Misc.NodePassDirDotThreshold or 0.5
 end
 
 local function getTouchDistance()
-	return G.Misc.NodeTouchDistance or 16
+	return G.Misc.NodeTouchDistance or APEX_TOUCH
+end
+
+local function getNodeTouchHeight()
+	return G.Misc.NodeTouchHeight or 82
 end
 
 local function getOvershootTouchDistance()
 	return G.Misc.NodeOvershootTouchDistance or 48
 end
 
-local function horizontalDir(from, to)
-	local dx = to.x - from.x
-	local dy = to.y - from.y
-	local len = math.sqrt(dx * dx + dy * dy)
-	if len < 0.001 then
-		return nil, 0
+local function getGroundZOnNode(pos, node)
+	if not node.nw or not node.ne or not node.sw then
+		return node._floorZ or node.pos.z
 	end
-	return Vector3(dx / len, dy / len, 0), len
+
+	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
+	local dx = pos.x - nw.x
+	local dy = pos.y - nw.y
+	local dxNe = ne.x - nw.x
+	local dySe = se.y - nw.y
+	local inTri1 = (dxNe ~= 0 or dySe ~= 0) and (dx / dxNe + dy / dySe) <= 1.0
+
+	local v0, v1, v2 = nw, ne, se
+	if not inTri1 then
+		v0, v1, v2 = nw, se, sw
+	end
+
+	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
+	if math.abs(denom) < 0.0001 then
+		return v0.z
+	end
+
+	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
+	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
+	local w2 = 1.0 - w0 - w1
+	return w0 * v0.z + w1 * v1.z + w2 * v2.z
 end
 
-local function horizontalUnit(vec)
-	if not vec then
-		return nil
+local function withGroundZ(point, node)
+	if not point or not node then
+		return point
 	end
-	local flat = Vector3(vec.x, vec.y, 0)
-	local len = flat:Length2D()
-	if len < 0.001 then
-		return nil
-	end
-	return flat / len
+	return Vector3(point.x, point.y, getGroundZOnNode(point, node))
 end
 
-local function isInsideNodeAABB(pos, node)
-	if Node.IsDoorNode(node) then
+local function getClosestWallDir(area, point)
+	if not area or not point or not area._minX then
+		return nil
+	end
+
+	local bestDir = nil
+	local bestDist = math.huge
+	local walls = {
+		[1] = math.abs(point.y - area._minY),
+		[3] = math.abs(point.y - area._maxY),
+		[2] = math.abs(point.x - area._maxX),
+		[4] = math.abs(point.x - area._minX),
+	}
+
+	for dir, dist in pairs(walls) do
+		if dist < bestDist then
+			bestDist = dist
+			bestDir = dir
+		end
+	end
+
+	return bestDir
+end
+
+local function getEntryDirIntoArea(prevArea, area, entryPoint)
+	if prevArea then
+		local connDir = NavPortal.GetExitDirToNeighbor(prevArea, area)
+		if connDir then
+			return OPPOSITE_EXIT_DIR[connDir]
+		end
+	end
+
+	if entryPoint and area then
+		return getClosestWallDir(area, entryPoint)
+	end
+
+	return nil
+end
+
+local function needsCenterForSameSideEntry(entryDir, exitDir)
+	return entryDir and exitDir and entryDir == exitDir
+end
+
+local function getExitDirBetween(area, nextArea)
+	local exitDir = NavPortal.GetExitDirToNeighbor(area, nextArea)
+	if exitDir then
+		return exitDir
+	end
+
+	-- Fallback only when graph lookup fails (should not happen on a valid A* segment)
+	local dir = horizontalDir(area.pos, nextArea.pos)
+	if not dir then
+		return nil
+	end
+	local _exitPt, _dist, fallbackDir = NavGeometry.FindNodeExit(area.pos, dir, area)
+	return fallbackDir
+end
+
+local function hasDoorOnExitEdge(area, exitDir)
+	if not exitDir or not area.c then
 		return false
 	end
-	return AreaSpatial.IsWithinArea(pos, node)
+
+	local nodes = G.Navigation and G.Navigation.nodes
+	if not nodes then
+		return false
+	end
+
+	local dirData = area.c[exitDir]
+	if not dirData or not dirData.connections then
+		return false
+	end
+
+	for i = 1, #dirData.connections do
+		local targetId = ConnectionUtils.GetNodeId(dirData.connections[i])
+		local target = nodes[targetId]
+		if target and target.isDoor then
+			return true
+		end
+	end
+
+	return false
 end
 
-function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
+local function isOnExitWall(point, area, exitDir)
+	if not point or not area._minX or not exitDir then
+		return false
+	end
+
+	if exitDir == 3 then
+		return point.y >= area._maxY - WALL_BAND
+	end
+	if exitDir == 1 then
+		return point.y <= area._minY + WALL_BAND
+	end
+	if exitDir == 2 then
+		return point.x >= area._maxX - WALL_BAND
+	end
+	if exitDir == 4 then
+		return point.x <= area._minX + WALL_BAND
+	end
+
+	return false
+end
+
+local function clampPortalCoord(coord, portalMin, portalMax)
+	if coord < portalMin then
+		return portalMin
+	end
+	if coord > portalMax then
+		return portalMax
+	end
+	return coord
+end
+
+local function buildPortalPosFromSpan(area, exitDir, portalMin, portalMax, biasPointOrCoord)
+	if not exitDir or not portalMin or not portalMax then
+		return nil
+	end
+
+	local coord = (portalMin + portalMax) * 0.5
+	if type(biasPointOrCoord) == "number" then
+		coord = biasPointOrCoord
+	elseif biasPointOrCoord then
+		coord = clampPortalCoord(getSharedAxisCoord(biasPointOrCoord, exitDir), portalMin, portalMax)
+	end
+	local x
+	local y
+	local z = area.pos.z
+
+	if exitDir == 2 then
+		x = area._maxX
+		y = coord
+	elseif exitDir == 4 then
+		x = area._minX
+		y = coord
+	elseif exitDir == 3 then
+		x = coord
+		y = area._maxY
+	else
+		x = coord
+		y = area._minY
+	end
+
+	return withGroundZ(Vector3(x, y, z), area)
+end
+
+local function getNearestPortalPosOnSpan(playerPos, area, exitDir, portalMin, portalMax)
+	if not (playerPos and area and exitDir and portalMin and portalMax) then
+		return nil
+	end
+
+	local coord = clampPortalCoord(getSharedAxisCoord(playerPos, exitDir), portalMin, portalMax)
+	return buildPortalPosFromSpan(area, exitDir, portalMin, portalMax, coord)
+end
+
+local function isSmartJumpActive()
+	local jumpState = G.SmartJump and G.SmartJump.jumpState
+	local idleState = G.SmartJump and G.SmartJump.Constants and G.SmartJump.Constants.STATE_IDLE
+	if jumpState and idleState and jumpState ~= idleState then
+		return true
+	end
+	return false
+end
+
+local function getPathNodeById(nodeId)
+	local nodes = G.Navigation and G.Navigation.nodes
+	if not nodes or not nodeId then
+		return nil
+	end
+	return nodes[nodeId]
+end
+
+local function getSegmentDropHeight(area, nextArea, portalPos)
+	if not (area and nextArea and portalPos) then
+		return 0
+	end
+
+	local fromZ = getGroundZOnNode(portalPos, area)
+	local toZ = getGroundZOnNode(nextArea.pos, nextArea) or nextArea._floorZ or nextArea.pos.z
+	if not fromZ or not toZ then
+		return 0
+	end
+
+	return fromZ - toZ
+end
+
+local function wouldExitOutsideDoorPortal(fromPoint, area, portalPos, exitDir, portalMin, portalMax)
+	if not (portalMin and portalMax and portalPos and exitDir) then
+		return false
+	end
+
+	local dir = horizontalDir(fromPoint, portalPos)
+	if not dir then
+		return false
+	end
+
+	local exitPt, _exitDist, foundExitDir = NavGeometry.FindNodeExit(fromPoint, dir, area)
+	if not exitPt or foundExitDir ~= exitDir then
+		return true
+	end
+
+	local coord = getSharedAxisCoord(exitPt, exitDir)
+	return coord < portalMin or coord > portalMax
+end
+
+--- Need an in-area approach point before portal when a straight walk would miss the opening.
+local function needsApproachBeforePortal(fromPoint, area, _nextArea, exitDir, portalMin, portalMax, portalPos)
+	if not (portalMin and portalMax and portalPos and exitDir) then
+		return false
+	end
+	if wouldExitOutsideDoorPortal(fromPoint, area, portalPos, exitDir, portalMin, portalMax) then
+		return true
+	end
+	if hasDoorOnExitEdge(area, exitDir) and isOnExitWall(fromPoint, area, exitDir) then
+		return true
+	end
+	return false
+end
+
+--- Build-time approach point along the portal line (never area geometric center).
+local function computeApproachPoint(fromPoint, area, portalPos, exitDir, portalMin, portalMax)
+	local dir = horizontalDir(fromPoint, portalPos)
+	if not dir then
+		return nil
+	end
+
+	local bestOnWall = nil
+	for back = APPROACH_STEP, MAX_APPROACH_BACK, APPROACH_STEP do
+		local candidate = Vector3(
+			portalPos.x - dir.x * back,
+			portalPos.y - dir.y * back,
+			portalPos.z
+		)
+		if not AreaSpatial.IsWithinArea(candidate, area) then
+			break
+		end
+
+		if wouldExitOutsideDoorPortal(candidate, area, portalPos, exitDir, portalMin, portalMax) then
+			break
+		end
+
+		local grounded = withGroundZ(candidate, area)
+		local onWall = hasDoorOnExitEdge(area, exitDir) and isOnExitWall(grounded, area, exitDir)
+		if not onWall then
+			return grounded
+		end
+		bestOnWall = grounded
+	end
+
+	return bestOnWall
+end
+
+local function isApproachKind(kind)
+	return kind == "approach" or kind == "center" or kind == "same_side_center"
+end
+
+local function isTransitionKind(kind)
+	return kind == "portal" or kind == "drop"
+end
+
+local function findSegmentTransitionApex(currentId, nextId)
+	local apexes = G.Navigation.apexPath
+	if not apexes then
+		return nil
+	end
+
+	for i = 1, #apexes do
+		local apex = apexes[i]
+		if isTransitionKind(apex.kind) and apex.areaId == currentId and apex.nextAreaId == nextId then
+			return apex, i
+		end
+	end
+
+	return nil
+end
+
+local function hasPassedApproachApex(playerPos, apex)
+	if not (apex and apex.pos) then
+		return false
+	end
+
+	return Common.Distance2D(playerPos, apex.pos) <= getTouchDistance()
+end
+
+local function apexIsForCurrentSegment(apex, path)
+	if not apex or not path or not path[1] then
+		return false
+	end
+
+	if apex.kind == "goal" then
+		return #path <= 1
+	end
+
+	if not path[2] then
+		return apex.areaId == path[1].id
+	end
+
+	if apex.areaId ~= path[1].id then
+		return false
+	end
+
+	if apex.nextAreaId and apex.nextAreaId ~= path[2].id then
+		return false
+	end
+
+	return true
+end
+
+local function getApexIndexForCurrentSegment(apexes, path)
+	if not apexes or #apexes == 0 or not path or not path[1] then
+		return 1
+	end
+
+	if not path[2] then
+		for i = 1, #apexes do
+			if apexes[i].kind == "goal" then
+				return i
+			end
+		end
+		return #apexes
+	end
+
+	for i = 1, #apexes do
+		if apexIsForCurrentSegment(apexes[i], path) then
+			return i
+		end
+	end
+
+	return 1
+end
+
+local function getPortalPoint(area, nextArea, exitDir)
+	if not exitDir then
+		return withGroundZ(nextArea.pos, area)
+	end
+
+	local portalMin, portalMax =
+		NavPortal.GetPortalSpanForNeighbor(area, nextArea, exitDir, STRING_PULL_DOORS_ONLY)
+	if not portalMin then
+		return withGroundZ(nextArea.pos, area)
+	end
+
+	return buildPortalPosFromSpan(area, exitDir, portalMin, portalMax, nextArea.pos)
+end
+
+local function isCoordInPortalSpan(coord, portalMin, portalMax, tolerance)
+	return NavMath.isCoordInSpan(coord, portalMin, portalMax, tolerance or PORTAL_SPAN_TOLERANCE)
+end
+
+local function isWithinPortalSpan(playerPos, exitDir, portalMin, portalMax, tolerance)
+	if not exitDir or not portalMin or not portalMax then
+		return false
+	end
+	return isCoordInPortalSpan(getSharedAxisCoord(playerPos, exitDir), portalMin, portalMax, tolerance)
+end
+
+local function isDropLikeSegment(apex, currentNode)
+	if not apex then
+		return false
+	end
+	if apex.kind == "drop" then
+		return true
+	end
+	if not (currentNode and apex.nextAreaId and apex.pos) then
+		return false
+	end
+	local nextNode = getPathNodeById(apex.nextAreaId)
+	if not nextNode then
+		return false
+	end
+	return getSegmentDropHeight(currentNode, nextNode, apex.pos) > DROP_Z_THRESHOLD
+end
+
+local function getSteerPosForApex(playerPos, apex, currentNode)
+	if not (apex and apex.pos) then
+		return nil
+	end
+
+	if not isDropLikeSegment(apex, currentNode) or not (apex.portalMin and apex.portalMax and apex.exitDir and currentNode) then
+		return apex.pos
+	end
+
+	local nearest = getNearestPortalPosOnSpan(playerPos, currentNode, apex.exitDir, apex.portalMin, apex.portalMax)
+	if not nearest then
+		return apex.pos
+	end
+
+	local nearEdge = Common.Distance2D(playerPos, nearest) <= getOvershootTouchDistance()
+		and isWithinPortalSpan(playerPos, apex.exitDir, apex.portalMin, apex.portalMax, PORTAL_SPAN_TOLERANCE)
+
+	if nearEdge and apex.passDir then
+		return Vector3(
+			nearest.x + apex.passDir.x * DROP_WALK_OFF,
+			nearest.y + apex.passDir.y * DROP_WALK_OFF,
+			nearest.z
+		)
+	end
+
+	return nearest
+end
+
+local function getSegmentPortalData(currentNode, nextNode)
+	local exitDir = getExitDirBetween(currentNode, nextNode)
+	if not exitDir then
+		return nil
+	end
+	local portalMin, portalMax =
+		NavPortal.GetPortalSpanForNeighbor(currentNode, nextNode, exitDir, STRING_PULL_DOORS_ONLY)
+	local portalPos = getPortalPoint(currentNode, nextNode, exitDir)
+	return {
+		exitDir = exitDir,
+		portalMin = portalMin,
+		portalMax = portalMax,
+		portalPos = portalPos,
+	}
+end
+
+local function resolvePortalSpan(portalApex, currentNode, nextNode)
+	local exitDir = portalApex.exitDir or getExitDirBetween(currentNode, nextNode)
+	local portalMin = portalApex.portalMin
+	local portalMax = portalApex.portalMax
+	if not portalMin and exitDir then
+		portalMin, portalMax = NavPortal.GetPortalSpanForNeighbor(
+			currentNode,
+			nextNode,
+			exitDir,
+			STRING_PULL_DOORS_ONLY
+		)
+	end
+	return exitDir, portalMin, portalMax
+end
+
+local function pushApex(apexes, pos, kind, areaId, nextAreaId, passDir, exitDir, portalMin, portalMax)
+	if not pos then
+		return
+	end
+
+	local last = apexes[#apexes]
+	if last and Common.Distance2D(last.pos, pos) < 4 then
+		return
+	end
+
+	apexes[#apexes + 1] = {
+		pos = pos,
+		kind = kind,
+		areaId = areaId,
+		nextAreaId = nextAreaId,
+		passDir = passDir,
+		exitDir = exitDir,
+		portalMin = portalMin,
+		portalMax = portalMax,
+	}
+end
+
+
+local function hasCrossedPortalPlane(playerPos, portalPos, passDir, margin)
+	if not (playerPos and portalPos and passDir) then
+		return false
+	end
+
+	local dx = playerPos.x - portalPos.x
+	local dy = playerPos.y - portalPos.y
+	return (dx * passDir.x + dy * passDir.y) >= (margin or PORTAL_PLANE_MARGIN)
+end
+
+local function hasPortalTouch(playerPos, portalPos, currentNode)
+	if not (playerPos and portalPos and currentNode) then
+		return false
+	end
+
+	local touch = getTouchDistance()
+	if Common.Distance2D(playerPos, portalPos) > touch then
+		return false
+	end
+
+	return AreaSpatial.IsWithinArea(playerPos, currentNode)
+end
+
+local function hasPortalOvershoot(playerPos, portalPos, currentNode)
+	if not (playerPos and portalPos and currentNode) then
+		return false
+	end
+
+	local dist2D = Common.Distance2D(playerPos, portalPos)
+	if dist2D > getOvershootTouchDistance() then
+		return false
+	end
+
+	local track = G.Navigation.nodePassTrack
+	if not (track and track.nodeId == currentNode.id and track.dirToTarget) then
+		return false
+	end
+
+	local dirNow = horizontalDir(playerPos, portalPos)
+	if not dirNow then
+		dirNow = horizontalUnit(G.BotIntendedWishDir)
+	end
+	if not dirNow then
+		return false
+	end
+
+	local dirDot = track.dirToTarget:Dot(dirNow)
+	if dirDot >= getPassDirDotThreshold() then
+		return false
+	end
+
+	return AreaSpatial.IsWithinArea(playerPos, currentNode)
+end
+
+local function evaluatePortalPass(
+	playerPos,
+	portalPos,
+	passDir,
+	exitDir,
+	portalMin,
+	portalMax,
+	currentNode,
+	nextNode,
+	apexKind
+)
+	local isDrop = apexKind == "drop" or (currentNode and portalPos and nextNode and getSegmentDropHeight(currentNode, nextNode, portalPos) > DROP_Z_THRESHOLD)
+
+	if isDrop then
+		if nextNode and PathStringPull.HasEnteredNextArea(playerPos, nextNode) then
+			return true, "drop_landed"
+		end
+
+		local pLocal = G.pLocal and G.pLocal.entity
+		if pLocal and not GroundMovement.isOnGround(pLocal) then
+			if isWithinPortalSpan(playerPos, exitDir, portalMin, portalMax, PORTAL_SPAN_TOLERANCE) then
+				return true, "drop_airborne"
+			end
+			if passDir and hasCrossedPortalPlane(playerPos, portalPos, passDir, -16) then
+				return true, "drop_airborne"
+			end
+		end
+	end
+
+	local inNext = nextNode and PathStringPull.HasEnteredNextArea(playerPos, nextNode)
+	local inCurrent = currentNode and AreaSpatial.IsWithinArea(playerPos, currentNode)
+
+	-- Entered next area: must be near this segment's portal (stops corner overlap false-advance)
+	if inNext and not inCurrent and portalPos and nextNode then
+		local dist2D = Common.Distance2D(playerPos, portalPos)
+		local inPortalSpan =
+			isWithinPortalSpan(playerPos, exitDir, portalMin, portalMax, PORTAL_SPAN_TOLERANCE)
+		if dist2D <= getOvershootTouchDistance() and inPortalSpan then
+			return true, "inside_next"
+		end
+	end
+
+	if not isWithinPortalSpan(playerPos, exitDir, portalMin, portalMax, PORTAL_SPAN_TOLERANCE) then
+		return false, nil
+	end
+
+	-- No portal advance while jumping — causes false segment pop and path desync.
+	if not isSmartJumpActive() then
+		if passDir and hasCrossedPortalPlane(playerPos, portalPos, passDir) then
+			return true, "portal_plane"
+		end
+
+		if hasPortalTouch(playerPos, portalPos, currentNode) and passDir then
+			if hasCrossedPortalPlane(playerPos, portalPos, passDir, 0) then
+				return true, "portal_touch"
+			end
+		end
+
+		if not isDrop and hasPortalOvershoot(playerPos, portalPos, currentNode) then
+			return true, "portal_overshoot"
+		end
+	end
+
+	return false, nil
+end
+
+local function hasPassedThroughPortal(playerPos, apex, currentNode)
+	if not (apex and apex.pos) then
+		return false
+	end
+
+	local nextNode = getPathNodeById(apex.nextAreaId)
+	local passed, _reason = evaluatePortalPass(
+		playerPos,
+		apex.pos,
+		apex.passDir,
+		apex.exitDir,
+		apex.portalMin,
+		apex.portalMax,
+		currentNode,
+		nextNode,
+		apex.kind
+	)
+	return passed
+end
+
+local function hasPassedPortalApex(playerPos, apex, currentNode)
+	if not (apex and apex.pos) then
+		return false
+	end
+
+	if isApproachKind(apex.kind) or apex.kind == "goal" then
+		return hasPassedApproachApex(playerPos, apex)
+	end
+
+	if isTransitionKind(apex.kind) then
+		return hasPassedThroughPortal(playerPos, apex, currentNode)
+	end
+
+	return false
+end
+
+function PathStringPull.GetSegmentPortalPos(area, nextArea)
+	local data = getSegmentPortalData(area, nextArea)
+	return data and data.portalPos or nil
+end
+
+--- Player→portal line must leave current area through the shared portal opening.
+function PathStringPull.CanWalkToSegmentPortal(playerPos, currentNode, nextNode)
+	if not (playerPos and currentNode and nextNode) then
+		return false, nil
+	end
+
+	local data = getSegmentPortalData(currentNode, nextNode)
+	if not data or not data.portalMin or not data.portalMax or not data.portalPos then
+		return false, nil
+	end
+
+	local dir = horizontalDir(playerPos, data.portalPos)
+	if not dir then
+		return false, nil
+	end
+
+	local exitPt, _exitDist, foundExitDir = NavGeometry.FindNodeExit(playerPos, dir, currentNode)
+	if not exitPt or foundExitDir ~= data.exitDir then
+		return false, nil
+	end
+
+	local coord = getSharedAxisCoord(exitPt, data.exitDir)
+	if not isCoordInPortalSpan(coord, data.portalMin, data.portalMax, PORTAL_SPAN_TOLERANCE) then
+		return false, nil
+	end
+
+	return true, data.portalPos
+end
+
+function PathStringPull.ResetApexAdvanceTick()
+	apexAdvanceTick = -1
+end
+
+--- Drop apexes for a consumed path node (runtime trim — never rebuild ProcessAreaPath).
+function PathStringPull.ConsumeNodeApexes(consumedNodeId)
+	local apexes = G.Navigation.apexPath
+	if not apexes or not consumedNodeId then
+		return
+	end
+
+	local i = 1
+	while i <= #apexes do
+		if apexes[i].areaId == consumedNodeId then
+			table.remove(apexes, i)
+		else
+			break
+		end
+	end
+
+	G.Navigation.apexIndex = 1
+	PathStringPull.ResetApexAdvanceTick()
+end
+
+--- Drop path[1] only when feet are firmly in path[2] (one node per call — no multi-pop).
+function PathStringPull.SyncPathPrefixToPlayer(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 2 or not playerPos then
+		return false
+	end
+
+	local pLocal = G.pLocal and G.pLocal.entity
+	if pLocal and not GroundMovement.isOnGround(pLocal) then
+		return false
+	end
+
+	local nextNode = path[2]
+	local inNextArea = false
+
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if playerArea and playerArea.id == nextNode.id then
+		inNextArea = true
+	elseif AreaSpatial.IsWithinArea(playerPos, nextNode) then
+		local currentNode = path[1]
+		if not currentNode or not AreaSpatial.IsWithinArea(playerPos, currentNode) then
+			inNextArea = true
+		end
+	end
+
+	if not inNextArea then
+		return false
+	end
+
+	local floorZ = getGroundZOnNode(playerPos, nextNode)
+	if floorZ and math.abs(playerPos.z - floorZ) > getNodeTouchHeight() then
+		return false
+	end
+
+	local removed = table.remove(path, 1)
+	if removed and removed.id then
+		PathStringPull.ConsumeNodeApexes(removed.id)
+	end
+
+	G.Navigation.currentNodeIndex = 1
+	return removed ~= nil
+end
+
+--- Follow / goal nudge: update last goal apex only (no full string-pull rebuild).
+function PathStringPull.UpdateGoalApex(goalPos)
+	local apexes = G.Navigation.apexPath
+	if not apexes or #apexes == 0 or not goalPos then
+		return
+	end
+
+	local apex = apexes[#apexes]
+	if not apex or apex.kind ~= "goal" then
+		return
+	end
+
+	local path = G.Navigation.path
+	local lastArea = path and path[#path]
+	apex.pos = lastArea and withGroundZ(goalPos, lastArea) or goalPos
+end
+
+function PathStringPull.lockIntentTowardNode(playerPos, targetNode, _nodeAfter)
 	if not (targetNode and targetNode.pos) then
 		G.Navigation.nodePassTrack = nil
 		return
@@ -10227,39 +10336,634 @@ function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
 	}
 end
 
-local function ensureSegmentIntent(playerPos, currentNode, nextNode)
-	local track = G.Navigation.nodePassTrack
-	if track and track.nodeId == currentNode.id and track.dirToTarget then
-		return track
-	end
-
-	local steer = PathStringPull.GetMovementTarget(playerPos)
-	local dir = horizontalDir(playerPos, steer or currentNode.pos)
-	if not dir then
-		dir = horizontalUnit(G.BotIntendedWishDir)
-	end
-
-	track = {
-		nodeId = currentNode.id,
-		dirToTarget = dir,
-	}
-	G.Navigation.nodePassTrack = track
-	return track
-end
-
-function PathSteering.getMovementTarget(playerPos, _path, _goalPos)
-	return PathStringPull.GetMovementTarget(playerPos)
-end
-
-function PathSteering.getReachDistance2D(_currentNode, _nextNode)
+function PathStringPull.getReachDistance2D(_currentNode, _nextNode)
 	return getTouchDistance()
 end
 
-function PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
-	return PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+--- On current path segment: in area, or in portal band (shared axis + Z within 82 of local floor).
+function PathStringPull.IsNearSegmentPortal(playerPos, currentNode, nextNode)
+	if AreaSpatial.IsWithinArea(playerPos, currentNode) then
+		return true
+	end
+
+	local data = getSegmentPortalData(currentNode, nextNode)
+	if not data or not data.portalMin or not data.portalMax then
+		return false
+	end
+	if not isWithinPortalSpan(playerPos, data.exitDir, data.portalMin, data.portalMax, PORTAL_SPAN_TOLERANCE) then
+		return false
+	end
+
+	local floorZ = getGroundZOnNode(playerPos, currentNode)
+	if not floorZ then
+		return true
+	end
+	return math.abs(playerPos.z - floorZ) <= getNodeTouchHeight()
 end
 
-return PathSteering
+--- Run once after A* — startPos is player position at path-find time.
+function PathStringPull.ProcessAreaPath(areaPath, goalPos, startPos)
+	local apexes = {}
+
+	if not areaPath or #areaPath == 0 then
+		if goalPos then
+			pushApex(apexes, goalPos, "goal", nil, nil, nil, nil, nil, nil)
+		end
+		return apexes
+	end
+
+	local lastPos = startPos or areaPath[1].pos
+
+	for i = 1, #areaPath - 1 do
+		local area = areaPath[i]
+		local nextArea = areaPath[i + 1]
+		if not (area and nextArea and area.pos and nextArea.pos) then
+			goto continue_segment
+		end
+
+		local prevArea = i > 1 and areaPath[i - 1] or nil
+		local exitDir = getExitDirBetween(area, nextArea)
+		local entryDir = getEntryDirIntoArea(prevArea, area, lastPos)
+		local portalMin, portalMax =
+			NavPortal.GetPortalSpanForNeighbor(area, nextArea, exitDir, STRING_PULL_DOORS_ONLY)
+		local portalPos = getPortalPoint(area, nextArea, exitDir)
+		local passDir = horizontalDir(portalPos, withGroundZ(nextArea.pos, nextArea))
+
+		if needsCenterForSameSideEntry(entryDir, exitDir) then
+			local centerPos = withGroundZ(area.pos, area)
+			pushApex(apexes, centerPos, "same_side_center", area.id, nextArea.id, nil, nil, nil, nil)
+			lastPos = centerPos
+		end
+
+		if needsApproachBeforePortal(lastPos, area, nextArea, exitDir, portalMin, portalMax, portalPos) then
+			local approachPos =
+				computeApproachPoint(lastPos, area, portalPos, exitDir, portalMin, portalMax)
+			if approachPos then
+				pushApex(apexes, approachPos, "approach", area.id, nextArea.id, nil, nil, nil, nil)
+				lastPos = approachPos
+			end
+		end
+
+		local dropHeight = getSegmentDropHeight(area, nextArea, portalPos)
+		local transitionKind = dropHeight > DROP_Z_THRESHOLD and "drop" or "portal"
+		pushApex(apexes, portalPos, transitionKind, area.id, nextArea.id, passDir, exitDir, portalMin, portalMax)
+		lastPos = portalPos
+
+		::continue_segment::
+	end
+
+	if goalPos then
+		local lastArea = areaPath[#areaPath]
+		local groundedGoal = lastArea and withGroundZ(goalPos, lastArea) or goalPos
+		pushApex(apexes, groundedGoal, "goal", nil, nil, nil, nil, nil, nil)
+	end
+
+	return apexes
+end
+
+--- Read-only peek for debug draw — never advances apexIndex.
+function PathStringPull.GetCachedApexTarget()
+	local apexes = G.Navigation.apexPath
+	local idx = G.Navigation.apexIndex or 1
+	if apexes and apexes[idx] and apexes[idx].pos then
+		return apexes[idx].pos
+	end
+	return G.Navigation.goalPos
+end
+
+local function advanceApexIndexOncePerTick(playerPos)
+	local tick = globals.TickCount()
+	if apexAdvanceTick == tick then
+		return
+	end
+	apexAdvanceTick = tick
+
+	local apexes = G.Navigation.apexPath
+	if not apexes or #apexes == 0 then
+		return
+	end
+
+	local path = G.Navigation.path
+	local currentNode = path and path[1]
+	local segmentStart = getApexIndexForCurrentSegment(apexes, path)
+	local idx = G.Navigation.apexIndex or 1
+	if idx < segmentStart then
+		idx = segmentStart
+	end
+
+	while idx <= #apexes do
+		local apex = apexes[idx]
+		if not apexIsForCurrentSegment(apex, path) then
+			break
+		end
+		if not hasPassedPortalApex(playerPos, apex, currentNode) then
+			break
+		end
+		idx = idx + 1
+	end
+
+	if idx > #apexes then
+		idx = #apexes
+	end
+
+	if not apexIsForCurrentSegment(apexes[idx], path) then
+		idx = segmentStart
+	end
+
+	G.Navigation.apexIndex = idx
+end
+
+function PathStringPull.GetMovementTarget(playerPos)
+	local apexes = G.Navigation.apexPath
+	if not apexes or #apexes == 0 then
+		return G.Navigation.goalPos
+	end
+
+	advanceApexIndexOncePerTick(playerPos)
+
+	local idx = G.Navigation.apexIndex or 1
+	if idx < 1 then
+		idx = 1
+	end
+	if idx > #apexes then
+		idx = #apexes
+	end
+
+	local apex = apexes[idx]
+	local path = G.Navigation.path
+	local currentNode = path and path[1]
+	return getSteerPosForApex(playerPos, apex, currentNode) or apex.pos
+end
+
+function PathStringPull.IsApproachApexPending(playerPos, currentNode, nextNode)
+	if not (currentNode and nextNode) then
+		return false
+	end
+
+	local apexes = G.Navigation.apexPath
+	if not apexes then
+		return false
+	end
+
+	local centerIdx = nil
+	local centerApex = nil
+	for i = 1, #apexes do
+		local apex = apexes[i]
+		if isApproachKind(apex.kind) and apex.areaId == currentNode.id and apex.nextAreaId == nextNode.id then
+			centerIdx = i
+			centerApex = apex
+			break
+		end
+	end
+
+	if not centerApex then
+		return false
+	end
+
+	local idx = G.Navigation.apexIndex or 1
+	if idx > centerIdx then
+		return false
+	end
+
+	return not hasPassedApproachApex(playerPos, centerApex)
+end
+
+PathStringPull.IsCenterApexPending = PathStringPull.IsApproachApexPending
+
+--- Claim next area: nav id under feet; airborne only uses bounds (no ground overlap).
+function PathStringPull.HasEnteredNextArea(playerPos, nextArea)
+	if not nextArea then
+		return false
+	end
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if playerArea then
+		return playerArea.id == nextArea.id
+	end
+	local pLocal = G.pLocal and G.pLocal.entity
+	if pLocal and not GroundMovement.isOnGround(pLocal) then
+		return AreaSpatial.IsWithinArea(playerPos, nextArea)
+	end
+	return false
+end
+
+--- True when we walked through the portal opening (shared-axis span + plane/touch/overshoot).
+function PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+	if not (currentNode and nextNode) then
+		return false, nil
+	end
+
+	local transitionApex = findSegmentTransitionApex(currentNode.id, nextNode.id)
+	if not transitionApex then
+		if PathStringPull.HasEnteredNextArea(playerPos, nextNode) then
+			return true, "inside_next"
+		end
+		return false, nil
+	end
+
+	local exitDir, portalMin, portalMax = resolvePortalSpan(transitionApex, currentNode, nextNode)
+	if not portalMin then
+		return false, nil
+	end
+
+	return evaluatePortalPass(
+		playerPos,
+		transitionApex.pos,
+		transitionApex.passDir,
+		exitDir,
+		portalMin,
+		portalMax,
+		currentNode,
+		nextNode,
+		transitionApex.kind
+	)
+end
+
+return PathStringPull
+
+end)
+__bundle_register("NavBot.Bot.GroundMovement", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Ground movement physics (from Auto_Trickstab SimulateDash / CalculateOptimalWishdir)
+Friction + sv_accelerate ground model for optimal wish direction each tick.
+]]
+
+local GroundMovement = {}
+
+local TWO_PI = 2 * math.pi
+local DEG_TO_RAD = math.pi / 180
+
+local DEFAULT_FRICTION = 4
+local DEFAULT_ACCELERATE = 10
+local DEFAULT_STOP_SPEED = 100
+local DEFAULT_MAX_SPEED = 320
+local DEFAULT_CMD_SPEED = 450
+
+local function getTickInterval()
+	local tick = globals.TickInterval()
+	if tick <= 0 then
+		return 1 / 66.67
+	end
+	return tick
+end
+
+local function getFriction()
+	local ok, val = pcall(client.GetConVar, "sv_friction")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_FRICTION
+end
+
+local function getAccelerate()
+	local ok, val = pcall(client.GetConVar, "sv_accelerate")
+	if ok and val and val > 0 then
+		return val
+	end
+	return DEFAULT_ACCELERATE
+end
+
+local function horizontalDir(from, to)
+	local dir = Vector3(to.x - from.x, to.y - from.y, 0)
+	local len = dir:Length2D()
+	if len < 0.001 then
+		return nil, 0
+	end
+	return dir / len, len
+end
+
+---@param velocity Vector3
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyFriction(velocity, onGround)
+	if not velocity or not onGround then
+		return velocity or Vector3(0, 0, 0)
+	end
+
+	local speed = velocity:Length()
+	if speed < DEFAULT_STOP_SPEED then
+		return Vector3(0, 0, 0)
+	end
+
+	local tick = getTickInterval()
+	local friction = getFriction() * tick
+	local control = speed < DEFAULT_STOP_SPEED and DEFAULT_STOP_SPEED or speed
+	local drop = control * friction
+	local newSpeed = speed - drop
+
+	if newSpeed < 0 then
+		newSpeed = 0
+	end
+
+	if newSpeed < speed then
+		return velocity * (newSpeed / speed)
+	end
+
+	return velocity
+end
+
+--- One tick of ground acceleration along wishdir (TF2 ProcessMovement style).
+---@param velocity Vector3
+---@param wishdir Vector3
+---@param maxSpeed number
+---@param onGround boolean
+---@return Vector3
+function GroundMovement.applyGroundAccel(velocity, wishdir, maxSpeed, onGround)
+	if not onGround or not wishdir then
+		return velocity
+	end
+
+	local tick = getTickInterval()
+	local accel = getAccelerate()
+	local vel = Vector3(velocity.x, velocity.y, velocity.z)
+
+	local currentSpeed = vel:Dot(wishdir)
+	local addSpeed = maxSpeed - currentSpeed
+	if addSpeed > 0 then
+		local accelSpeed = math.min(accel * maxSpeed * tick, addSpeed)
+		vel = vel + wishdir * accelSpeed
+	end
+
+	local horizSpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+	if horizSpeed > maxSpeed then
+		local scale = maxSpeed / horizSpeed
+		vel = Vector3(vel.x * scale, vel.y * scale, vel.z)
+	end
+
+	return vel
+end
+
+--- Coast with friction only (no input), like CalculateOptimalWishdir pass 1.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param ticks number
+---@param onGround boolean
+---@return Vector3 pos, Vector3 vel
+function GroundMovement.predictCoast(startPos, startVel, ticks, onGround)
+	local tick = getTickInterval()
+	local pos = Vector3(startPos.x, startPos.y, startPos.z)
+	local vel = Vector3(startVel.x, startVel.y, startVel.z)
+
+	for _ = 1, ticks do
+		pos = pos + vel * tick
+		vel = GroundMovement.applyFriction(vel, onGround)
+	end
+
+	return pos, vel
+end
+
+--- Wish direction after coasting: where we should accelerate after friction bleeds velocity.
+---@param startPos Vector3
+---@param startVel Vector3
+---@param dest Vector3
+---@param coastTicks number|nil
+---@param onGround boolean
+---@return Vector3|nil wishdir
+function GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
+	coastTicks = coastTicks or 1
+	onGround = onGround ~= false
+
+	local coastPos, _coastVel
+	if coastTicks > 0 and onGround then
+		coastPos, _coastVel = GroundMovement.predictCoast(startPos, startVel, coastTicks, onGround)
+	else
+		coastPos = startPos
+	end
+
+	local wishdir, dist = horizontalDir(coastPos, dest)
+	if not wishdir then
+		return nil
+	end
+
+	-- Already at target after coast
+	if dist < 1.5 then
+		return nil
+	end
+
+	return wishdir
+end
+
+--- How many ticks to coast before aiming (more speed → slightly more lookahead).
+function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
+	if not maxSpeed or maxSpeed <= 0 then
+		return 1
+	end
+	local ratio = horizSpeed / maxSpeed
+	if ratio < 0.25 then
+		return 0
+	end
+	if ratio < 0.6 then
+		return 1
+	end
+	return 2
+end
+
+--- Convert world wish direction into forward/side move (view-relative).
+---@param cmd UserCmd
+---@param wishdir Vector3
+---@param cmdSpeed number|nil
+function GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
+	cmdSpeed = cmdSpeed or DEFAULT_CMD_SPEED
+
+	local targetYaw = (math.atan(wishdir.y, wishdir.x) + TWO_PI) % TWO_PI
+	local _, currentYaw = cmd:GetViewAngles()
+	currentYaw = currentYaw * DEG_TO_RAD
+
+	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
+
+	cmd:SetForwardMove(math.cos(yawDiff) * cmdSpeed)
+	cmd:SetSideMove(math.sin(-yawDiff) * cmdSpeed)
+end
+
+--- Simulate one tick forward with friction + accel; returns post-tick position.
+function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+	return pos + vel * tick, vel
+end
+
+local STEP_HEIGHT = Vector3(0, 0, 18)
+
+--- One ground physics tick with hull collision (for SmartJump prediction).
+---@return Vector3|nil newPos
+---@return Vector3 newVel
+---@return boolean hitWall
+---@return table|nil wallTrace
+function GroundMovement.simulateGroundStepHull(pos, vel, wishdir, maxSpeed, hullMin, hullMax, onGround)
+	local tick = getTickInterval()
+	vel = GroundMovement.applyFriction(vel, onGround)
+	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
+
+	local targetPos = pos + vel * tick
+	local step = STEP_HEIGHT
+
+	local startTrace = engine.TraceHull(pos + step, pos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local startOnGround = startTrace.endpos
+
+	local upTrace = engine.TraceHull(targetPos + step, targetPos, hullMin, hullMax, MASK_PLAYERSOLID)
+	local targetRaised = upTrace.endpos
+
+	local wallTrace = engine.TraceHull(startOnGround + step, targetRaised + step, hullMin, hullMax, MASK_PLAYERSOLID)
+	local newPos = targetRaised
+	if wallTrace.fraction > 0 then
+		newPos = wallTrace.endpos
+	end
+
+	local groundTrace = engine.TraceHull(newPos, newPos - step * 2, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	groundTrace = engine.TraceHull(newPos, newPos - step, hullMin, hullMax, MASK_PLAYERSOLID)
+	if groundTrace.fraction >= 1 then
+		return nil, vel, false, nil
+	end
+	newPos = groundTrace.endpos
+
+	local hitWall = wallTrace.fraction < 1
+	if hitWall then
+		local wallNormal = wallTrace.plane
+		local up = Vector3(0, 0, 1)
+		local wallAngle = math.deg(math.acos(wallNormal:Dot(up)))
+		if wallAngle > 55 then
+			local dot = vel:Dot(wallNormal)
+			vel = vel - wallNormal * dot
+		end
+	end
+
+	return newPos, vel, hitWall, wallTrace
+end
+
+function GroundMovement.getMaxSpeed(player)
+	local cap = player and player:GetPropFloat("m_flMaxspeed")
+	if cap and cap > 0 then
+		return cap
+	end
+	return DEFAULT_MAX_SPEED
+end
+
+function GroundMovement.isOnGround(player)
+	if not player then
+		return false
+	end
+	local flags = player:GetPropInt("m_fFlags")
+	return (flags & FL_ONGROUND) ~= 0
+end
+
+return GroundMovement
+
+end)
+__bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Node advance — simple rules:
+  1. Entered path[2] (nav id or area bounds — no XY touch padding on next area)
+  2. Edge/door pass on portal segments only (shared-axis span + crossed plane)
+  3. Skip_Nodes + on path[1] + CanSkip to path[2] (doorsOnly=false)
+]]
+
+local G = require("NavBot.Core.Globals")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
+
+local NodeSkipper = {}
+
+local EDGE_PASS_REASONS = {
+	portal_plane = true,
+	portal_touch = true,
+	inside_next = true,
+	drop_landed = true,
+	drop_airborne = true,
+}
+
+local function getTouchDist()
+	return (G.Misc and G.Misc.NodeTouchDistance) or 16
+end
+
+--- 16 XY + 82 Z touch on a node (current node only — not used for next-area claim).
+local function hasNodeTouch(playerPos, node)
+	if not node then
+		return false
+	end
+	if AreaSpatial.IsWithinArea(playerPos, node) then
+		return true
+	end
+	local touchDist = getTouchDist()
+	return AreaSpatial.DistSqPointToAABB(playerPos, node) <= touchDist * touchDist
+end
+
+local function isEdgeSegment(currentNode, nextNode)
+	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
+end
+
+local function isOnCurrentNode(playerPos, currentNode, nextNode)
+	if hasNodeTouch(playerPos, currentNode) then
+		return true
+	end
+	return PathStringPull.IsNearSegmentPortal(playerPos, currentNode, nextNode)
+end
+
+local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
+	if not fromAreaNode or not goalPos then
+		return false
+	end
+	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, false, allowJump)
+	return success and canSkip == true
+end
+
+--- True when path[1] is claimed — entered next area, passed portal edge, or CanSkip to path[2].
+function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
+	if not (playerPos and currentNode and nextNode and nextNode.pos) then
+		return false, nil
+	end
+
+	if PathStringPull.HasEnteredNextArea(playerPos, nextNode) then
+		return true, "in_next_area"
+	end
+
+	if isEdgeSegment(currentNode, nextNode) then
+		local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+		if passed and EDGE_PASS_REASONS[passReason] then
+			return true, passReason
+		end
+	end
+
+	if not (G.Menu.Navigation and G.Menu.Navigation.Skip_Nodes) then
+		return false, "skip_disabled"
+	end
+
+	if not isOnCurrentNode(playerPos, currentNode, nextNode) then
+		return false, "not_on_current"
+	end
+
+	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+	if canWalkToNextNode(playerPos, nextNode.pos, currentNode, allowJump) then
+		return true, "navigable_to_next"
+	end
+
+	return false, "not_walkable_to_next"
+end
+
+function NodeSkipper.NoteAdvance(_playerPos, _reason)
+end
+
+function NodeSkipper.Reset()
+	G.Navigation.nodePassTrack = nil
+	G.Navigation.lastAdvancePos = nil
+	G.Navigation.lastStuckTargetDist2D = nil
+	G.Navigation.skipBlockedUntilTick = nil
+end
+
+function NodeSkipper.BlockSkippingAfterPathSet()
+end
+
+function NodeSkipper.BlockSkippingForTicks(_ticks)
+	G.Navigation.skipBlockedUntilTick = nil
+	G.Navigation.lastAdvancePos = nil
+end
+
+return NodeSkipper
 
 end)
 __bundle_register("NavBot.Algorithms.A-Star", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -10741,6 +11445,146 @@ end
 return WorkManager
 
 end)
+__bundle_register("NavBot.Bot.NavMoveDebug", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Nav movement debug — one-line status when Navigation.MoveDebug is enabled.
+Imported by: MovementDecisions, Navigation
+]]
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Node = require("NavBot.Navigation.Node")
+local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+
+local NavMoveDebug = {}
+local Log = Common.Log.new("NavMove")
+
+local STATUS_INTERVAL = 33
+local lastStatusTick = 0
+local lastBlockKey = nil
+
+local function isEnabled()
+	return G.Menu.Navigation and G.Menu.Navigation.MoveDebug == true
+end
+
+local function getPlayerAreaId(playerPos)
+	local area = Node.GetAreaAtPosition(playerPos)
+	return area and area.id or nil
+end
+
+local function getApexSummary()
+	local apexes = G.Navigation.apexPath
+	local idx = G.Navigation.apexIndex or 1
+	if not apexes or not apexes[idx] then
+		return "apex=none"
+	end
+
+	local apex = apexes[idx]
+	return string.format(
+		"apex[%d] %s %s->%s",
+		idx,
+		tostring(apex.kind or "?"),
+		tostring(apex.areaId or "-"),
+		tostring(apex.nextAreaId or "-")
+	)
+end
+
+local function getSmartJumpState()
+	local state = G.SmartJump and G.SmartJump.jumpState
+	if not state or state == "STATE_IDLE" then
+		return "idle"
+	end
+	return state
+end
+
+function NavMoveDebug.OnAdvanceBlocked(playerPos, currentNode, nextNode, reason)
+	if not isEnabled() then
+		return
+	end
+	if not (currentNode and nextNode and reason) then
+		return
+	end
+
+	local key = tostring(currentNode.id) .. "->" .. tostring(nextNode.id) .. ":" .. reason
+	if key == lastBlockKey then
+		return
+	end
+	lastBlockKey = key
+
+	local feetArea = getPlayerAreaId(playerPos)
+	Log:Info(
+		"BLOCKED %s->%s (%s) feet=%s dist2d=%.0f",
+		tostring(currentNode.id),
+		tostring(nextNode.id),
+		reason,
+		tostring(feetArea or "?"),
+		Common.Distance2D(playerPos, nextNode.pos)
+	)
+end
+
+function NavMoveDebug.OnAdvanced(currentId, reason)
+	if not isEnabled() then
+		return
+	end
+	lastBlockKey = nil
+	Log:Info("ADVANCED left node %s (%s)", tostring(currentId), tostring(reason or "?"))
+end
+
+function NavMoveDebug.OnPathAligned(playerAreaId, pathLen)
+	if not isEnabled() then
+		return
+	end
+	Log:Info("PATH ALIGNED to area %s (pathLen=%d)", tostring(playerAreaId), pathLen or 0)
+end
+
+function NavMoveDebug.Tick(playerPos, speed2D)
+	if not isEnabled() then
+		return
+	end
+	if not playerPos then
+		return
+	end
+
+	local now = globals.TickCount()
+	if now - lastStatusTick < STATUS_INTERVAL then
+		return
+	end
+	lastStatusTick = now
+
+	local path = G.Navigation.path
+	if not path or #path == 0 then
+		return
+	end
+
+	local currentNode = path[1]
+	local nextNode = path[2]
+	local feetArea = getPlayerAreaId(playerPos)
+	local targetPos = G.Navigation.currentTargetPos
+	local targetDist = targetPos and Common.Distance2D(playerPos, targetPos) or -1
+	local nextDist = nextNode and nextNode.pos and Common.Distance2D(playerPos, nextNode.pos) or -1
+	local canAdvance, advanceReason = NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
+	local advanceState = canAdvance and ("can:" .. tostring(advanceReason)) or tostring(advanceReason or "?")
+
+	local segment = nextNode and string.format("%s->%s", tostring(currentNode.id), tostring(nextNode.id))
+		or tostring(currentNode.id)
+
+	Log:Info(
+		"seg=%s len=%d feet=%s spd=%.0f tgt=%.0f next=%.0f advance=%s %s jump=%s",
+		segment,
+		#path,
+		tostring(feetArea or "?"),
+		speed2D or 0,
+		targetDist,
+		nextDist,
+		advanceState,
+		getApexSummary(),
+		getSmartJumpState()
+	)
+end
+
+return NavMoveDebug
+
+end)
 __bundle_register("NavBot.Bot.MovementController", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
 Movement Controller - TF2 ground physics walk (Auto_Trickstab friction + accel model)
@@ -10817,458 +11661,6 @@ function MovementController.handleCameraRotation(userCmd, targetPos)
 end
 
 return MovementController
-
-end)
-__bundle_register("NavBot.Bot.GroundMovement", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-Ground movement physics (from Auto_Trickstab SimulateDash / CalculateOptimalWishdir)
-Friction + sv_accelerate ground model for optimal wish direction each tick.
-]]
-
-local GroundMovement = {}
-
-local TWO_PI = 2 * math.pi
-local DEG_TO_RAD = math.pi / 180
-
-local DEFAULT_FRICTION = 4
-local DEFAULT_ACCELERATE = 10
-local DEFAULT_STOP_SPEED = 100
-local DEFAULT_MAX_SPEED = 320
-local DEFAULT_CMD_SPEED = 450
-
-local function getTickInterval()
-	local tick = globals.TickInterval()
-	if tick <= 0 then
-		return 1 / 66.67
-	end
-	return tick
-end
-
-local function getFriction()
-	local ok, val = pcall(client.GetConVar, "sv_friction")
-	if ok and val and val > 0 then
-		return val
-	end
-	return DEFAULT_FRICTION
-end
-
-local function getAccelerate()
-	local ok, val = pcall(client.GetConVar, "sv_accelerate")
-	if ok and val and val > 0 then
-		return val
-	end
-	return DEFAULT_ACCELERATE
-end
-
-local function horizontalDir(from, to)
-	local dir = Vector3(to.x - from.x, to.y - from.y, 0)
-	local len = dir:Length2D()
-	if len < 0.001 then
-		return nil, 0
-	end
-	return dir / len, len
-end
-
----@param velocity Vector3
----@param onGround boolean
----@return Vector3
-function GroundMovement.applyFriction(velocity, onGround)
-	if not velocity or not onGround then
-		return velocity or Vector3(0, 0, 0)
-	end
-
-	local speed = velocity:Length()
-	if speed < DEFAULT_STOP_SPEED then
-		return Vector3(0, 0, 0)
-	end
-
-	local tick = getTickInterval()
-	local friction = getFriction() * tick
-	local control = speed < DEFAULT_STOP_SPEED and DEFAULT_STOP_SPEED or speed
-	local drop = control * friction
-	local newSpeed = speed - drop
-
-	if newSpeed < 0 then
-		newSpeed = 0
-	end
-
-	if newSpeed < speed then
-		return velocity * (newSpeed / speed)
-	end
-
-	return velocity
-end
-
---- One tick of ground acceleration along wishdir (TF2 ProcessMovement style).
----@param velocity Vector3
----@param wishdir Vector3
----@param maxSpeed number
----@param onGround boolean
----@return Vector3
-function GroundMovement.applyGroundAccel(velocity, wishdir, maxSpeed, onGround)
-	if not onGround or not wishdir then
-		return velocity
-	end
-
-	local tick = getTickInterval()
-	local accel = getAccelerate()
-	local vel = Vector3(velocity.x, velocity.y, velocity.z)
-
-	local currentSpeed = vel:Dot(wishdir)
-	local addSpeed = maxSpeed - currentSpeed
-	if addSpeed > 0 then
-		local accelSpeed = math.min(accel * maxSpeed * tick, addSpeed)
-		vel = vel + wishdir * accelSpeed
-	end
-
-	local horizSpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
-	if horizSpeed > maxSpeed then
-		local scale = maxSpeed / horizSpeed
-		vel = Vector3(vel.x * scale, vel.y * scale, vel.z)
-	end
-
-	return vel
-end
-
---- Coast with friction only (no input), like CalculateOptimalWishdir pass 1.
----@param startPos Vector3
----@param startVel Vector3
----@param ticks number
----@param onGround boolean
----@return Vector3 pos, Vector3 vel
-function GroundMovement.predictCoast(startPos, startVel, ticks, onGround)
-	local tick = getTickInterval()
-	local pos = Vector3(startPos.x, startPos.y, startPos.z)
-	local vel = Vector3(startVel.x, startVel.y, startVel.z)
-
-	for _ = 1, ticks do
-		pos = pos + vel * tick
-		vel = GroundMovement.applyFriction(vel, onGround)
-	end
-
-	return pos, vel
-end
-
---- Wish direction after coasting: where we should accelerate after friction bleeds velocity.
----@param startPos Vector3
----@param startVel Vector3
----@param dest Vector3
----@param coastTicks number|nil
----@param onGround boolean
----@return Vector3|nil wishdir
-function GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
-	coastTicks = coastTicks or 1
-	onGround = onGround ~= false
-
-	local coastPos, _coastVel
-	if coastTicks > 0 and onGround then
-		coastPos, _coastVel = GroundMovement.predictCoast(startPos, startVel, coastTicks, onGround)
-	else
-		coastPos = startPos
-	end
-
-	local wishdir, dist = horizontalDir(coastPos, dest)
-	if not wishdir then
-		return nil
-	end
-
-	-- Already at target after coast
-	if dist < 1.5 then
-		return nil
-	end
-
-	return wishdir
-end
-
---- How many ticks to coast before aiming (more speed → slightly more lookahead).
-function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
-	if not maxSpeed or maxSpeed <= 0 then
-		return 1
-	end
-	local ratio = horizSpeed / maxSpeed
-	if ratio < 0.25 then
-		return 0
-	end
-	if ratio < 0.6 then
-		return 1
-	end
-	return 2
-end
-
---- Convert world wish direction into forward/side move (view-relative).
----@param cmd UserCmd
----@param wishdir Vector3
----@param cmdSpeed number|nil
-function GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
-	cmdSpeed = cmdSpeed or DEFAULT_CMD_SPEED
-
-	local targetYaw = (math.atan(wishdir.y, wishdir.x) + TWO_PI) % TWO_PI
-	local _, currentYaw = cmd:GetViewAngles()
-	currentYaw = currentYaw * DEG_TO_RAD
-
-	local yawDiff = (targetYaw - currentYaw + math.pi) % TWO_PI - math.pi
-
-	cmd:SetForwardMove(math.cos(yawDiff) * cmdSpeed)
-	cmd:SetSideMove(math.sin(-yawDiff) * cmdSpeed)
-end
-
---- Simulate one tick forward with friction + accel; returns post-tick position.
-function GroundMovement.simulateGroundStep(pos, vel, wishdir, maxSpeed, onGround)
-	local tick = getTickInterval()
-	vel = GroundMovement.applyFriction(vel, onGround)
-	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
-	return pos + vel * tick, vel
-end
-
-local STEP_HEIGHT = Vector3(0, 0, 18)
-
---- One ground physics tick with hull collision (for SmartJump prediction).
----@return Vector3|nil newPos
----@return Vector3 newVel
----@return boolean hitWall
----@return table|nil wallTrace
-function GroundMovement.simulateGroundStepHull(pos, vel, wishdir, maxSpeed, hullMin, hullMax, onGround)
-	local tick = getTickInterval()
-	vel = GroundMovement.applyFriction(vel, onGround)
-	vel = GroundMovement.applyGroundAccel(vel, wishdir, maxSpeed, onGround)
-
-	local targetPos = pos + vel * tick
-	local step = STEP_HEIGHT
-
-	local startTrace = engine.TraceHull(pos + step, pos, hullMin, hullMax, MASK_PLAYERSOLID)
-	local startOnGround = startTrace.endpos
-
-	local upTrace = engine.TraceHull(targetPos + step, targetPos, hullMin, hullMax, MASK_PLAYERSOLID)
-	local targetRaised = upTrace.endpos
-
-	local wallTrace = engine.TraceHull(startOnGround + step, targetRaised + step, hullMin, hullMax, MASK_PLAYERSOLID)
-	local newPos = targetRaised
-	if wallTrace.fraction > 0 then
-		newPos = wallTrace.endpos
-	end
-
-	local groundTrace = engine.TraceHull(newPos, newPos - step * 2, hullMin, hullMax, MASK_PLAYERSOLID)
-	if groundTrace.fraction >= 1 then
-		return nil, vel, false, nil
-	end
-	newPos = groundTrace.endpos
-
-	groundTrace = engine.TraceHull(newPos, newPos - step, hullMin, hullMax, MASK_PLAYERSOLID)
-	if groundTrace.fraction >= 1 then
-		return nil, vel, false, nil
-	end
-	newPos = groundTrace.endpos
-
-	local hitWall = wallTrace.fraction < 1
-	if hitWall then
-		local wallNormal = wallTrace.plane
-		local up = Vector3(0, 0, 1)
-		local wallAngle = math.deg(math.acos(wallNormal:Dot(up)))
-		if wallAngle > 55 then
-			local dot = vel:Dot(wallNormal)
-			vel = vel - wallNormal * dot
-		end
-	end
-
-	return newPos, vel, hitWall, wallTrace
-end
-
-function GroundMovement.getMaxSpeed(player)
-	local cap = player and player:GetPropFloat("m_flMaxspeed")
-	if cap and cap > 0 then
-		return cap
-	end
-	return DEFAULT_MAX_SPEED
-end
-
-function GroundMovement.isOnGround(player)
-	if not player then
-		return false
-	end
-	local flags = player:GetPropInt("m_fFlags")
-	return (flags & FL_ONGROUND) ~= 0
-end
-
-return GroundMovement
-
-end)
-__bundle_register("NavBot.Algorithms.Greedy", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-    Greedy Best-First Search Algorithm
-    Fastest possible pathfinding using straight-line heuristic
-    Always expands node closest to destination (no cost consideration)
-    Author: titaniummachine1 (github.com/titaniummachine1)
-]]
-
-local G = require("NavBot.Core.Globals")
-local Navigation = require("NavBot.Navigation")
-
-local Greedy = {}
-
--- Calculate straight-line distance heuristic (Euclidean distance)
-local function heuristic(startPos, goalPos)
-	local dx = startPos.x - goalPos.x
-	local dy = startPos.y - goalPos.y
-	local dz = startPos.z - goalPos.z
-	return math.abs(dx) + math.abs(dy) + math.abs(dz)
-end
-
--- Main greedy pathfinding function
-function Greedy.FindPath(startPos, goalPos, maxIterations)
-	maxIterations = maxIterations or 500
-
-	local startNode = Navigation.GetClosestNode(startPos)
-	local goalNode = Navigation.GetClosestNode(goalPos)
-
-	if not startNode or not goalNode then
-		return {}
-	end
-
-	if startNode.id == goalNode.id then
-		return { startNode.id }
-	end
-
-	-- Priority queue based on distance to goal (min-heap)
-	local openSet = {}
-	local closedSet = {}
-	local cameFrom = {}
-
-	-- Insert start node with its heuristic value
-	table.insert(openSet, {
-		nodeId = startNode.id,
-		priority = heuristic(startPos, goalPos),
-	})
-
-	local iterations = 0
-
-	while #openSet > 0 and iterations < maxIterations do
-		iterations = iterations + 1
-
-		-- Get node with lowest heuristic value (closest to goal)
-		local current = table.remove(openSet, 1)
-
-		-- Skip if already visited
-		if closedSet[current.nodeId] then
-			goto continue
-		end
-
-		closedSet[current.nodeId] = true
-
-		-- Goal reached
-		if current.nodeId == goalNode.id then
-			-- Reconstruct path
-			local path = {}
-			local node = goalNode.id
-
-			while node do
-				table.insert(path, 1, node)
-				node = cameFrom[node]
-			end
-
-			return path
-		end
-
-		-- Get current node data
-		local currentNode = Navigation.GetNode(current.nodeId)
-		if not currentNode then
-			goto continue
-		end
-
-		-- Explore neighbors
-		local adjacent = Navigation.GetAdjacentNodes(current.nodeId)
-		for _, neighborId in ipairs(adjacent) do
-			if not closedSet[neighborId] then
-				local neighborNode = Navigation.GetNode(neighborId)
-				if neighborNode then
-					-- Calculate heuristic for neighbor
-					local neighborPos = Vector3(neighborNode.x, neighborNode.y, neighborNode.z)
-					local hValue = heuristic(neighborPos, goalPos)
-
-					-- Add to open set
-					table.insert(openSet, {
-						nodeId = neighborId,
-						priority = hValue,
-					})
-
-					-- Track parent
-					if not cameFrom[neighborId] then
-						cameFrom[neighborId] = current.nodeId
-					end
-				end
-			end
-		end
-
-		-- Sort open set by priority (lowest first)
-		table.sort(openSet, function(a, b)
-			return a.priority < b.priority
-		end)
-
-		::continue::
-	end
-
-	-- No path found within iteration limit
-	return {}
-end
-
--- Simple version with even less overhead for very fast pathfinding
-function Greedy.FindPathFast(startPos, goalPos, maxNodes)
-	maxNodes = maxNodes or 100
-
-	local startNode = Navigation.GetClosestNode(startPos)
-	local goalNode = Navigation.GetClosestNode(goalPos)
-
-	if not startNode or not goalNode then
-		return {}
-	end
-
-	if startNode.id == goalNode.id then
-		return { startNode.id }
-	end
-
-	local path = { startNode.id }
-	local currentId = startNode.id
-	local visited = { [currentId] = true }
-
-	for i = 1, maxNodes do
-		if currentId == goalNode.id then
-			return path
-		end
-
-		local adjacent = Navigation.GetAdjacentNodes(currentId)
-		local bestNeighbor = nil
-		local bestDistance = math.huge
-
-		-- Find neighbor closest to goal
-		for _, neighborId in ipairs(adjacent) do
-			if not visited[neighborId] then
-				local neighborNode = Navigation.GetNode(neighborId)
-				if neighborNode then
-					local neighborPos = Vector3(neighborNode.x, neighborNode.y, neighborNode.z)
-					local distance = heuristic(neighborPos, goalPos)
-
-					if distance < bestDistance then
-						bestDistance = distance
-						bestNeighbor = neighborId
-					end
-				end
-			end
-		end
-
-		if not bestNeighbor then
-			break -- Dead end
-		end
-
-		table.insert(path, bestNeighbor)
-		visited[bestNeighbor] = true
-		currentId = bestNeighbor
-	end
-
-	return path
-end
-
-print("Greedy Best-First Search algorithm loaded")
-
-return Greedy
 
 end)
 return __bundle_require("__root")

@@ -178,12 +178,30 @@ function Common.Dot(a, b)
 end
 
 -- Arrow line drawing function (moved from Visuals.lua and ISWalkable.lua)
-function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
+function Common.DrawArrowLine(
+	start_pos,
+	end_pos,
+	arrowhead_length,
+	arrowhead_width,
+	invert,
+	colorR,
+	colorG,
+	colorB,
+	colorA
+)
 	assert(start_pos and end_pos, "Common.DrawArrowLine: start_pos and end_pos are required")
 	assert(
 		arrowhead_length and arrowhead_width,
 		"Common.DrawArrowLine: arrowhead_length and arrowhead_width are required"
 	)
+	assert(
+		colorR and colorG and colorB and colorA,
+		"Common.DrawArrowLine: colorR, colorG, colorB, colorA is required (Lmaobox draw API)"
+	)
+	if not start_pos.Length or not end_pos.Length then
+		return
+	end
+	draw.Color(colorR, colorG, colorB, colorA)
 
 	-- If invert is true, swap start_pos and end_pos
 	if invert then
@@ -221,7 +239,6 @@ function Common.DrawArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_wi
 	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
 	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
 
-	-- Only draw if all screen positions are valid (uses draw.Color set by caller)
 	if w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2 then
 		-- Draw the line from start to the base of the arrow (not all the way to the end)
 		draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
@@ -303,7 +320,8 @@ function Common.Drawing.WorldToScreen(worldPos)
 	return client.WorldToScreen(worldPos)
 end
 
-function Common.Drawing.Draw3DBox(size, pos)
+function Common.Drawing.Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	-- Recompute corners every call to ensure correct size; caching caused wrong sizes
 	local corners = {

@@ -106,7 +106,8 @@ function NavDebug.GetHullTraceCount()
 	return #hullTraces
 end
 
-local function drawWorldLine(a, b)
+local function drawWorldLine(a, b, r, g, b, a)
+	draw.Color(r, g, b, a)
 	local w2sA = client.WorldToScreen(a)
 	local w2sB = client.WorldToScreen(b)
 	if w2sA and w2sB then
@@ -114,12 +115,11 @@ local function drawWorldLine(a, b)
 	end
 end
 
-local function setPathDrawColor(isNavigable)
+local function getPathDrawColor(isNavigable)
 	if isNavigable then
-		draw.Color(0, 255, 0, 255)
-	else
-		draw.Color(255, 0, 0, 255)
+		return 0, 255, 0, 255
 	end
+	return 255, 0, 0, 255
 end
 
 function NavDebug.Draw()
@@ -128,29 +128,27 @@ function NavDebug.Draw()
 	end
 
 	if debugWaypoints and #debugWaypoints >= 1 and debugLastResult ~= nil then
-		setPathDrawColor(debugLastResult)
+		local pathR, pathG, pathB, pathA = getPathDrawColor(debugLastResult)
 
 		for i = 1, #debugWaypoints - 1 do
 			local a = debugWaypoints[i].pos
 			local b = debugWaypoints[i + 1].pos
 			if a and b then
-				Common.DrawArrowLine(a, b, 8, 14, false)
+				Common.DrawArrowLine(a, b, 8, 14, false, pathR, pathG, pathB, pathA)
 			end
 		end
 
 		for i = 1, #debugWaypoints do
 			local wp = debugWaypoints[i]
 			if wp.pos then
-				setPathDrawColor(debugLastResult)
-				drawWorldLine(wp.pos, wp.pos + Vector3(0, 0, 20))
+				drawWorldLine(wp.pos, wp.pos + Vector3(0, 0, 20), pathR, pathG, pathB, pathA)
 			end
 		end
 	end
 
 	if debugFailLine and debugFailLine.from and debugFailLine.to then
-		draw.Color(255, 0, 0, 255)
-		Common.DrawArrowLine(debugFailLine.from, debugFailLine.to, 12, 22, false)
-		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32))
+		Common.DrawArrowLine(debugFailLine.from, debugFailLine.to, 12, 22, false, 255, 0, 0, 255)
+		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32), 255, 0, 0, 255)
 	end
 
 	for _, portal in ipairs(portalSpans) do
@@ -167,10 +165,11 @@ function NavDebug.Draw()
 			wallPos = node._minY
 		end
 
+		local portalR, portalG, portalB, portalA
 		if portal.isDoorPortal then
-			draw.Color(255, 200, 0, 255)
+			portalR, portalG, portalB, portalA = 255, 200, 0, 255
 		else
-			draw.Color(0, 200, 255, 255)
+			portalR, portalG, portalB, portalA = 0, 200, 255, 255
 		end
 
 		local a
@@ -182,17 +181,28 @@ function NavDebug.Draw()
 			a = Vector3(portal.portalMin, wallPos, z)
 			b = Vector3(portal.portalMax, wallPos, z)
 		end
-		drawWorldLine(a, b)
+		drawWorldLine(a, b, portalR, portalG, portalB, portalA)
 	end
 
 	for _, trace in ipairs(hullTraces) do
 		if trace.startPos and trace.endPos then
+			local traceR, traceG, traceB, traceA
 			if trace.blocked then
-				draw.Color(255, 0, 0, 255)
+				traceR, traceG, traceB, traceA = 255, 0, 0, 255
 			else
-				draw.Color(0, 80, 255, 255)
+				traceR, traceG, traceB, traceA = 0, 80, 255, 255
 			end
-			Common.DrawArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
+			Common.DrawArrowLine(
+				trace.startPos,
+				trace.endPos - Vector3(0, 0, 0.5),
+				10,
+				20,
+				false,
+				traceR,
+				traceG,
+				traceB,
+				traceA
+			)
 		end
 	end
 end

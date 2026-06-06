@@ -1,107 +1,109 @@
 --[[
-Node Skipper — runs every tick; skip current node when NavPredict.CanSkip passes (no doors-only).
-Door portals are reserved for PathStringPull at path-build time.
+Node advance — simple rules:
+  1. Entered path[2] (nav id or area bounds — no XY touch padding on next area)
+  2. Edge/door pass on portal segments only (shared-axis span + crossed plane)
+  3. Skip_Nodes + on path[1] + CanSkip to path[2] (doorsOnly=false)
 ]]
 
-local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local PathSteering = require("NavBot.Navigation.PathSteering")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
-
-local Log = Common.Log.new("NodeSkipper")
 
 local NodeSkipper = {}
 
-local lastBlockedLogKey = nil
-local lastBlockedLogTick = 0
-local BLOCKED_LOG_INTERVAL = 66
+local EDGE_PASS_REASONS = {
+	portal_plane = true,
+	portal_touch = true,
+	inside_next = true,
+	drop_landed = true,
+	drop_airborne = true,
+}
 
-local function lockIntentAfterSkip(playerPos)
-	local path = G.Navigation.path
-	if path and path[1] then
-		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
-	end
+local function getTouchDist()
+	return (G.Misc and G.Misc.NodeTouchDistance) or 16
 end
 
-local function rebuildApexPath(playerPos)
-	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(G.Navigation.path, G.Navigation.goalPos, playerPos)
-	G.Navigation.apexIndex = 1
-end
-
-local function logSkipBlocked(currentNode, nextNode, reason)
-	local key = tostring(currentNode.id) .. "->" .. tostring(nextNode.id) .. ":" .. reason
-	local now = globals.TickCount()
-	if key == lastBlockedLogKey and (now - lastBlockedLogTick) < BLOCKED_LOG_INTERVAL then
-		return
-	end
-	lastBlockedLogKey = key
-	lastBlockedLogTick = now
-	Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
-end
-
-local function canSkipSegment(playerPos, goalPos, fromAreaNode, allowJump)
-	if not fromAreaNode then
+--- 16 XY + 82 Z touch on a node (current node only — not used for next-area claim).
+local function hasNodeTouch(playerPos, node)
+	if not node then
 		return false
 	end
-	-- doorsOnly=false for skipping; doors-only mode is for string-pull apex build
+	if AreaSpatial.IsWithinArea(playerPos, node) then
+		return true
+	end
+	local touchDist = getTouchDist()
+	return AreaSpatial.DistSqPointToAABB(playerPos, node) <= touchDist * touchDist
+end
+
+local function isEdgeSegment(currentNode, nextNode)
+	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
+end
+
+local function isOnCurrentNode(playerPos, currentNode, nextNode)
+	if hasNodeTouch(playerPos, currentNode) then
+		return true
+	end
+	return PathStringPull.IsNearSegmentPortal(playerPos, currentNode, nextNode)
+end
+
+local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
+	if not fromAreaNode or not goalPos then
+		return false
+	end
 	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, false, allowJump)
 	return success and canSkip == true
 end
 
-local function trySkipCurrentNode(playerPos, currentNode, nextNode)
-	local goalPos = nextNode.pos
+--- True when path[1] is claimed — entered next area, passed portal edge, or CanSkip to path[2].
+function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
+	if not (playerPos and currentNode and nextNode and nextNode.pos) then
+		return false, nil
+	end
+
+	if PathStringPull.HasEnteredNextArea(playerPos, nextNode) then
+		return true, "in_next_area"
+	end
+
+	if isEdgeSegment(currentNode, nextNode) then
+		local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+		if passed and EDGE_PASS_REASONS[passReason] then
+			return true, passReason
+		end
+	end
+
+	if not (G.Menu.Navigation and G.Menu.Navigation.Skip_Nodes) then
+		return false, "skip_disabled"
+	end
+
+	if not isOnCurrentNode(playerPos, currentNode, nextNode) then
+		return false, "not_on_current"
+	end
+
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-
-	if not canSkipSegment(playerPos, goalPos, currentNode, allowJump) then
-		logSkipBlocked(currentNode, nextNode, "not_walkable")
-		return false
+	if canWalkToNextNode(playerPos, nextNode.pos, currentNode, allowJump) then
+		return true, "navigable_to_next"
 	end
 
-	local missedNode = table.remove(G.Navigation.path, 1)
-	G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-	table.insert(G.Navigation.pathHistory, 1, missedNode)
-	while #G.Navigation.pathHistory > 32 do
-		table.remove(G.Navigation.pathHistory)
-	end
+	return false, "not_walkable_to_next"
+end
 
-	G.Navigation.lastSkipTick = globals.TickCount()
-	G.Navigation.currentNodeIndex = 1
-	rebuildApexPath(playerPos)
-	Log:Info("Skipped node %s, targeting %s", tostring(missedNode.id), tostring(nextNode.id))
-	return true
+function NodeSkipper.NoteAdvance(_playerPos, _reason)
 end
 
 function NodeSkipper.Reset()
 	G.Navigation.nodePassTrack = nil
-	lastBlockedLogKey = nil
-	lastBlockedLogTick = 0
+	G.Navigation.lastAdvancePos = nil
+	G.Navigation.lastStuckTargetDist2D = nil
+	G.Navigation.skipBlockedUntilTick = nil
 end
 
-function NodeSkipper.Tick(playerPos)
-	assert(playerPos, "Tick: playerPos missing")
+function NodeSkipper.BlockSkippingAfterPathSet()
+end
 
-	if not G.Menu.Navigation.Skip_Nodes then
-		return false
-	end
-
-	local path = G.Navigation.path
-	if not path or #path < 2 then
-		return false
-	end
-
-	local currentNode = path[1]
-	local nextNode = path[2]
-	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
-		return false
-	end
-
-	if trySkipCurrentNode(playerPos, currentNode, nextNode) then
-		lockIntentAfterSkip(playerPos)
-		return true
-	end
-
-	return false
+function NodeSkipper.BlockSkippingForTicks(_ticks)
+	G.Navigation.skipBlockedUntilTick = nil
+	G.Navigation.lastAdvancePos = nil
 end
 
 return NodeSkipper

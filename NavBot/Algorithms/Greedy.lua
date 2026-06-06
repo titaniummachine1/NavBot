@@ -1,8 +1,6 @@
 --[[
-    Greedy Best-First Search Algorithm
-    Fastest possible pathfinding using straight-line heuristic
-    Always expands node closest to destination (no cost consideration)
-    Author: titaniummachine1 (github.com/titaniummachine1)
+    Greedy Best-First Search — experimental alternate pathfinder (not used by Main).
+    A* via Navigation.FindPath is the production pathfinder.
 ]]
 
 local G = require("NavBot.Core.Globals")

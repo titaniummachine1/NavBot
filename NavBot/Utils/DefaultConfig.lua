@@ -21,6 +21,7 @@ defaultconfig = {
 		Skip_Nodes = true, --skips nodes if it can go directly to ones closer to target.
 		StopDistance = 50, -- Distance to stop from target when following (FOLLOWING state)
 		WalkableMode = "Smooth", -- "Smooth" uses 18-unit steps, "Aggressive" allows 72-unit jumps
+		MoveDebug = false, -- NavMove console lines: segment, feet area, block reason, apex target
 		CleanupConnections = true, -- Cleanup invalid connections during map load (disable to prevent crashes)
 		AllowExpensiveChecks = true, -- Allow expensive walkability checks for proper stair/ramp connections
 	},

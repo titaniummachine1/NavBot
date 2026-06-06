@@ -65,7 +65,8 @@ local function BenchmarkStop(startTime, startMemory)
 end
 
 -- Draw 3D box at position
-local function Draw3DBox(size, pos)
+local function Draw3DBox(size, pos, r, g, b, a)
+	draw.Color(r or 255, g or 255, b or 255, a or 255)
 	local halfSize = size / 2
 	local corners = {
 		Vector3(-halfSize, -halfSize, -halfSize),
@@ -264,6 +265,8 @@ local IsNavigableTest = {
 }
 
 -- Auto-register callbacks
+callbacks.Unregister("CreateMove", "IsNavigableTest_CreateMove")
+callbacks.Unregister("Draw", "IsNavigableTest_Draw")
 callbacks.Register("CreateMove", "IsNavigableTest_CreateMove", OnCreateMove)
 callbacks.Register("Draw", "IsNavigableTest_Draw", OnDraw)
 

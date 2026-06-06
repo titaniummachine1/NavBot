@@ -1,0 +1,58 @@
+---
+description: Ask before guessing; no unrequested changes; Lmaobox API via MCP only
+alwaysApply: true
+---
+
+# Agent discipline (NavBot)
+
+## Do not change behavior unless asked
+
+- Only implement what the user explicitly requested in the current task.
+- Do **not** add runtime fixes, refactors, logging, or "helpful" extras on your own.
+- If the user said **build once at path time** (e.g. `ProcessAreaPath`, apex list), do **not** reintroduce per-tick/per-frame reprocessing of that logic (no runtime center forcing, no `GetMovementTarget` rebuilding paths).
+- When intent is unclear or multiple approaches exist, **ask a short clarifying question** before coding. Do not guess.
+
+## Lmaobox API — MCP first, never hallucinate
+
+Before using any Lmaobox/game API (entity methods, props, flags, callbacks, engine/draw):
+
+1. Use **`user-lmaobox-context`** MCP:
+   - `get_smart_context("<Symbol>")` — signatures, examples, gotchas
+   - `get_types("<Symbol>")` — type/signature check
+   - `smart_search("<topic>")` — find correct symbol name
+   - `traceback` — map bundled `NavBot.lua` line numbers to source modules
+2. If MCP has **no definition**, do not invent the API. Use documented alternatives (e.g. `m_fFlags & FL_ONGROUND`, not `Entity:IsOnGround()` unless MCP confirms it).
+3. Prefer `lmaobox_lua_documentation.md` in repo root as secondary reference; MCP wins on conflicts.
+
+## NavBot navigation invariants (do not break without explicit request)
+
+| Concern                     | Build time (once)                          | Runtime (per tick)                                            |
+| --------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
+| String-pull / center apexes | `PathStringPull.ProcessAreaPath`           | Walk `G.Navigation.apexPath` only                             |
+| Door portals for steering   | `STRING_PULL_DOORS_ONLY` in string-pull    | —                                                             |
+| Pop path[1]                 | —                                          | `CanAdvanceToNext`: in path[2] OR `CanSkip` to path[2] only   |
+| Draw / visuals              | Read cached `apexPath`, `currentTargetPos` | Never call `GetMovementTarget` or `ProcessAreaPath` in `Draw` |
+
+## When stuck
+
+State what you are unsure about and ask. A wrong confident change is worse than one question.
+
+## Design over edge cases
+
+- Prefer one rule that holds everywhere (e.g. portal shared-axis tolerance, segment pass = entered next area) over per-situation hacks.
+- Build-time geometry (approach points along portal line, portal spans) must match runtime checks — same constants, same definitions.
+- Never target nav area geometric center for movement; waypoints are portal openings and goals only.
+- Segment exit direction comes from the **connection graph** (`GetExitDirToNeighbor`), not center-to-center rays.
+- Area containment Z uses **local floor** on the nav quad with `NodeTouchHeight` (82) — not flat min-corner Z.
+- Hot-path state (`apexIndex`, movement target) advances at most once per tick; no unbounded loops in CreateMove.
+- **No legacy "just in case"** — delete dead code when rewriting; do not keep parallel systems (waypoints + apex, STUCK state, pathHistory).
+- Shared 2D math lives in `NavBot.Utils.NavMath` (or `Common`); never duplicate `horizontalDir` / portal axis helpers per file.
+- `ProcessAreaPath` only at path-find; runtime uses `ConsumeNodeApexes` + `UpdateGoalApex`.
+- Pop path[1] via `CanAdvanceToNext`: strict `in_next_area`, portal edge pass (not center), or `CanSkip` to path[2] only while on path[1] (touch/portal band).
+- `AlignPathIfDesynced` only when feet are on path[i] i>1 but path[1] is stale (recovery, not every-tick sync).
+- Apex steering clamped to current segment (path[1]->path[2]); never skip apexes ahead while path[1] remains.
+- String-pull build: same wall enter+exit on an area → `same_side_center` apex before portal.
+- Z drop > STEP_HEIGHT between areas → `drop` apex; segment passes on airborne/landed, not geometric skip.
+- Repath start: `GetPathStartNode` (area-at-feet); after A\* `AlignPathPrefixToPlayer` trims stale prefix.
+- Drop apex steering: nearest portal span point; walk-off nudge when near edge. No portal_overshoot on drops/jumps.
+- SmartJump runs once per tick from `MovementDecisions` only; sim uses `apexPath` at current speed.

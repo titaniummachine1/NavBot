@@ -112,6 +112,10 @@ local function OnDrawMenu()
 		TimMenu.Tooltip("Distance to stop from dynamic targets like payload (FOLLOWING state)")
 		TimMenu.NextLine()
 
+		G.Menu.Navigation.MoveDebug = TimMenu.Checkbox("Nav Move Debug Logs", G.Menu.Navigation.MoveDebug or false)
+		TimMenu.Tooltip("seg, feet area, advance block reason, apex target, speed — every ~0.5s")
+		TimMenu.NextLine()
+
 		G.Menu.Navigation.WalkableMode = G.Menu.Navigation.WalkableMode or "Smooth"
 		local walkableModes = { "Smooth", "Aggressive" }
 		-- Get current mode as index number

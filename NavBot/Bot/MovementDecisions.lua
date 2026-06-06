@@ -1,33 +1,31 @@
 --[[
-Movement Decision System - Composition-based bot behavior
-Handles all movement decisions while ensuring walkTo is always called
+Movement Decision System — portal apex steering, segment advance, stuck repath
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Navigation = require("NavBot.Navigation")
-local PathSteering = require("NavBot.Navigation.PathSteering")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
-local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local NavMoveDebug = require("NavBot.Bot.NavMoveDebug")
 local SmartJump = require("NavBot.Bot.SmartJump")
+local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
 local WorkManager = require("NavBot.WorkManager")
 
 local MovementDecisions = {}
 local Log = Common.Log.new("MovementDecisions")
 
--- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
-
--- Constants for timing and performance
-local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
-local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
-local WALKABILITY_CHECK_COOLDOWN = 5 -- ticks (~83ms) between expensive walkability checks
+local DISTANCE_CHECK_COOLDOWN = 3
 local STUCK_SPEED_RATIO = 0.8
 local STUCK_GRACE_TICKS = 33
 local STUCK_SAME_NODE_TICKS = 200
 local STUCK_SLOW_REPATH_TICKS = 132
+
+local cachedTargetTick = -1
+local cachedTargetPos = nil
+local lastSegmentAdvanceTick = -1
 
 local function getPlayerSpeed2D(pLocal)
 	local velocity = pLocal:EstimateAbsVelocity()
@@ -45,45 +43,51 @@ local function isBelowStuckSpeedThreshold(speed2D, maxSpeed)
 end
 
 local function triggerStuckRepath(reason)
-	local StateHandler = require("NavBot.Bot.StateHandler")
-	WorkManager.setWorkCooldown("node_skipping", STUCK_SLOW_REPATH_TICKS)
-	StateHandler.addStuckPenalties()
-	StateHandler.forceRepath(reason)
 	G.Navigation.slowSpeedTicks = 0
 	G.Navigation.currentNodeTicks = 0
-end
 
--- Decision: Check if we've reached the target and advance waypoints/nodes
-function MovementDecisions.checkDistanceAndAdvance(userCmd)
-	local result = { shouldContinue = true }
-	local LocalOrigin = G.pLocal.Origin
-
-	-- Throttled distance calculation for reaching nodes
-	if not WorkManager.attemptWork(DISTANCE_CHECK_COOLDOWN, "distance_check") then
-		return result -- Skip this frame's distance check
+	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
+		return
 	end
 
-	-- In FOLLOWING state we don't advance nodes based on reach distance
+	local path = G.Navigation.path
+	if path and path[1] and path[2] then
+		CircuitBreaker.addFailure(path[1], path[2])
+	end
+	NodeSkipper.BlockSkippingForTicks(STUCK_SLOW_REPATH_TICKS)
+
+	-- Lazy: StateHandler also requires MovementDecisions (circular if at module top).
+	local StateHandler = require("NavBot.Bot.StateHandler")
+	StateHandler.forceRepath(reason, true)
+end
+
+function MovementDecisions.checkDistanceAndAdvance(_userCmd)
+	local result = { shouldContinue = true }
+	local localOrigin = G.pLocal.Origin
+
+	if not WorkManager.attemptWork(DISTANCE_CHECK_COOLDOWN, "distance_check") then
+		return result
+	end
+
 	if G.currentState == G.States.FOLLOWING then
 		return result
 	end
 
-	if MovementDecisions.tryAdvancePathNode(LocalOrigin) then
-		return result
+	if Navigation.AlignPathIfDesynced(localOrigin) then
+		MovementDecisions.resetTargetCache()
+		local path = G.Navigation.path
+		if path and path[1] and G.pLocal and G.pLocal.Origin then
+			PathStringPull.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+		end
+		local feetArea = path and path[1] and path[1].id
+		NavMoveDebug.OnPathAligned(feetArea, path and #path or 0)
 	end
 
-	local targetPos = MovementDecisions.getCurrentTarget()
-	if not targetPos then
-		result.shouldContinue = false
-		return result
-	end
-
-	local horizontalDist = Common.Distance2D(LocalOrigin, targetPos)
-	local verticalDist = math.abs(LocalOrigin.z - targetPos.z)
+	MovementDecisions.tryAdvancePathNode(localOrigin)
 
 	local path = G.Navigation.path
 	if path and #path == 1 and G.Navigation.goalPos then
-		local goalDist = Common.Distance2D(LocalOrigin, G.Navigation.goalPos)
+		local goalDist = Common.Distance2D(localOrigin, G.Navigation.goalPos)
 		if goalDist < (G.Misc.NodeTouchDistance or 16) then
 			Navigation.ClearPath()
 			Log:Info("Reached final goal")
@@ -97,6 +101,11 @@ function MovementDecisions.checkDistanceAndAdvance(userCmd)
 end
 
 function MovementDecisions.tryAdvancePathNode(playerPos)
+	local tick = globals.TickCount()
+	if tick == lastSegmentAdvanceTick then
+		return false
+	end
+
 	local path = G.Navigation.path
 	if not path or #path < 2 then
 		return false
@@ -108,63 +117,57 @@ function MovementDecisions.tryAdvancePathNode(playerPos)
 		return false
 	end
 
-	local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
-	if not passed then
+	local canAdvance, advanceReason = NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
+	if not canAdvance then
+		NavMoveDebug.OnAdvanceBlocked(playerPos, currentNode, nextNode, advanceReason)
 		return false
 	end
 
-	Log:Debug("Advancing path: left node %s (%s)", tostring(currentNode.id), passReason or "?")
+	lastSegmentAdvanceTick = tick
+	Log:Debug("Advancing path: left node %s (%s)", tostring(currentNode.id), advanceReason or "?")
+	NavMoveDebug.OnAdvanced(currentNode.id, advanceReason)
+	NodeSkipper.NoteAdvance(playerPos, advanceReason)
 	return MovementDecisions.advanceNode()
 end
 
--- Helper: Get current target position
 function MovementDecisions.getCurrentTarget()
+	local tick = globals.TickCount()
+	if tick == cachedTargetTick and cachedTargetPos then
+		return cachedTargetPos
+	end
+
 	local origin = G.pLocal and G.pLocal.Origin
 	local path = G.Navigation.path
+	local target
 	if origin and path and #path > 0 then
-		return PathSteering.getMovementTarget(origin, path, G.Navigation.goalPos)
-	end
-	return G.Navigation.goalPos
-end
-
--- Helper: Check if we've reached the target
-function MovementDecisions.hasReachedTarget(origin, targetPos, horizontalDist, verticalDist)
-	local reachDist = G.Misc.NodeTouchDistance or 16
-	local touchHeight = G.Misc.NodeTouchHeight or 82
-	if G.Navigation.path and #G.Navigation.path > 1 then
-		local currentNode = G.Navigation.path[1]
-		local nextNode = G.Navigation.path[2]
-		reachDist = PathSteering.getReachDistance2D(currentNode, nextNode)
+		target = PathStringPull.GetMovementTarget(origin)
+	else
+		target = G.Navigation.goalPos
 	end
 
-	-- Mid-air: origin high but still inside nav area vertical band
-	local currentNode = G.Navigation.path and G.Navigation.path[1]
-	if currentNode and not Node.IsDoorNode(currentNode) then
-		if horizontalDist < reachDist and AreaSpatial.IsWithinArea(origin, currentNode) then
-			return true
-		end
-	end
-
-	return (horizontalDist < reachDist) and (verticalDist <= touchHeight)
+	cachedTargetTick = tick
+	cachedTargetPos = target
+	return target
 end
 
--- Reset distance tracking (call when path changes)
-function MovementDecisions.resetDistanceTracking()
-	previousDistance = nil
+function MovementDecisions.resetTargetCache()
+	cachedTargetTick = -1
+	cachedTargetPos = nil
+	lastSegmentAdvanceTick = -1
 end
 
--- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
-	previousDistance = nil
+	MovementDecisions.resetTargetCache()
 	G.Navigation.slowSpeedTicks = 0
 	G.Navigation.currentNodeTicks = 0
+	G.Navigation.lastStuckTargetDist2D = nil
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
 
 	local path = G.Navigation.path
 	if path and path[1] and G.pLocal and G.pLocal.Origin then
-		PathSteering.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
+		PathStringPull.lockIntentTowardNode(G.pLocal.Origin, path[1], path[2])
 	end
 
 	if #G.Navigation.path == 0 then
@@ -175,11 +178,9 @@ function MovementDecisions.advanceNode()
 		return false
 	end
 
-	return true -- Continue moving
+	return true
 end
 
--- Only start stuck checks after speed stays below 80% max for STUCK_GRACE_TICKS.
--- Never switch to STUCK state (that stops walkTo); repath while still moving.
 function MovementDecisions.checkStuckState()
 	if not G.Menu.Main.EnableWalking then
 		return
@@ -195,7 +196,20 @@ function MovementDecisions.checkStuckState()
 
 	if not isBelowStuckSpeedThreshold(speed2D, maxSpeed) then
 		G.Navigation.slowSpeedTicks = 0
+		G.Navigation.lastStuckTargetDist2D = nil
 		return
+	end
+
+	local origin = G.pLocal.Origin
+	local targetPos = PathStringPull.GetCachedApexTarget()
+	if origin and targetPos then
+		local targetDist2D = Common.Distance2D(origin, targetPos)
+		local lastDist = G.Navigation.lastStuckTargetDist2D
+		if lastDist and targetDist2D < lastDist - 12 then
+			G.Navigation.slowSpeedTicks = 0
+			G.Navigation.currentNodeTicks = 0
+		end
+		G.Navigation.lastStuckTargetDist2D = targetDist2D
 	end
 
 	G.Navigation.slowSpeedTicks = (G.Navigation.slowSpeedTicks or 0) + 1
@@ -213,11 +227,17 @@ function MovementDecisions.checkStuckState()
 		end
 
 		if G.Navigation.currentNodeTicks > STUCK_SAME_NODE_TICKS then
+			local path = G.Navigation.path
+			local seg = path
+					and path[1]
+					and path[2]
+					and string.format("%s->%s", tostring(path[1].id), tostring(path[2].id))
+				or tostring(currentNodeId)
 			Log:Warn(
-				"STUCK: Same node %s for %d ticks below %.0f%% speed, repathing",
-				tostring(currentNodeId),
+				"STUCK: seg=%s for %d ticks below %d pct speed, repathing",
+				seg,
 				G.Navigation.currentNodeTicks,
-				STUCK_SPEED_RATIO * 100
+				math.floor(STUCK_SPEED_RATIO * 100)
 			)
 			triggerStuckRepath("Same node too long while slow")
 			return
@@ -226,37 +246,25 @@ function MovementDecisions.checkStuckState()
 
 	if G.Navigation.slowSpeedTicks > STUCK_GRACE_TICKS + STUCK_SLOW_REPATH_TICKS then
 		Log:Warn(
-			"STUCK: Speed %.1f below %.0f%% max for %d ticks, repathing",
+			"STUCK: Speed %.1f below %d pct max for %d ticks, repathing",
 			speed2D,
-			STUCK_SPEED_RATIO * 100,
+			math.floor(STUCK_SPEED_RATIO * 100),
 			G.Navigation.slowSpeedTicks
 		)
 		triggerStuckRepath("Slow for extended period")
 	end
 end
 
--- Decision: Handle debug logging (throttled)
 function MovementDecisions.handleDebugLogging()
-	-- Throttled debug logging
-	G.__lastMoveDebugTick = G.__lastMoveDebugTick or 0
-	local now = globals.TickCount()
-
-	if now - G.__lastMoveDebugTick > DEBUG_LOG_COOLDOWN then
-		local targetPos = MovementDecisions.getCurrentTarget()
-		if targetPos then
-			local pathLen = G.Navigation.path and #G.Navigation.path or 0
-			Log:Debug("MOVING: pathLen=%d", pathLen)
-		end
-		G.__lastMoveDebugTick = now
-	end
+	local pLocal = G.pLocal and G.pLocal.entity
+	local speed2D = pLocal and getPlayerSpeed2D(pLocal) or 0
+	NavMoveDebug.Tick(G.pLocal and G.pLocal.Origin, speed2D)
 end
 
--- Decision: Handle SmartJump execution
 function MovementDecisions.handleSmartJump(userCmd)
 	SmartJump.Main(userCmd)
 end
 
--- Movement Execution: Always called at the end
 function MovementDecisions.executeMovement(userCmd)
 	local targetPos = MovementDecisions.getCurrentTarget()
 	if not targetPos then
@@ -264,7 +272,6 @@ function MovementDecisions.executeMovement(userCmd)
 		return
 	end
 
-	-- Always execute movement regardless of decision cooldowns
 	if G.Menu.Main.EnableWalking then
 		MovementController.walkTo(userCmd, G.pLocal.entity, targetPos)
 	else
@@ -273,38 +280,33 @@ function MovementDecisions.executeMovement(userCmd)
 	end
 end
 
--- Main composition function: Run all decisions then always execute movement
 function MovementDecisions.handleMovingState(userCmd)
-	-- Early validation
 	if not G.Navigation.path or #G.Navigation.path == 0 then
 		Log:Warn("No path available, returning to IDLE state")
 		G.currentState = G.States.IDLE
 		return
 	end
 
-	-- Update movement direction for SmartJump
 	local targetPos = MovementDecisions.getCurrentTarget()
 	if targetPos then
-		local LocalOrigin = G.pLocal.Origin
-		local direction = targetPos - LocalOrigin
-		G.BotMovementDirection = direction:Length() > 0 and Common.Normalize(direction) or Vector3(0, 0, 0)
+		local localOrigin = G.pLocal.Origin
+		local direction = targetPos - localOrigin
+		if direction:Length() > 0 then
+			G.BotMovementDirection = Common.Normalize(direction)
+			G.BotIntendedWishDir = G.BotMovementDirection
+		else
+			G.BotMovementDirection = Vector3(0, 0, 0)
+			G.BotIntendedWishDir = Vector3(0, 0, 0)
+		end
 		G.BotIsMoving = true
 		G.Navigation.currentTargetPos = targetPos
 	end
 
-	-- Handle camera rotation
 	MovementController.handleCameraRotation(userCmd, targetPos)
-
-	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
-	NodeSkipper.Tick(G.pLocal.Origin)
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
-
-	-- ALWAYS execute movement at the end, regardless of decision outcomes
 	MovementDecisions.executeMovement(userCmd)
-
-	-- Handle SmartJump after walkTo
 	MovementDecisions.handleSmartJump(userCmd)
 end
 

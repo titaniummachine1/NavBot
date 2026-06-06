@@ -2,19 +2,34 @@
 --  AreaSpatial.lua  ·  AABB distance, containment, and grid indexing
 --##########################################################################
 --
---  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps only tilt
---  the floor plane. Containment = horizontal AABB + vertical band above floor.
+--  TF2 nav areas are axis-aligned in XY. Bots stay upright; ramps tilt the floor.
+--  Containment = horizontal AABB + vertical band above local floor (82 up, 8 down).
+
+local G = require("NavBot.Core.Globals")
+local NavGeometry = require("NavBot.Navigation.Prediction.NavGeometry")
 
 local AreaSpatial = {}
 
 local GRID_CELL_SIZE = 256
 
--- Upright player slack relative to area floor (matches G.Misc.NodeTouchHeight ≈ 82)
 AreaSpatial.Z_PAD_BELOW = 8
 AreaSpatial.Z_PAD_ABOVE = 82
 
 local Z_PAD_BELOW = AreaSpatial.Z_PAD_BELOW
-local Z_PAD_ABOVE = AreaSpatial.Z_PAD_ABOVE
+
+local function getZPadAbove()
+	return (G.Misc and G.Misc.NodeTouchHeight) or AreaSpatial.Z_PAD_ABOVE
+end
+
+local function getLocalFloorZ(pos, node)
+	if node.nw and node.ne and node.sw and node.se then
+		local z = NavGeometry.GetGroundZFromQuad(pos, node)
+		if z then
+			return z
+		end
+	end
+	return node._floorZ
+end
 
 --- Precompute floor Z and vertical query band on a normalized node.
 function AreaSpatial.PrecomputeVerticalBounds(node)
@@ -22,13 +37,14 @@ function AreaSpatial.PrecomputeVerticalBounds(node)
 		return
 	end
 
-	local floorZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
-	node._floorZ = floorZ
-	node._minZ = floorZ - Z_PAD_BELOW
-	node._maxZ = floorZ + Z_PAD_ABOVE
+	local minZ = math.min(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	local maxZ = math.max(node.nw.z, node.ne.z, node.sw.z, node.se.z)
+	node._floorZ = minZ
+	node._minZ = minZ - Z_PAD_BELOW
+	node._maxZ = maxZ + getZPadAbove()
 end
 
---- Horizontal axis-aligned footprint + vertical band (82 up, 8 down from floor).
+--- Horizontal AABB + vertical band (NodeTouchHeight above local floor, 8 below).
 function AreaSpatial.IsWithinArea(pos, node)
 	if not node or not node._minX then
 		return false
@@ -41,13 +57,14 @@ function AreaSpatial.IsWithinArea(pos, node)
 		return false
 	end
 
-	local floorZ = node._floorZ
+	local floorZ = getLocalFloorZ(pos, node)
 	if not floorZ then
 		return true
 	end
 
+	local zPadAbove = getZPadAbove()
 	local heightAboveFloor = pos.z - floorZ
-	return heightAboveFloor <= Z_PAD_ABOVE and heightAboveFloor >= -Z_PAD_BELOW
+	return heightAboveFloor <= zPadAbove and heightAboveFloor >= -Z_PAD_BELOW
 end
 
 --- Squared distance from a point to the XY footprint + Z query band (0 if inside).
