@@ -10,7 +10,7 @@ local MovementController = {}
 
 local ARRIVAL_DIST = 1.5
 
---- Walk toward dest using simulated friction/coast wish direction + optimal ground accel input.
+--- Walk toward dest. Stops only on the final path node; intermediate apexes keep full speed.
 function MovementController.walkTo(cmd, player, dest)
 	if not (cmd and player and dest) then
 		return
@@ -21,9 +21,12 @@ function MovementController.walkTo(cmd, player, dest)
 		return
 	end
 
+	local path = G.Navigation.path
+	local isFinalWaypoint = not path or #path <= 1
+
 	local toDest = dest - pos
 	toDest.z = 0
-	if toDest:Length2D() < ARRIVAL_DIST then
+	if isFinalWaypoint and toDest:Length2D() < ARRIVAL_DIST then
 		cmd:SetForwardMove(0)
 		cmd:SetSideMove(0)
 		return
@@ -34,17 +37,13 @@ function MovementController.walkTo(cmd, player, dest)
 	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
 	vel.z = 0
 
-	local horizSpeed = vel:Length2D()
-	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
-	local wishdir = GroundMovement.computeWishDirToTarget(pos, vel, dest, coastTicks, onGround)
-
+	local wishdir = GroundMovement.computeWalkWishDir(pos, vel, dest, maxSpeed, onGround, isFinalWaypoint)
 	if not wishdir then
 		cmd:SetForwardMove(0)
 		cmd:SetSideMove(0)
 		return
 	end
 
-	-- Air: still steer toward target; ground uses full cmd speed cap
 	local cmdSpeed = math.min(maxSpeed + 1, 450)
 	GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
 end

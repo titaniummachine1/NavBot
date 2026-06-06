@@ -73,6 +73,8 @@ function MovementDecisions.checkDistanceAndAdvance(_userCmd)
 		return result
 	end
 
+	MovementDecisions.tryAdvancePathNode(localOrigin)
+
 	if Navigation.AlignPathIfDesynced(localOrigin) then
 		MovementDecisions.resetTargetCache()
 		local path = G.Navigation.path
@@ -82,8 +84,6 @@ function MovementDecisions.checkDistanceAndAdvance(_userCmd)
 		local feetArea = path and path[1] and path[1].id
 		NavMoveDebug.OnPathAligned(feetArea, path and #path or 0)
 	end
-
-	MovementDecisions.tryAdvancePathNode(localOrigin)
 
 	local path = G.Navigation.path
 	if path and #path == 1 and G.Navigation.goalPos then

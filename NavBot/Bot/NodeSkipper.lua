@@ -1,50 +1,39 @@
 --[[
-Node advance — simple rules:
-  1. Entered path[2] (nav id or area bounds — no XY touch padding on next area)
-  2. Edge/door pass on portal segments only (shared-axis span + crossed plane)
-  3. Skip_Nodes + on path[1] + CanSkip to path[2] (doorsOnly=false)
+Node advance:
+  1. Feet in path[2] (strict nav id / area bounds)
+  2. Portal edge: crossed shared-axis plane (PathStringPull.HasPassedSegment)
+  3. Open/center segment only: Skip_Nodes + feet in path[1] + velocity toward target + CanSkip
 ]]
 
 local G = require("NavBot.Core.Globals")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
+local NavMath = require("NavBot.Utils.NavMath")
 local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local Node = require("NavBot.Navigation.Node")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local NodeSkipper = {}
 
+local SKIP_VEL_MIN_DOT = 0.92
+local SKIP_MIN_SPEED = 80
+
 local EDGE_PASS_REASONS = {
 	portal_plane = true,
-	portal_touch = true,
 	inside_next = true,
 	drop_landed = true,
 	drop_airborne = true,
 }
 
-local function getTouchDist()
-	return (G.Misc and G.Misc.NodeTouchDistance) or 16
-end
-
---- 16 XY + 82 Z touch on a node (current node only — not used for next-area claim).
-local function hasNodeTouch(playerPos, node)
+local function isFeetInNode(playerPos, node)
 	if not node then
 		return false
 	end
-	if AreaSpatial.IsWithinArea(playerPos, node) then
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if playerArea and playerArea.id == node.id then
 		return true
 	end
-	local touchDist = getTouchDist()
-	return AreaSpatial.DistSqPointToAABB(playerPos, node) <= touchDist * touchDist
-end
-
-local function isEdgeSegment(currentNode, nextNode)
-	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
-end
-
-local function isOnCurrentNode(playerPos, currentNode, nextNode)
-	if hasNodeTouch(playerPos, currentNode) then
-		return true
-	end
-	return PathStringPull.IsNearSegmentPortal(playerPos, currentNode, nextNode)
+	return AreaSpatial.IsWithinArea(playerPos, node)
 end
 
 local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
@@ -55,7 +44,34 @@ local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
 	return success and canSkip == true
 end
 
---- True when path[1] is claimed — entered next area, passed portal edge, or CanSkip to path[2].
+local function isVelocityTowardTarget(playerPos, targetPos, player)
+	if not (player and targetPos) then
+		return false
+	end
+
+	local vel = player:EstimateAbsVelocity()
+	local speed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+	if speed < SKIP_MIN_SPEED then
+		return false
+	end
+
+	local targetDir = NavMath.horizontalDir2D(playerPos, targetPos)
+	if not targetDir then
+		return false
+	end
+
+	local dot = (vel.x / speed) * targetDir.x + (vel.y / speed) * targetDir.y
+	return dot >= SKIP_VEL_MIN_DOT
+end
+
+local function getSkipTargetPos(playerPos)
+	if G.Navigation.currentTargetPos then
+		return G.Navigation.currentTargetPos
+	end
+	return PathStringPull.GetMovementTarget(playerPos)
+end
+
+--- True when path[1] is claimed.
 function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 	if not (playerPos and currentNode and nextNode and nextNode.pos) then
 		return false, nil
@@ -65,19 +81,30 @@ function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 		return true, "in_next_area"
 	end
 
-	if isEdgeSegment(currentNode, nextNode) then
+	if PathStringPull.IsEdgeSegment(currentNode, nextNode) then
 		local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
 		if passed and EDGE_PASS_REASONS[passReason] then
 			return true, passReason
 		end
+		return false, "edge_not_crossed"
 	end
 
 	if not (G.Menu.Navigation and G.Menu.Navigation.Skip_Nodes) then
 		return false, "skip_disabled"
 	end
 
-	if not isOnCurrentNode(playerPos, currentNode, nextNode) then
+	if not isFeetInNode(playerPos, currentNode) then
 		return false, "not_on_current"
+	end
+
+	local pLocal = G.pLocal and G.pLocal.entity
+	if not pLocal or not GroundMovement.isOnGround(pLocal) then
+		return false, "airborne"
+	end
+
+	local targetPos = getSkipTargetPos(playerPos)
+	if not isVelocityTowardTarget(playerPos, targetPos, pLocal) then
+		return false, "bad_velocity"
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
@@ -88,8 +115,7 @@ function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 	return false, "not_walkable_to_next"
 end
 
-function NodeSkipper.NoteAdvance(_playerPos, _reason)
-end
+function NodeSkipper.NoteAdvance(_playerPos, _reason) end
 
 function NodeSkipper.Reset()
 	G.Navigation.nodePassTrack = nil
@@ -98,8 +124,7 @@ function NodeSkipper.Reset()
 	G.Navigation.skipBlockedUntilTick = nil
 end
 
-function NodeSkipper.BlockSkippingAfterPathSet()
-end
+function NodeSkipper.BlockSkippingAfterPathSet() end
 
 function NodeSkipper.BlockSkippingForTicks(_ticks)
 	G.Navigation.skipBlockedUntilTick = nil

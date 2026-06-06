@@ -173,6 +173,35 @@ function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
 	return 2
 end
 
+local ARRIVAL_DIST = 1.5
+function GroundMovement.computeWalkWishDir(startPos, startVel, dest, maxSpeed, onGround, allowStop)
+	onGround = onGround ~= false
+
+	local toDest = Vector3(dest.x - startPos.x, dest.y - startPos.y, 0)
+	local dist = toDest:Length2D()
+	if dist < 0.001 then
+		return nil
+	end
+
+	if allowStop and dist < ARRIVAL_DIST then
+		return nil
+	end
+
+	local horizSpeed = math.sqrt(startVel.x * startVel.x + startVel.y * startVel.y)
+	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
+	local wishdir = GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
+
+	if wishdir then
+		return wishdir
+	end
+
+	if allowStop then
+		return nil
+	end
+
+	return toDest / dist
+end
+
 --- Convert world wish direction into forward/side move (view-relative).
 ---@param cmd UserCmd
 ---@param wishdir Vector3

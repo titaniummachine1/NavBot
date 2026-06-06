@@ -8124,6 +8124,8 @@ function MovementDecisions.checkDistanceAndAdvance(_userCmd)
 		return result
 	end
 
+	MovementDecisions.tryAdvancePathNode(localOrigin)
+
 	if Navigation.AlignPathIfDesynced(localOrigin) then
 		MovementDecisions.resetTargetCache()
 		local path = G.Navigation.path
@@ -8133,8 +8135,6 @@ function MovementDecisions.checkDistanceAndAdvance(_userCmd)
 		local feetArea = path and path[1] and path[1].id
 		NavMoveDebug.OnPathAligned(feetArea, path and #path or 0)
 	end
-
-	MovementDecisions.tryAdvancePathNode(localOrigin)
 
 	local path = G.Navigation.path
 	if path and #path == 1 and G.Navigation.goalPos then
@@ -9378,7 +9378,7 @@ function Navigation.GetPathStartNode(pos)
 end
 
 --- After A* only: drop prefix until player area is path[1] (fixes wrong start node).
-function Navigation.AlignPathPrefixToPlayer(playerPos)
+function Navigation.AlignPathPrefixAfterFind(playerPos)
 	local path = G.Navigation.path
 	if not path or #path < 1 or not playerPos then
 		return false
@@ -9418,7 +9418,37 @@ function Navigation.AlignPathPrefixToPlayer(playerPos)
 	return popped > 0
 end
 
---- Feet are on path[i] with i>1 but path[1] is stale — trim prefix (desync recovery only).
+--- Recovery only: feet in path[2] while path[1] is stale — pop one node (never multi-pop).
+function Navigation.AlignPathPrefixToPlayer(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 2 or not playerPos then
+		return false
+	end
+
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if not playerArea then
+		return false
+	end
+
+	if path[1].id == playerArea.id then
+		return false
+	end
+
+	if path[2].id ~= playerArea.id then
+		return false
+	end
+
+	local removed = table.remove(path, 1)
+	if removed and removed.id then
+		PathStringPull.ConsumeNodeApexes(removed.id)
+	end
+
+	G.Navigation.currentNodeIndex = 1
+	Log:Info("Aligned path prefix to area %s (pathLen=%d, popped=1)", tostring(playerArea.id), #path)
+	return true
+end
+
+--- Feet are on path[2] but path[1] is stale — trim one prefix node (desync recovery only).
 function Navigation.AlignPathIfDesynced(playerPos)
 	local path = G.Navigation.path
 	if not path or #path < 2 or not playerPos then
@@ -9430,22 +9460,7 @@ function Navigation.AlignPathIfDesynced(playerPos)
 		return false
 	end
 
-	local playerArea = Node.GetAreaAtPosition(playerPos)
-	if not playerArea then
-		return false
-	end
-
-	if path[1] and path[1].id == playerArea.id then
-		return false
-	end
-
-	for i = 2, #path do
-		if path[i].id == playerArea.id then
-			return Navigation.AlignPathPrefixToPlayer(playerPos)
-		end
-	end
-
-	return false
+	return Navigation.AlignPathPrefixToPlayer(playerPos)
 end
 
 ---@param startNode Node
@@ -9486,7 +9501,7 @@ function Navigation.FindPath(startNode, goalNode)
 		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
 		local origin = G.pLocal and G.pLocal.Origin
 		if origin then
-			Navigation.AlignPathPrefixToPlayer(origin)
+			Navigation.AlignPathPrefixAfterFind(origin)
 		end
 		Navigation.RebuildApexPath(true)
 	end
@@ -10054,50 +10069,6 @@ local function hasCrossedPortalPlane(playerPos, portalPos, passDir, margin)
 	return (dx * passDir.x + dy * passDir.y) >= (margin or PORTAL_PLANE_MARGIN)
 end
 
-local function hasPortalTouch(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local touch = getTouchDistance()
-	if Common.Distance2D(playerPos, portalPos) > touch then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
-local function hasPortalOvershoot(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local dist2D = Common.Distance2D(playerPos, portalPos)
-	if dist2D > getOvershootTouchDistance() then
-		return false
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not (track and track.nodeId == currentNode.id and track.dirToTarget) then
-		return false
-	end
-
-	local dirNow = horizontalDir(playerPos, portalPos)
-	if not dirNow then
-		dirNow = horizontalUnit(G.BotIntendedWishDir)
-	end
-	if not dirNow then
-		return false
-	end
-
-	local dirDot = track.dirToTarget:Dot(dirNow)
-	if dirDot >= getPassDirDotThreshold() then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
 local function evaluatePortalPass(
 	playerPos,
 	portalPos,
@@ -10144,20 +10115,14 @@ local function evaluatePortalPass(
 		return false, nil
 	end
 
-	-- No portal advance while jumping — causes false segment pop and path desync.
-	if not isSmartJumpActive() then
-		if passDir and hasCrossedPortalPlane(playerPos, portalPos, passDir) then
+	local pLocal = G.pLocal and G.pLocal.entity
+	local onGround = pLocal and GroundMovement.isOnGround(pLocal)
+	local jumping = isSmartJumpActive()
+
+	-- Portal plane cross claims the node while moving through at speed (ground only).
+	if passDir and onGround and not jumping then
+		if hasCrossedPortalPlane(playerPos, portalPos, passDir, -12) then
 			return true, "portal_plane"
-		end
-
-		if hasPortalTouch(playerPos, portalPos, currentNode) and passDir then
-			if hasCrossedPortalPlane(playerPos, portalPos, passDir, 0) then
-				return true, "portal_touch"
-			end
-		end
-
-		if not isDrop and hasPortalOvershoot(playerPos, portalPos, currentNode) then
-			return true, "portal_overshoot"
 		end
 	end
 
@@ -10198,6 +10163,10 @@ local function hasPassedPortalApex(playerPos, apex, currentNode)
 	end
 
 	return false
+end
+
+function PathStringPull.IsEdgeSegment(currentNode, nextNode)
+	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
 end
 
 function PathStringPull.GetSegmentPortalPos(area, nextArea)
@@ -10757,6 +10726,35 @@ function GroundMovement.getCoastTicks(horizSpeed, maxSpeed)
 	return 2
 end
 
+local ARRIVAL_DIST = 1.5
+function GroundMovement.computeWalkWishDir(startPos, startVel, dest, maxSpeed, onGround, allowStop)
+	onGround = onGround ~= false
+
+	local toDest = Vector3(dest.x - startPos.x, dest.y - startPos.y, 0)
+	local dist = toDest:Length2D()
+	if dist < 0.001 then
+		return nil
+	end
+
+	if allowStop and dist < ARRIVAL_DIST then
+		return nil
+	end
+
+	local horizSpeed = math.sqrt(startVel.x * startVel.x + startVel.y * startVel.y)
+	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
+	local wishdir = GroundMovement.computeWishDirToTarget(startPos, startVel, dest, coastTicks, onGround)
+
+	if wishdir then
+		return wishdir
+	end
+
+	if allowStop then
+		return nil
+	end
+
+	return toDest / dist
+end
+
 --- Convert world wish direction into forward/side move (view-relative).
 ---@param cmd UserCmd
 ---@param wishdir Vector3
@@ -10856,52 +10854,41 @@ return GroundMovement
 end)
 __bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
-Node advance — simple rules:
-  1. Entered path[2] (nav id or area bounds — no XY touch padding on next area)
-  2. Edge/door pass on portal segments only (shared-axis span + crossed plane)
-  3. Skip_Nodes + on path[1] + CanSkip to path[2] (doorsOnly=false)
+Node advance:
+  1. Feet in path[2] (strict nav id / area bounds)
+  2. Portal edge: crossed shared-axis plane (PathStringPull.HasPassedSegment)
+  3. Open/center segment only: Skip_Nodes + feet in path[1] + velocity toward target + CanSkip
 ]]
 
 local G = require("NavBot.Core.Globals")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local GroundMovement = require("NavBot.Bot.GroundMovement")
+local NavMath = require("NavBot.Utils.NavMath")
 local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local Node = require("NavBot.Navigation.Node")
 local PathStringPull = require("NavBot.Navigation.PathStringPull")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 
 local NodeSkipper = {}
 
+local SKIP_VEL_MIN_DOT = 0.92
+local SKIP_MIN_SPEED = 80
+
 local EDGE_PASS_REASONS = {
 	portal_plane = true,
-	portal_touch = true,
 	inside_next = true,
 	drop_landed = true,
 	drop_airborne = true,
 }
 
-local function getTouchDist()
-	return (G.Misc and G.Misc.NodeTouchDistance) or 16
-end
-
---- 16 XY + 82 Z touch on a node (current node only — not used for next-area claim).
-local function hasNodeTouch(playerPos, node)
+local function isFeetInNode(playerPos, node)
 	if not node then
 		return false
 	end
-	if AreaSpatial.IsWithinArea(playerPos, node) then
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if playerArea and playerArea.id == node.id then
 		return true
 	end
-	local touchDist = getTouchDist()
-	return AreaSpatial.DistSqPointToAABB(playerPos, node) <= touchDist * touchDist
-end
-
-local function isEdgeSegment(currentNode, nextNode)
-	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
-end
-
-local function isOnCurrentNode(playerPos, currentNode, nextNode)
-	if hasNodeTouch(playerPos, currentNode) then
-		return true
-	end
-	return PathStringPull.IsNearSegmentPortal(playerPos, currentNode, nextNode)
+	return AreaSpatial.IsWithinArea(playerPos, node)
 end
 
 local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
@@ -10912,7 +10899,34 @@ local function canWalkToNextNode(playerPos, goalPos, fromAreaNode, allowJump)
 	return success and canSkip == true
 end
 
---- True when path[1] is claimed — entered next area, passed portal edge, or CanSkip to path[2].
+local function isVelocityTowardTarget(playerPos, targetPos, player)
+	if not (player and targetPos) then
+		return false
+	end
+
+	local vel = player:EstimateAbsVelocity()
+	local speed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
+	if speed < SKIP_MIN_SPEED then
+		return false
+	end
+
+	local targetDir = NavMath.horizontalDir2D(playerPos, targetPos)
+	if not targetDir then
+		return false
+	end
+
+	local dot = (vel.x / speed) * targetDir.x + (vel.y / speed) * targetDir.y
+	return dot >= SKIP_VEL_MIN_DOT
+end
+
+local function getSkipTargetPos(playerPos)
+	if G.Navigation.currentTargetPos then
+		return G.Navigation.currentTargetPos
+	end
+	return PathStringPull.GetMovementTarget(playerPos)
+end
+
+--- True when path[1] is claimed.
 function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 	if not (playerPos and currentNode and nextNode and nextNode.pos) then
 		return false, nil
@@ -10922,19 +10936,30 @@ function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 		return true, "in_next_area"
 	end
 
-	if isEdgeSegment(currentNode, nextNode) then
+	if PathStringPull.IsEdgeSegment(currentNode, nextNode) then
 		local passed, passReason = PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
 		if passed and EDGE_PASS_REASONS[passReason] then
 			return true, passReason
 		end
+		return false, "edge_not_crossed"
 	end
 
 	if not (G.Menu.Navigation and G.Menu.Navigation.Skip_Nodes) then
 		return false, "skip_disabled"
 	end
 
-	if not isOnCurrentNode(playerPos, currentNode, nextNode) then
+	if not isFeetInNode(playerPos, currentNode) then
 		return false, "not_on_current"
+	end
+
+	local pLocal = G.pLocal and G.pLocal.entity
+	if not pLocal or not GroundMovement.isOnGround(pLocal) then
+		return false, "airborne"
+	end
+
+	local targetPos = getSkipTargetPos(playerPos)
+	if not isVelocityTowardTarget(playerPos, targetPos, pLocal) then
+		return false, "bad_velocity"
 	end
 
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
@@ -10945,8 +10970,7 @@ function NodeSkipper.CanAdvanceToNext(playerPos, currentNode, nextNode)
 	return false, "not_walkable_to_next"
 end
 
-function NodeSkipper.NoteAdvance(_playerPos, _reason)
-end
+function NodeSkipper.NoteAdvance(_playerPos, _reason) end
 
 function NodeSkipper.Reset()
 	G.Navigation.nodePassTrack = nil
@@ -10955,8 +10979,7 @@ function NodeSkipper.Reset()
 	G.Navigation.skipBlockedUntilTick = nil
 end
 
-function NodeSkipper.BlockSkippingAfterPathSet()
-end
+function NodeSkipper.BlockSkippingAfterPathSet() end
 
 function NodeSkipper.BlockSkippingForTicks(_ticks)
 	G.Navigation.skipBlockedUntilTick = nil
@@ -11598,7 +11621,7 @@ local MovementController = {}
 
 local ARRIVAL_DIST = 1.5
 
---- Walk toward dest using simulated friction/coast wish direction + optimal ground accel input.
+--- Walk toward dest. Stops only on the final path node; intermediate apexes keep full speed.
 function MovementController.walkTo(cmd, player, dest)
 	if not (cmd and player and dest) then
 		return
@@ -11609,9 +11632,12 @@ function MovementController.walkTo(cmd, player, dest)
 		return
 	end
 
+	local path = G.Navigation.path
+	local isFinalWaypoint = not path or #path <= 1
+
 	local toDest = dest - pos
 	toDest.z = 0
-	if toDest:Length2D() < ARRIVAL_DIST then
+	if isFinalWaypoint and toDest:Length2D() < ARRIVAL_DIST then
 		cmd:SetForwardMove(0)
 		cmd:SetSideMove(0)
 		return
@@ -11622,17 +11648,13 @@ function MovementController.walkTo(cmd, player, dest)
 	local vel = player:EstimateAbsVelocity() or Vector3(0, 0, 0)
 	vel.z = 0
 
-	local horizSpeed = vel:Length2D()
-	local coastTicks = onGround and GroundMovement.getCoastTicks(horizSpeed, maxSpeed) or 0
-	local wishdir = GroundMovement.computeWishDirToTarget(pos, vel, dest, coastTicks, onGround)
-
+	local wishdir = GroundMovement.computeWalkWishDir(pos, vel, dest, maxSpeed, onGround, isFinalWaypoint)
 	if not wishdir then
 		cmd:SetForwardMove(0)
 		cmd:SetSideMove(0)
 		return
 	end
 
-	-- Air: still steer toward target; ground uses full cmd speed cap
 	local cmdSpeed = math.min(maxSpeed + 1, 450)
 	GroundMovement.wishDirToCmd(cmd, wishdir, cmdSpeed)
 end

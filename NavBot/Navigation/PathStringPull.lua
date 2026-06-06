@@ -554,50 +554,6 @@ local function hasCrossedPortalPlane(playerPos, portalPos, passDir, margin)
 	return (dx * passDir.x + dy * passDir.y) >= (margin or PORTAL_PLANE_MARGIN)
 end
 
-local function hasPortalTouch(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local touch = getTouchDistance()
-	if Common.Distance2D(playerPos, portalPos) > touch then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
-local function hasPortalOvershoot(playerPos, portalPos, currentNode)
-	if not (playerPos and portalPos and currentNode) then
-		return false
-	end
-
-	local dist2D = Common.Distance2D(playerPos, portalPos)
-	if dist2D > getOvershootTouchDistance() then
-		return false
-	end
-
-	local track = G.Navigation.nodePassTrack
-	if not (track and track.nodeId == currentNode.id and track.dirToTarget) then
-		return false
-	end
-
-	local dirNow = horizontalDir(playerPos, portalPos)
-	if not dirNow then
-		dirNow = horizontalUnit(G.BotIntendedWishDir)
-	end
-	if not dirNow then
-		return false
-	end
-
-	local dirDot = track.dirToTarget:Dot(dirNow)
-	if dirDot >= getPassDirDotThreshold() then
-		return false
-	end
-
-	return AreaSpatial.IsWithinArea(playerPos, currentNode)
-end
-
 local function evaluatePortalPass(
 	playerPos,
 	portalPos,
@@ -644,20 +600,14 @@ local function evaluatePortalPass(
 		return false, nil
 	end
 
-	-- No portal advance while jumping — causes false segment pop and path desync.
-	if not isSmartJumpActive() then
-		if passDir and hasCrossedPortalPlane(playerPos, portalPos, passDir) then
+	local pLocal = G.pLocal and G.pLocal.entity
+	local onGround = pLocal and GroundMovement.isOnGround(pLocal)
+	local jumping = isSmartJumpActive()
+
+	-- Portal plane cross claims the node while moving through at speed (ground only).
+	if passDir and onGround and not jumping then
+		if hasCrossedPortalPlane(playerPos, portalPos, passDir, -12) then
 			return true, "portal_plane"
-		end
-
-		if hasPortalTouch(playerPos, portalPos, currentNode) and passDir then
-			if hasCrossedPortalPlane(playerPos, portalPos, passDir, 0) then
-				return true, "portal_touch"
-			end
-		end
-
-		if not isDrop and hasPortalOvershoot(playerPos, portalPos, currentNode) then
-			return true, "portal_overshoot"
 		end
 	end
 
@@ -698,6 +648,10 @@ local function hasPassedPortalApex(playerPos, apex, currentNode)
 	end
 
 	return false
+end
+
+function PathStringPull.IsEdgeSegment(currentNode, nextNode)
+	return PathStringPull.GetSegmentPortalPos(currentNode, nextNode) ~= nil
 end
 
 function PathStringPull.GetSegmentPortalPos(area, nextArea)

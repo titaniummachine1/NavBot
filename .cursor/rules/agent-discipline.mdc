@@ -48,7 +48,7 @@ State what you are unsure about and ask. A wrong confident change is worse than 
 - **No legacy "just in case"** — delete dead code when rewriting; do not keep parallel systems (waypoints + apex, STUCK state, pathHistory).
 - Shared 2D math lives in `NavBot.Utils.NavMath` (or `Common`); never duplicate `horizontalDir` / portal axis helpers per file.
 - `ProcessAreaPath` only at path-find; runtime uses `ConsumeNodeApexes` + `UpdateGoalApex`.
-- Pop path[1] via `CanAdvanceToNext`: strict `in_next_area`, portal edge pass (not center), or `CanSkip` to path[2] only while on path[1] (touch/portal band).
+- Pop path[1] via `CanAdvanceToNext`: strict `in_next_area`, portal plane cross on edge segments, or `CanSkip` on non-edge segments only (feet in path[1], velocity toward target).
 - `AlignPathIfDesynced` only when feet are on path[i] i>1 but path[1] is stale (recovery, not every-tick sync).
 - Apex steering clamped to current segment (path[1]->path[2]); never skip apexes ahead while path[1] remains.
 - String-pull build: same wall enter+exit on an area → `same_side_center` apex before portal.

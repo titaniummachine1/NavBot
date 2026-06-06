@@ -228,7 +228,7 @@ function Navigation.GetPathStartNode(pos)
 end
 
 --- After A* only: drop prefix until player area is path[1] (fixes wrong start node).
-function Navigation.AlignPathPrefixToPlayer(playerPos)
+function Navigation.AlignPathPrefixAfterFind(playerPos)
 	local path = G.Navigation.path
 	if not path or #path < 1 or not playerPos then
 		return false
@@ -268,7 +268,37 @@ function Navigation.AlignPathPrefixToPlayer(playerPos)
 	return popped > 0
 end
 
---- Feet are on path[i] with i>1 but path[1] is stale — trim prefix (desync recovery only).
+--- Recovery only: feet in path[2] while path[1] is stale — pop one node (never multi-pop).
+function Navigation.AlignPathPrefixToPlayer(playerPos)
+	local path = G.Navigation.path
+	if not path or #path < 2 or not playerPos then
+		return false
+	end
+
+	local playerArea = Node.GetAreaAtPosition(playerPos)
+	if not playerArea then
+		return false
+	end
+
+	if path[1].id == playerArea.id then
+		return false
+	end
+
+	if path[2].id ~= playerArea.id then
+		return false
+	end
+
+	local removed = table.remove(path, 1)
+	if removed and removed.id then
+		PathStringPull.ConsumeNodeApexes(removed.id)
+	end
+
+	G.Navigation.currentNodeIndex = 1
+	Log:Info("Aligned path prefix to area %s (pathLen=%d, popped=1)", tostring(playerArea.id), #path)
+	return true
+end
+
+--- Feet are on path[2] but path[1] is stale — trim one prefix node (desync recovery only).
 function Navigation.AlignPathIfDesynced(playerPos)
 	local path = G.Navigation.path
 	if not path or #path < 2 or not playerPos then
@@ -280,22 +310,7 @@ function Navigation.AlignPathIfDesynced(playerPos)
 		return false
 	end
 
-	local playerArea = Node.GetAreaAtPosition(playerPos)
-	if not playerArea then
-		return false
-	end
-
-	if path[1] and path[1].id == playerArea.id then
-		return false
-	end
-
-	for i = 2, #path do
-		if path[i].id == playerArea.id then
-			return Navigation.AlignPathPrefixToPlayer(playerPos)
-		end
-	end
-
-	return false
+	return Navigation.AlignPathPrefixToPlayer(playerPos)
 end
 
 ---@param startNode Node
@@ -336,7 +351,7 @@ function Navigation.FindPath(startNode, goalNode)
 		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
 		local origin = G.pLocal and G.pLocal.Origin
 		if origin then
-			Navigation.AlignPathPrefixToPlayer(origin)
+			Navigation.AlignPathPrefixAfterFind(origin)
 		end
 		Navigation.RebuildApexPath(true)
 	end
