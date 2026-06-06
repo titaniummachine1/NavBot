@@ -234,46 +234,11 @@ function StateHandler.handlePathfindingState()
 	end
 end
 
--- Simplified unstuck logic - guarantee bot never gets stuck
--- Only checks velocity/timeout when bot is walking autonomously
-function StateHandler.handleStuckState(userCmd)
-	local currentTick = globals.TickCount()
-
-	-- Velocity/timeout checks ONLY when bot is walking autonomously
-	if G.Menu.Main.EnableWalking then
-		-- Check velocity for stuck detection
-		local pLocal = G.pLocal.entity
-		if pLocal then
-			local velocity = pLocal:EstimateAbsVelocity()
-			local speed2D = 0
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
-			end
-
-			-- MAIN TRIGGER: Velocity < 50 = STUCK
-			if speed2D < 50 then
-				Log:Warn("STUCK DETECTED: velocity " .. tostring(speed2D) .. " < 50 - adding penalties and repathing")
-
-				-- Disable node skipping for 132 ticks (2 seconds) by setting work cooldown
-				WorkManager.setWorkCooldown("node_skipping", 132)
-				Log:Debug("Node skipping disabled for 132 ticks due to stuck")
-
-				-- Add cost penalties to current connection (node->node, node->door, door->door)
-				StateHandler.addStuckPenalties()
-
-				-- ALWAYS repath when stuck (simplified approach)
-				StateHandler.forceRepath("Velocity too low")
-				return
-			end
-		end
-	end
-
-	-- Reset stuck detection if moving normally
+-- Legacy entry point; stuck detection now lives in MovementDecisions.checkStuckState
+function StateHandler.handleStuckState(_userCmd)
+	G.currentState = G.States.MOVING
 	G.Navigation.unwalkableCount = 0
 	G.Navigation.stuckStartTick = nil
-
-	-- Reset node skipping cooldown to 1 tick when unstuck
-	WorkManager.setWorkCooldown("node_skipping", 1)
 end
 
 -- Add cost penalties to connections when stuck

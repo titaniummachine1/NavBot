@@ -1,14 +1,13 @@
 --[[
-Node Skipper - Single-node skip only, validated by NavPredict.CanSkip.
-Pass detection from PathSteering; no multi-node forward skip.
+Node Skipper — runs every tick; skip current node when NavPredict.CanSkip passes (no doors-only).
+Door portals are reserved for PathStringPull at path-build time.
 ]]
 
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local Node = require("NavBot.Navigation.Node")
 local PathSteering = require("NavBot.Navigation.PathSteering")
-local WorkManager = require("NavBot.WorkManager")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
 
 local Log = Common.Log.new("NodeSkipper")
 
@@ -23,6 +22,11 @@ local function lockIntentAfterSkip(playerPos)
 	if path and path[1] then
 		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
 	end
+end
+
+local function rebuildApexPath(playerPos)
+	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(G.Navigation.path, G.Navigation.goalPos, playerPos)
+	G.Navigation.apexIndex = 1
 end
 
 local function logSkipBlocked(currentNode, nextNode, reason)
@@ -40,21 +44,17 @@ local function canSkipSegment(playerPos, goalPos, fromAreaNode, allowJump)
 	if not fromAreaNode then
 		return false
 	end
-	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, true, allowJump)
+	-- doorsOnly=false for skipping; doors-only mode is for string-pull apex build
+	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, false, allowJump)
 	return success and canSkip == true
 end
 
-local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
-	if not G.Menu.Navigation.Skip_Nodes then
-		return false
-	end
-
+local function trySkipCurrentNode(playerPos, currentNode, nextNode)
 	local goalPos = nextNode.pos
 	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
 
-	-- Always validate from the path node we are leaving, not overlap-picked area
 	if not canSkipSegment(playerPos, goalPos, currentNode, allowJump) then
-		logSkipBlocked(currentNode, nextNode, reason)
+		logSkipBlocked(currentNode, nextNode, "not_walkable")
 		return false
 	end
 
@@ -66,22 +66,10 @@ local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
 	end
 
 	G.Navigation.lastSkipTick = globals.TickCount()
-	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
+	G.Navigation.currentNodeIndex = 1
+	rebuildApexPath(playerPos)
+	Log:Info("Skipped node %s, targeting %s", tostring(missedNode.id), tostring(nextNode.id))
 	return true
-end
-
-local function shouldAttemptSkip(playerPos, currentNode, nextNode)
-	local passed, passReason = PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
-	if passed then
-		return true, passReason
-	end
-
-	local playerArea = Node.GetAreaAtPosition(playerPos)
-	if playerArea and playerArea.id == nextNode.id then
-		return true, "inside_next_area"
-	end
-
-	return false, nil
 end
 
 function NodeSkipper.Reset()
@@ -93,7 +81,7 @@ end
 function NodeSkipper.Tick(playerPos)
 	assert(playerPos, "Tick: playerPos missing")
 
-	if not WorkManager.attemptWork(1, "node_skipping") then
+	if not G.Menu.Navigation.Skip_Nodes then
 		return false
 	end
 
@@ -108,14 +96,8 @@ function NodeSkipper.Tick(playerPos)
 		return false
 	end
 
-	local shouldSkip, skipReason = shouldAttemptSkip(playerPos, currentNode, nextNode)
-	if not shouldSkip then
-		return false
-	end
-
-	if trySkipCurrentNode(playerPos, currentNode, nextNode, skipReason) then
+	if trySkipCurrentNode(playerPos, currentNode, nextNode) then
 		lockIntentAfterSkip(playerPos)
-		G.Navigation.currentNodeIndex = 1
 		return true
 	end
 

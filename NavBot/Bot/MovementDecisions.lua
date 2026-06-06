@@ -11,6 +11,7 @@ local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
+local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
 
@@ -23,6 +24,34 @@ local Log = Common.Log.new("MovementDecisions")
 local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
 local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
 local WALKABILITY_CHECK_COOLDOWN = 5 -- ticks (~83ms) between expensive walkability checks
+local STUCK_SPEED_RATIO = 0.8
+local STUCK_GRACE_TICKS = 33
+local STUCK_SAME_NODE_TICKS = 200
+local STUCK_SLOW_REPATH_TICKS = 132
+
+local function getPlayerSpeed2D(pLocal)
+	local velocity = pLocal:EstimateAbsVelocity()
+	if not velocity or type(velocity.x) ~= "number" or type(velocity.y) ~= "number" then
+		return 0
+	end
+	return math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+end
+
+local function isBelowStuckSpeedThreshold(speed2D, maxSpeed)
+	if not maxSpeed or maxSpeed <= 0 then
+		maxSpeed = 450
+	end
+	return speed2D < (maxSpeed * STUCK_SPEED_RATIO)
+end
+
+local function triggerStuckRepath(reason)
+	local StateHandler = require("NavBot.Bot.StateHandler")
+	WorkManager.setWorkCooldown("node_skipping", STUCK_SLOW_REPATH_TICKS)
+	StateHandler.addStuckPenalties()
+	StateHandler.forceRepath(reason)
+	G.Navigation.slowSpeedTicks = 0
+	G.Navigation.currentNodeTicks = 0
+end
 
 -- Decision: Check if we've reached the target and advance waypoints/nodes
 function MovementDecisions.checkDistanceAndAdvance(userCmd)
@@ -127,6 +156,8 @@ end
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
 	previousDistance = nil
+	G.Navigation.slowSpeedTicks = 0
+	G.Navigation.currentNodeTicks = 0
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
@@ -147,70 +178,60 @@ function MovementDecisions.advanceNode()
 	return true -- Continue moving
 end
 
--- Decision: Check stuck state: Simple walkability check with cooldown
+-- Only start stuck checks after speed stays below 80% max for STUCK_GRACE_TICKS.
+-- Never switch to STUCK state (that stops walkTo); repath while still moving.
 function MovementDecisions.checkStuckState()
-	-- Velocity/timeout checks ONLY when bot is walking autonomously
-	if G.Menu.Main.EnableWalking then
-		local pLocal = G.pLocal.entity
-		if pLocal then
-			-- Track how long we've been on the same node
-			local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
-			if currentNodeId then
-				if currentNodeId ~= G.Navigation.lastNodeId then
-					G.Navigation.lastNodeId = currentNodeId
-					G.Navigation.currentNodeTicks = 0
-				else
-					G.Navigation.currentNodeTicks = (G.Navigation.currentNodeTicks or 0) + 1
-				end
+	if not G.Menu.Main.EnableWalking then
+		return
+	end
 
-				-- Stuck detection: If on same node for > 200 ticks (3 seconds), force repath
-				if G.Navigation.currentNodeTicks > 200 then
-					Log:Warn("STUCK: Same node for %d ticks, switching to STUCK state", G.Navigation.currentNodeTicks)
-					G.currentState = G.States.STUCK
-					G.Navigation.currentNodeTicks = 0
-					return
-				end
-			end
+	local pLocal = G.pLocal.entity
+	if not pLocal then
+		return
+	end
 
-			-- Velocity-based stuck detection
-			local velocity = pLocal:EstimateAbsVelocity()
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+	local maxSpeed = Common.Dynamic.GetMaxSpeed()
+	local speed2D = getPlayerSpeed2D(pLocal)
 
-				-- Critical velocity threshold: < 50 = stuck
-				if speed2D < 50 then
-					G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
+	if not isBelowStuckSpeedThreshold(speed2D, maxSpeed) then
+		G.Navigation.slowSpeedTicks = 0
+		return
+	end
 
-					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
-					if G.Navigation.lowVelocityTicks > 66 then
-						Log:Warn(
-							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
-							speed2D,
-							G.Navigation.lowVelocityTicks
-						)
-						G.currentState = G.States.STUCK
-						G.Navigation.lowVelocityTicks = 0
-					end
-				else
-					G.Navigation.lowVelocityTicks = 0
-				end
-			end
+	G.Navigation.slowSpeedTicks = (G.Navigation.slowSpeedTicks or 0) + 1
+	if G.Navigation.slowSpeedTicks <= STUCK_GRACE_TICKS then
+		return
+	end
+
+	local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
+	if currentNodeId then
+		if currentNodeId ~= G.Navigation.lastNodeId then
+			G.Navigation.lastNodeId = currentNodeId
+			G.Navigation.currentNodeTicks = 0
+		else
+			G.Navigation.currentNodeTicks = (G.Navigation.currentNodeTicks or 0) + 1
+		end
+
+		if G.Navigation.currentNodeTicks > STUCK_SAME_NODE_TICKS then
+			Log:Warn(
+				"STUCK: Same node %s for %d ticks below %.0f%% speed, repathing",
+				tostring(currentNodeId),
+				G.Navigation.currentNodeTicks,
+				STUCK_SPEED_RATIO * 100
+			)
+			triggerStuckRepath("Same node too long while slow")
+			return
 		end
 	end
 
-	-- Simple walkability check for ALL modes (with 33 tick cooldown)
-	-- Only when NOT walking autonomously (walking mode has velocity checks)
-	if not G.Menu.Main.EnableWalking then
-		-- TEMPORARILY DISABLED to debug NodeSkipper traces (this was interfering with visualization)
-		-- if WorkManager.attemptWork(33, "stuck_walkability_check") then
-		-- 	local targetPos = MovementDecisions.getCurrentTarget()
-		-- 	if targetPos then
-		-- 		if not PathValidator.Path(G.pLocal.Origin, targetPos) then
-		-- 			Log:Warn("STUCK: Path to current target not walkable, repathing")
-		-- 			G.currentState = G.States.STUCK
-		-- 		end
-		-- 	end
-		-- end
+	if G.Navigation.slowSpeedTicks > STUCK_GRACE_TICKS + STUCK_SLOW_REPATH_TICKS then
+		Log:Warn(
+			"STUCK: Speed %.1f below %.0f%% max for %d ticks, repathing",
+			speed2D,
+			STUCK_SPEED_RATIO * 100,
+			G.Navigation.slowSpeedTicks
+		)
+		triggerStuckRepath("Slow for extended period")
 	end
 end
 
@@ -276,6 +297,7 @@ function MovementDecisions.handleMovingState(userCmd)
 
 	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
+	NodeSkipper.Tick(G.pLocal.Origin)
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
 

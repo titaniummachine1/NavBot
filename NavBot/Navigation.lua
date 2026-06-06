@@ -145,6 +145,7 @@ function Navigation.ClearPath()
 	G.Navigation.pathHistory = {}
 	G.Navigation.apexPath = nil
 	G.Navigation.apexIndex = 1
+	G.Navigation.slowSpeedTicks = 0
 	NodeSkipper.Reset()
 end
 

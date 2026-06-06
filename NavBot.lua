@@ -140,13 +140,9 @@ local function onCreateMove(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
 	elseif G.currentState == G.States.STUCK then
-		-- Only run stuck logic if walking is enabled (manual override mode = no stuck logic)
-		if G.Menu.Main.EnableWalking then
-			StateHandler.handleStuckState(userCmd)
-		else
-			-- Manual mode: just transition back to MOVING, skipping still works
-			G.currentState = G.States.MOVING
-		end
+		-- Legacy state: keep walking, repath handled from MOVING.checkStuckState now
+		G.currentState = G.States.MOVING
+		MovementDecisions.handleMovingState(userCmd)
 	end
 
 	-- Work management
@@ -8368,6 +8364,7 @@ local PathStringPull = require("NavBot.Navigation.PathStringPull")
 local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
 local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
+local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
 
@@ -8380,6 +8377,34 @@ local Log = Common.Log.new("MovementDecisions")
 local DISTANCE_CHECK_COOLDOWN = 3 -- ticks (~50ms) between distance calculations
 local DEBUG_LOG_COOLDOWN = 15 -- ticks (~0.25s) between debug logs
 local WALKABILITY_CHECK_COOLDOWN = 5 -- ticks (~83ms) between expensive walkability checks
+local STUCK_SPEED_RATIO = 0.8
+local STUCK_GRACE_TICKS = 33
+local STUCK_SAME_NODE_TICKS = 200
+local STUCK_SLOW_REPATH_TICKS = 132
+
+local function getPlayerSpeed2D(pLocal)
+	local velocity = pLocal:EstimateAbsVelocity()
+	if not velocity or type(velocity.x) ~= "number" or type(velocity.y) ~= "number" then
+		return 0
+	end
+	return math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+end
+
+local function isBelowStuckSpeedThreshold(speed2D, maxSpeed)
+	if not maxSpeed or maxSpeed <= 0 then
+		maxSpeed = 450
+	end
+	return speed2D < (maxSpeed * STUCK_SPEED_RATIO)
+end
+
+local function triggerStuckRepath(reason)
+	local StateHandler = require("NavBot.Bot.StateHandler")
+	WorkManager.setWorkCooldown("node_skipping", STUCK_SLOW_REPATH_TICKS)
+	StateHandler.addStuckPenalties()
+	StateHandler.forceRepath(reason)
+	G.Navigation.slowSpeedTicks = 0
+	G.Navigation.currentNodeTicks = 0
+end
 
 -- Decision: Check if we've reached the target and advance waypoints/nodes
 function MovementDecisions.checkDistanceAndAdvance(userCmd)
@@ -8484,6 +8509,8 @@ end
 -- Decision: Handle node advancement
 function MovementDecisions.advanceNode()
 	previousDistance = nil
+	G.Navigation.slowSpeedTicks = 0
+	G.Navigation.currentNodeTicks = 0
 	Navigation.RemoveCurrentNode()
 	Navigation.ResetTickTimer()
 	Navigation.ResetNodeSkipping()
@@ -8504,70 +8531,60 @@ function MovementDecisions.advanceNode()
 	return true -- Continue moving
 end
 
--- Decision: Check stuck state: Simple walkability check with cooldown
+-- Only start stuck checks after speed stays below 80% max for STUCK_GRACE_TICKS.
+-- Never switch to STUCK state (that stops walkTo); repath while still moving.
 function MovementDecisions.checkStuckState()
-	-- Velocity/timeout checks ONLY when bot is walking autonomously
-	if G.Menu.Main.EnableWalking then
-		local pLocal = G.pLocal.entity
-		if pLocal then
-			-- Track how long we've been on the same node
-			local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
-			if currentNodeId then
-				if currentNodeId ~= G.Navigation.lastNodeId then
-					G.Navigation.lastNodeId = currentNodeId
-					G.Navigation.currentNodeTicks = 0
-				else
-					G.Navigation.currentNodeTicks = (G.Navigation.currentNodeTicks or 0) + 1
-				end
+	if not G.Menu.Main.EnableWalking then
+		return
+	end
 
-				-- Stuck detection: If on same node for > 200 ticks (3 seconds), force repath
-				if G.Navigation.currentNodeTicks > 200 then
-					Log:Warn("STUCK: Same node for %d ticks, switching to STUCK state", G.Navigation.currentNodeTicks)
-					G.currentState = G.States.STUCK
-					G.Navigation.currentNodeTicks = 0
-					return
-				end
-			end
+	local pLocal = G.pLocal.entity
+	if not pLocal then
+		return
+	end
 
-			-- Velocity-based stuck detection
-			local velocity = pLocal:EstimateAbsVelocity()
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				local speed2D = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+	local maxSpeed = Common.Dynamic.GetMaxSpeed()
+	local speed2D = getPlayerSpeed2D(pLocal)
 
-				-- Critical velocity threshold: < 50 = stuck
-				if speed2D < 50 then
-					G.Navigation.lowVelocityTicks = (G.Navigation.lowVelocityTicks or 0) + 1
+	if not isBelowStuckSpeedThreshold(speed2D, maxSpeed) then
+		G.Navigation.slowSpeedTicks = 0
+		return
+	end
 
-					-- If velocity too low for 66 ticks (1 second), switch to STUCK state
-					if G.Navigation.lowVelocityTicks > 66 then
-						Log:Warn(
-							"STUCK: Low velocity (%.1f) for %d ticks, entering STUCK state",
-							speed2D,
-							G.Navigation.lowVelocityTicks
-						)
-						G.currentState = G.States.STUCK
-						G.Navigation.lowVelocityTicks = 0
-					end
-				else
-					G.Navigation.lowVelocityTicks = 0
-				end
-			end
+	G.Navigation.slowSpeedTicks = (G.Navigation.slowSpeedTicks or 0) + 1
+	if G.Navigation.slowSpeedTicks <= STUCK_GRACE_TICKS then
+		return
+	end
+
+	local currentNodeId = G.Navigation.path and G.Navigation.path[1] and G.Navigation.path[1].id
+	if currentNodeId then
+		if currentNodeId ~= G.Navigation.lastNodeId then
+			G.Navigation.lastNodeId = currentNodeId
+			G.Navigation.currentNodeTicks = 0
+		else
+			G.Navigation.currentNodeTicks = (G.Navigation.currentNodeTicks or 0) + 1
+		end
+
+		if G.Navigation.currentNodeTicks > STUCK_SAME_NODE_TICKS then
+			Log:Warn(
+				"STUCK: Same node %s for %d ticks below %.0f%% speed, repathing",
+				tostring(currentNodeId),
+				G.Navigation.currentNodeTicks,
+				STUCK_SPEED_RATIO * 100
+			)
+			triggerStuckRepath("Same node too long while slow")
+			return
 		end
 	end
 
-	-- Simple walkability check for ALL modes (with 33 tick cooldown)
-	-- Only when NOT walking autonomously (walking mode has velocity checks)
-	if not G.Menu.Main.EnableWalking then
-		-- TEMPORARILY DISABLED to debug NodeSkipper traces (this was interfering with visualization)
-		-- if WorkManager.attemptWork(33, "stuck_walkability_check") then
-		-- 	local targetPos = MovementDecisions.getCurrentTarget()
-		-- 	if targetPos then
-		-- 		if not PathValidator.Path(G.pLocal.Origin, targetPos) then
-		-- 			Log:Warn("STUCK: Path to current target not walkable, repathing")
-		-- 			G.currentState = G.States.STUCK
-		-- 		end
-		-- 	end
-		-- end
+	if G.Navigation.slowSpeedTicks > STUCK_GRACE_TICKS + STUCK_SLOW_REPATH_TICKS then
+		Log:Warn(
+			"STUCK: Speed %.1f below %.0f%% max for %d ticks, repathing",
+			speed2D,
+			STUCK_SPEED_RATIO * 100,
+			G.Navigation.slowSpeedTicks
+		)
+		triggerStuckRepath("Slow for extended period")
 	end
 end
 
@@ -8633,6 +8650,7 @@ function MovementDecisions.handleMovingState(userCmd)
 
 	-- Run all decision components (these don't affect movement execution)
 	MovementDecisions.handleDebugLogging()
+	NodeSkipper.Tick(G.pLocal.Origin)
 	MovementDecisions.checkDistanceAndAdvance(userCmd)
 	MovementDecisions.checkStuckState()
 
@@ -8644,6 +8662,1895 @@ function MovementDecisions.handleMovingState(userCmd)
 end
 
 return MovementDecisions
+
+end)
+__bundle_register("NavBot.Bot.StateHandler", function(require, _LOADED, __bundle_register, __bundle_modules)
+--##########################################################################
+--  StateHandler.lua  ·  Game state management and transitions
+--##########################################################################
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Navigation = require("NavBot.Navigation")
+local Node = require("NavBot.Navigation.Node")
+local WorkManager = require("NavBot.WorkManager")
+local GoalFinder = require("NavBot.Bot.GoalFinder")
+local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local SmartJump = require("NavBot.Bot.SmartJump")
+local MovementDecisions = require("NavBot.Bot.MovementDecisions")
+
+local StateHandler = {}
+local Log = Common.Log.new("StateHandler")
+
+-- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
+
+function StateHandler.handleUserInput(userCmd)
+	if userCmd:GetForwardMove() ~= 0 or userCmd:GetSideMove() ~= 0 then
+		G.Navigation.currentNodeTicks = 0
+		G.currentState = G.States.IDLE
+		G.wasManualWalking = true
+		G.BotIsMoving = false
+		-- Set timestamp when user last moved to prevent immediate pathfinding
+		G.lastManualMovementTick = globals.TickCount()
+		return true
+	end
+	return false
+end
+
+function StateHandler.handleIdleState()
+	G.BotIsMoving = false
+
+	-- Prevent pathfinding spam after manual movement (66 tick cooldown = 1 second)
+	local currentTick = globals.TickCount()
+	if G.lastManualMovementTick and (currentTick - G.lastManualMovementTick) < 66 then
+		return -- Still in cooldown after manual movement
+	end
+
+	-- Ensure navigation is ready before any goal work
+	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
+		Log:Debug("No navigation nodes available, staying in IDLE state")
+		return
+	end
+
+	-- Use WorkManager's simple cooldown pattern instead of complex priority system
+	if not WorkManager.attemptWork(5, "goal_search") then
+		return -- Still on cooldown
+	end
+
+	-- Check for immediate goals
+	local goalNode, goalPos = GoalFinder.findGoal("Objective")
+	if goalNode and goalPos then
+		local distance = (G.pLocal.Origin - goalPos):Length()
+
+		-- Only use direct-walk shortcut outside CTF and for short hops
+		local mapName = engine.GetMapName():lower()
+		local allowDirectWalk = not mapName:find("ctf_") and distance > 25 and distance <= 300
+		if allowDirectWalk then
+			local currentArea = Navigation.GetAreaAtPosition(G.pLocal.Origin)
+			if currentArea then
+				local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+				local success, canWalk =
+					pcall(NavPredict.CanSkip, G.pLocal.Origin, goalPos, currentArea, true, allowJump)
+				if success and canWalk then
+					Log:Info("Direct-walk (short hop), moving immediately (dist: %.1f)", distance)
+					G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+					G.Navigation.goalPos = goalPos
+					G.Navigation.goalNodeId = goalNode.id
+					Navigation.RebuildApexPath()
+					G.currentState = G.States.MOVING
+					G.lastPathfindingTick = globals.TickCount()
+					return
+				end
+			end
+		end
+
+		-- Check if goal has changed significantly from current path
+		if G.Navigation.goalPos then
+			local goalChanged = (G.Navigation.goalPos - goalPos):Length() > 150
+			if goalChanged then
+				Log:Info("Goal changed significantly, forcing immediate repath (new distance: %.1f)", distance)
+				G.lastPathfindingTick = 0 -- Force repath immediately
+			end
+		end
+	end
+
+	-- Check if path was recently modified by node skipper (prevent immediate overwrite)
+	local currentTick = globals.TickCount()
+	if G.Navigation.lastSkipTick and (currentTick - G.Navigation.lastSkipTick) < 10 then
+		Log:Debug("Path was recently skipped, not overwriting")
+		return
+	end
+
+	-- Prevent pathfinding spam by limiting frequency
+	G.lastPathfindingTick = G.lastPathfindingTick or 0
+	if currentTick - G.lastPathfindingTick < 33 then
+		return
+	end
+
+	-- (nodes were already checked above)
+
+	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	if not startNode then
+		Log:Warn("Could not find start node")
+		return
+	end
+
+	if not (goalNode and goalPos) then
+		-- Throttle warn to avoid log spam
+		G.lastNoGoalWarnTick = G.lastNoGoalWarnTick or 0
+		if currentTick - G.lastNoGoalWarnTick > 60 then
+			Log:Warn("Could not find goal node")
+			G.lastNoGoalWarnTick = currentTick
+		end
+		return
+	end
+
+	G.Navigation.goalPos = goalPos
+	G.Navigation.goalNodeId = goalNode and goalNode.id or nil
+
+	-- Check if we're on same node OR neighbor node for smooth following
+	local isNeighbor = false
+	if startNode.id ~= goalNode.id and startNode.c then
+		-- Check if goal node is a direct neighbor (connected)
+		for _, dir in pairs(startNode.c) do
+			if dir.connections then
+				for _, conn in ipairs(dir.connections) do
+					if conn.node == goalNode.id then
+						isNeighbor = true
+						break
+					end
+				end
+			end
+			if isNeighbor then
+				break
+			end
+		end
+	end
+
+	-- Avoid pathfinding if we're at goal node or neighboring area
+	if startNode.id == goalNode.id or isNeighbor then
+		if goalPos then
+			-- Check distance to see if we're close enough
+			local dist = (G.pLocal.Origin - goalPos):Length()
+			local stopRadius = G.Menu.Navigation.StopDistance or 50
+			G.Navigation.followingStopRadius = stopRadius
+
+			if dist <= stopRadius then
+				-- Within stop radius - enter FOLLOWING state and just track position
+				-- DON'T set lastPathfindingTick - this isn't pathfinding, just direct movement
+				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+				Navigation.RebuildApexPath()
+				G.currentState = G.States.FOLLOWING
+				G.Navigation.followingDistance = dist
+				Log:Debug(
+					"Within stop radius (%.0f/%.0f) - entering FOLLOWING state %s",
+					dist,
+					stopRadius,
+					isNeighbor and "(neighbor)" or "(same node)"
+				)
+			else
+				-- Too far - move closer (still direct movement, not pathfinding)
+				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+				Navigation.RebuildApexPath()
+				G.currentState = G.States.MOVING
+				G.Navigation.followingStopRadius = nil
+				Log:Info(
+					"Moving to goal position (%.0f, %.0f, %.0f) from node %d (dist=%.0f) %s",
+					goalPos.x,
+					goalPos.y,
+					goalPos.z,
+					startNode.id,
+					dist,
+					isNeighbor and "[neighbor]" or ""
+				)
+			end
+		else
+			Log:Debug("No goal position available, staying in IDLE")
+			G.lastPathfindingTick = currentTick
+			G.Navigation.followingStopRadius = nil
+		end
+		return
+	end
+
+	Log:Info("Generating new path from node %d to node %d", startNode.id, goalNode.id)
+	WorkManager.addWork(Navigation.FindPath, { startNode, goalNode }, 33, "Pathfinding")
+	G.currentState = G.States.PATHFINDING
+	G.lastPathfindingTick = currentTick
+end
+
+function StateHandler.handlePathfindingState()
+	if Navigation.pathFound then
+		G.currentState = G.States.MOVING
+		Navigation.pathFound = false
+	elseif Navigation.pathFailed then
+		Log:Warn("Pathfinding failed")
+		G.currentState = G.States.IDLE
+		Navigation.pathFailed = false
+	else
+		-- If no work in progress, start pathfinding
+		local pathfindingWork = WorkManager.works["Pathfinding"]
+		if not pathfindingWork or pathfindingWork.wasExecuted then
+			local goalPos = G.Navigation.goalPos
+			local goalNodeId = G.Navigation.goalNodeId
+
+			if goalPos and goalNodeId then
+				local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+				local goalNode = G.Navigation.nodes and G.Navigation.nodes[goalNodeId]
+
+				if startNode and goalNode and startNode.id ~= goalNode.id then
+					local currentTick = globals.TickCount()
+					if not G.lastRepathTick then
+						G.lastRepathTick = 0
+					end
+
+					if currentTick - G.lastRepathTick > 30 then
+						Log:Info("Repathing from stuck state: node %d to node %d", startNode.id, goalNode.id)
+						WorkManager.addWork(Navigation.FindPath, { startNode, goalNode }, 33, "Pathfinding")
+						G.lastRepathTick = currentTick
+					end
+				else
+					Log:Debug("Cannot repath - invalid start/goal nodes, returning to IDLE")
+					G.currentState = G.States.IDLE
+				end
+			else
+				Log:Debug("No existing goal for repath, returning to IDLE")
+				G.currentState = G.States.IDLE
+			end
+		end
+	end
+end
+
+-- Legacy entry point; stuck detection now lives in MovementDecisions.checkStuckState
+function StateHandler.handleStuckState(_userCmd)
+	G.currentState = G.States.MOVING
+	G.Navigation.unwalkableCount = 0
+	G.Navigation.stuckStartTick = nil
+end
+
+-- Add cost penalties to connections when stuck
+function StateHandler.addStuckPenalties()
+	local path = G.Navigation.path
+	if not path or #path < 2 then
+		return
+	end
+
+	-- Add penalty to current connection (between any two path elements)
+	local currentElement = path[1]
+	local nextElement = path[2]
+
+	if currentElement and nextElement then
+		-- Handle different connection types: node->node, node->door, door->door
+		local fromId = currentElement.id or currentElement.fromId
+		local toId = nextElement.id or nextElement.toId or nextElement.areaId
+
+		if fromId and toId then
+			-- Find and penalize the connection
+			local fromNode = G.Navigation.nodes and G.Navigation.nodes[fromId]
+			local toNode = G.Navigation.nodes and G.Navigation.nodes[toId]
+
+			if fromNode and toNode then
+				local connection = Node.GetConnectionEntry(fromNode, toNode)
+				if connection then
+					connection.cost = (connection.cost or 1) + 50
+					Log:Info(
+						"Added 50 cost penalty to connection "
+							.. tostring(fromId)
+							.. " -> "
+							.. tostring(toId)
+							.. " (stuck penalty)"
+					)
+				end
+			end
+		end
+	end
+end
+
+-- Force immediate repath (with cooldown to prevent spam)
+function StateHandler.forceRepath(reason)
+	-- Prevent repath spam with 33 tick cooldown
+	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
+		return -- Still on cooldown, ignore repath request
+	end
+
+	Log:Warn("Force repath triggered: %s", reason)
+
+	-- Clear stuck state
+	G.Navigation.stuckStartTick = nil
+	G.Navigation.unwalkableCount = 0
+	Navigation.ResetTickTimer()
+
+	-- Force immediate repath
+	G.currentState = G.States.PATHFINDING
+	G.lastPathfindingTick = 0
+
+	-- Reset work manager to allow immediate repath
+	WorkManager.clearWork("Pathfinding")
+end
+
+-- Handle FOLLOWING state - direct following of dynamic targets on same node
+function StateHandler.handleFollowingState(userCmd)
+	local currentTick = globals.TickCount()
+
+	-- Throttle updates to every 5 ticks (~83ms) for responsive tracking
+	if not G.Navigation.lastFollowUpdateTick then
+		G.Navigation.lastFollowUpdateTick = 0
+	end
+
+	if currentTick - G.Navigation.lastFollowUpdateTick < 5 then
+		-- Use MovementDecisions to continue moving to current target
+		if G.Navigation.path and #G.Navigation.path > 0 then
+			MovementDecisions.handleMovingState(userCmd)
+		end
+		return
+	end
+
+	G.Navigation.lastFollowUpdateTick = currentTick
+
+	-- Re-check goal position (payload/player may have moved)
+	local goalNode, goalPos = GoalFinder.findGoal("Objective")
+
+	if not goalNode or not goalPos then
+		-- Lost target - return to IDLE (clear pathfinding throttle for immediate repath)
+		Log:Debug("Lost target in FOLLOWING state, returning to IDLE")
+		G.currentState = G.States.IDLE
+		G.lastPathfindingTick = 0
+		G.Navigation.followingStopRadius = nil
+		return
+	end
+
+	-- Check if still on same node
+	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+	if not startNode or startNode.id ~= goalNode.id then
+		-- No longer on same node - return to IDLE to trigger pathfinding (clear throttle)
+		Log:Debug("Left target node in FOLLOWING state, returning to IDLE")
+		G.currentState = G.States.IDLE
+		G.lastPathfindingTick = 0
+		G.Navigation.followingStopRadius = nil
+		return
+	end
+
+	-- Check distance change
+	local currentDist = (G.pLocal.Origin - goalPos):Length()
+	local stopRadius = G.Menu.Navigation.StopDistance or 50
+	local distChange = math.abs(currentDist - (G.Navigation.followingDistance or currentDist))
+
+	-- Only update if distance changed significantly (>30 units)
+	if distChange > 10 then
+		G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
+		Navigation.RebuildApexPath()
+		G.Navigation.followingDistance = currentDist
+		G.Navigation.goalPos = goalPos
+		Log:Debug("Target moved %.0f units, updating position (dist=%.0f)", distChange, currentDist)
+
+		-- If moved outside stop radius, switch to MOVING
+		if currentDist > stopRadius then
+			Log:Debug("Target moved outside stop radius, switching to MOVING")
+			G.currentState = G.States.MOVING
+			G.Navigation.followingStopRadius = nil
+		end
+	end
+
+	-- Continue moving to target
+	if G.Navigation.path and #G.Navigation.path > 0 then
+		MovementDecisions.handleMovingState(userCmd)
+	end
+end
+
+return StateHandler
+
+end)
+__bundle_register("NavBot.Bot.CircuitBreaker", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Circuit Breaker - Prevents infinite loops on problematic connections
+Tracks connection failures and temporarily blocks connections that fail repeatedly
+]]
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+-- local Node = require("NavBot.Navigation.Node")  -- Temporarily disabled for bundle compatibility
+
+local CircuitBreaker = {}
+local Log = Common.Log.new("CircuitBreaker")
+
+-- Circuit breaker state
+local state = {
+	failures = {}, -- [connectionKey] = { count, lastFailTime, isBlocked }
+	maxFailures = 2, -- Max failures before blocking connection temporarily
+	blockDuration = 300, -- Ticks to block connection (5 seconds)
+	cleanupInterval = 1800, -- Clean up old entries every 30 seconds
+	lastCleanup = 0,
+}
+
+-- Add a connection failure to the circuit breaker
+function CircuitBreaker.addFailure(nodeA, nodeB)
+	if not nodeA or not nodeB then
+		return false
+	end
+
+	local connectionKey = nodeA.id .. "->" .. nodeB.id
+	local currentTick = globals.TickCount()
+
+	-- Initialize or update failure count
+	if not state.failures[connectionKey] then
+		state.failures[connectionKey] = { count = 0, lastFailTime = 0, isBlocked = false }
+	end
+
+	local failure = state.failures[connectionKey]
+	failure.count = failure.count + 1
+	failure.lastFailTime = currentTick
+
+	-- Each failure adds MORE penalty (makes path progressively more expensive)
+	local additionalPenalty = 100 -- Add 100 units per failure
+	-- Node.AddFailurePenalty(nodeA, nodeB, additionalPenalty)  -- Temporarily disabled for bundle compatibility
+
+	Log:Debug(
+		"Connection %s failure #%d - added %d penalty (total accumulating)",
+		connectionKey,
+		failure.count,
+		additionalPenalty
+	)
+
+	-- Block connection if too many failures
+	if failure.count >= state.maxFailures then
+		failure.isBlocked = true
+		-- Add a big penalty to ensure A* avoids this completely
+		local blockingPenalty = 500
+		-- Node.AddFailurePenalty(nodeA, nodeB, blockingPenalty)  -- Temporarily disabled for bundle compatibility
+
+		Log:Warn(
+			"Connection %s BLOCKED after %d failures (added final %d penalty)",
+			connectionKey,
+			failure.count,
+			blockingPenalty
+		)
+		return true
+	end
+
+	return false
+end
+
+-- Check if a connection is blocked by circuit breaker
+function CircuitBreaker.isBlocked(nodeA, nodeB)
+	if not nodeA or not nodeB then
+		return false
+	end
+
+	local connectionKey = nodeA.id .. "->" .. nodeB.id
+	local failure = state.failures[connectionKey]
+
+	if not failure or not failure.isBlocked then
+		return false
+	end
+
+	local currentTick = globals.TickCount()
+	-- Unblock if enough time has passed (penalties remain but connection becomes usable)
+	if currentTick - failure.lastFailTime > state.blockDuration then
+		failure.isBlocked = false
+		failure.count = 0 -- Reset failure count (penalties stay, giving A* a chance to reconsider)
+
+		Log:Info(
+			"Connection %s UNBLOCKED after timeout (accumulated penalties remain as lesson learned)",
+			connectionKey
+		)
+		return false
+	end
+
+	return true
+end
+
+-- Clean up old circuit breaker entries
+function CircuitBreaker.cleanup()
+	local currentTick = globals.TickCount()
+	if currentTick - state.lastCleanup < state.cleanupInterval then
+		return
+	end
+
+	state.lastCleanup = currentTick
+	local cleaned = 0
+
+	for connectionKey, failure in pairs(state.failures) do
+		-- Clean up old, unblocked entries
+		if not failure.isBlocked and (currentTick - failure.lastFailTime) > state.blockDuration * 2 then
+			state.failures[connectionKey] = nil
+			cleaned = cleaned + 1
+		end
+	end
+
+	if cleaned > 0 then
+		Log:Debug("Circuit breaker cleaned up %d old entries", cleaned)
+	end
+end
+
+-- Get circuit breaker status for debugging
+function CircuitBreaker.getStatus()
+	local currentTick = globals.TickCount()
+	local blockedCount = 0
+	local totalFailures = 0
+
+	for connectionKey, failure in pairs(state.failures) do
+		totalFailures = totalFailures + failure.count
+		if failure.isBlocked then
+			blockedCount = blockedCount + 1
+		end
+	end
+
+	return {
+		connections = state.failures,
+		blockedCount = blockedCount,
+		totalFailures = totalFailures,
+		settings = {
+			maxFailures = state.maxFailures,
+			blockDuration = state.blockDuration,
+		},
+	}
+end
+
+-- Clear all circuit breaker data
+function CircuitBreaker.clear()
+	state.failures = {}
+	Log:Info("Circuit breaker cleared - all connections reset")
+end
+
+-- Manually block/unblock connections
+function CircuitBreaker.manualBlock(nodeA, nodeB)
+	local connectionKey = tostring(nodeA) .. "->" .. tostring(nodeB)
+	state.failures[connectionKey] = {
+		count = state.maxFailures,
+		lastFailTime = globals.TickCount(),
+		isBlocked = true,
+	}
+	Log:Info("Manually blocked connection %s", connectionKey)
+end
+
+function CircuitBreaker.manualUnblock(nodeA, nodeB)
+	local connectionKey = tostring(nodeA) .. "->" .. tostring(nodeB)
+	if state.failures[connectionKey] then
+		state.failures[connectionKey].isBlocked = false
+		state.failures[connectionKey].count = 0
+		Log:Info("Manually unblocked connection %s", connectionKey)
+	end
+end
+
+return CircuitBreaker
+
+end)
+__bundle_register("NavBot.Bot.GoalFinder", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Goal Finder - Finds navigation goals based on current tasks
+Handles payload, CTF, health pack, and teammate following goals
+]]
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Navigation = require("NavBot.Navigation")
+
+local GoalFinder = {}
+local Log = Common.Log.new("GoalFinder")
+
+local function findPayloadGoal()
+	-- Cache payload entities for 90 ticks (1.5 seconds) to avoid expensive entity searches
+	local currentTick = globals.TickCount()
+	if not G.World.payloadCacheTime or (currentTick - G.World.payloadCacheTime) > 90 then
+		G.World.payloads = entities.FindByClass("CObjectCartDispenser")
+		G.World.payloadCacheTime = currentTick
+	end
+
+	local pLocal = G.pLocal.entity
+	local myTeam = pLocal:GetTeamNumber()
+	local ownCart = nil
+	local enemyCart = nil
+
+	-- First pass: find own cart and enemy cart
+	for _, entity in pairs(G.World.payloads or {}) do
+		if entity:IsValid() then
+			local cartTeam = entity:GetTeamNumber()
+			if cartTeam == myTeam then
+				ownCart = entity
+			else
+				enemyCart = entity
+			end
+		end
+	end
+
+	-- If we found our own cart, use it
+	if ownCart then
+		local pos = ownCart:GetAbsOrigin()
+		-- Offset down by 80 units to get ground-level position
+		pos = Vector3(pos.x, pos.y, pos.z - 80)
+		return Navigation.GetAreaAtPosition(pos), pos
+	end
+
+	-- If we're on defense (no own cart found) and enemy cart exists, defend enemy cart
+	if enemyCart then
+		local pos = enemyCart:GetAbsOrigin()
+		-- Offset down by 80 units to get ground-level position
+		pos = Vector3(pos.x, pos.y, pos.z - 80)
+		Log:Info("Own cart not found, defending enemy cart at position")
+		return Navigation.GetAreaAtPosition(pos), pos
+	end
+end
+
+local function findFlagGoal()
+	local pLocal = G.pLocal.entity
+	local myItem = pLocal:GetPropInt("m_hItem")
+
+	-- Cache flag entities for 90 ticks (1.5 seconds) to avoid expensive entity searches
+	local currentTick = globals.TickCount()
+	if not G.World.flagCacheTime or (currentTick - G.World.flagCacheTime) > 90 then
+		G.World.flags = entities.FindByClass("CCaptureFlag")
+		G.World.flagCacheTime = currentTick
+	end
+
+	-- Throttle debug logging to avoid spam (only log every 60 ticks)
+	if not G.lastFlagLogTick then
+		G.lastFlagLogTick = 0
+	end
+	local shouldLog = (currentTick - G.lastFlagLogTick) > 60
+
+	if shouldLog then
+		Log:Debug("CTF Flag Detection: myItem=%d, playerTeam=%d", myItem, pLocal:GetTeamNumber())
+		G.lastFlagLogTick = currentTick
+	end
+
+	local targetFlag = nil
+	local targetPos = nil
+
+	for _, entity in pairs(G.World.flags or {}) do
+		local flagTeam = entity:GetTeamNumber()
+		local myTeam = flagTeam == pLocal:GetTeamNumber()
+		local pos = entity:GetAbsOrigin()
+
+		if shouldLog then
+			Log:Debug("Flag found: team=%d, isMyTeam=%s, pos=%s", flagTeam, tostring(myTeam), tostring(pos))
+		end
+
+		-- If carrying enemy intel (myItem > 0), go to our team's capture point
+		-- If not carrying intel (myItem <= 0), go get the enemy intel
+		if (myItem > 0 and myTeam) or (myItem <= 0 and not myTeam) then
+			targetFlag = entity
+			targetPos = pos
+			if shouldLog then
+				Log:Info(
+					"CTF Goal: %s (carrying=%s)",
+					myItem > 0 and "Return to base" or "Get enemy intel",
+					tostring(myItem > 0)
+				)
+			end
+			break -- Take the first valid target
+		end
+	end
+
+	if targetFlag and targetPos then
+		return Navigation.GetAreaAtPosition(targetPos), targetPos
+	end
+
+	if shouldLog then
+		Log:Debug("No suitable flag target found - available flags: %d", #G.World.flags)
+	end
+	return nil
+end
+
+local function findHealthGoal()
+	local closestDist = math.huge
+	local closestNode = nil
+	local closestPos = nil
+	for _, pos in pairs(G.World.healthPacks) do
+		local healthNode = Navigation.GetAreaAtPosition(pos)
+		if healthNode then
+			local dist = (G.pLocal.Origin - pos):Length()
+			if dist < closestDist then
+				closestDist = dist
+				closestNode = healthNode
+				closestPos = pos
+			end
+		end
+	end
+	return closestNode, closestPos
+end
+
+-- Find and follow the closest teammate using FastPlayers (throttled to avoid lag)
+local function findFollowGoal()
+	local localWP = Common.FastPlayers.GetLocal()
+	if not localWP then
+		return nil
+	end
+	local origin = localWP:GetRawEntity():GetAbsOrigin()
+	local closestDist = math.huge
+	local closestNode = nil
+	local targetPos = nil
+	local foundTarget = false
+
+	-- Cache teammate search for 30 ticks (0.5 seconds) to reduce expensive player iteration
+	local currentTick = globals.TickCount()
+	if not G.World.teammatesCacheTime or (currentTick - G.World.teammatesCacheTime) > 30 then
+		G.World.cachedTeammates = Common.FastPlayers.GetTeammates(true)
+		G.World.teammatesCacheTime = currentTick
+	end
+
+	for _, wp in ipairs(G.World.cachedTeammates or {}) do
+		local ent = wp:GetRawEntity()
+		if ent and ent:IsValid() and ent:IsAlive() then
+			foundTarget = true
+			local pos = ent:GetAbsOrigin()
+			local dist = (pos - origin):Length()
+			if dist < closestDist then
+				closestDist = dist
+				-- Update our memory of where we last saw this target
+				G.Navigation.lastKnownTargetPosition = pos
+				closestNode = Navigation.GetAreaAtPosition(pos)
+				targetPos = pos
+			end
+		end
+	end
+
+	-- If no alive teammates found, but we have a last known position, use that
+	if not foundTarget and G.Navigation.lastKnownTargetPosition then
+		Log:Info("No alive teammates found, moving to last known position")
+		closestNode = Navigation.GetAreaAtPosition(G.Navigation.lastKnownTargetPosition)
+		targetPos = G.Navigation.lastKnownTargetPosition
+	end
+
+	-- If the target is very close (same node), add some distance to avoid pathfinding to self
+	if closestNode and closestDist < 150 then -- 150 units is quite close
+		local startNode = Navigation.GetClosestNode(origin)
+		if startNode and closestNode.id == startNode.id then
+			Log:Debug("Target too close (same node), expanding search radius")
+			-- Look for a node near the target but not the same as our current node
+			for _, node in pairs(G.Navigation.nodes or {}) do
+				if node.id ~= startNode.id then
+					local targetPos = G.Navigation.lastKnownTargetPosition or closestNode.pos
+					local nodeToTargetDist = (node.pos - targetPos):Length()
+					if nodeToTargetDist < 200 then -- Within 200 units of target
+						closestNode = node
+						break
+					end
+				end
+			end
+		end
+	end
+
+	return closestNode, targetPos
+end
+
+-- Main function to find goal node based on current task
+function GoalFinder.findGoal(currentTask)
+	-- Safety check: ensure nodes are loaded before proceeding
+	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
+		Log:Debug("No navigation nodes available, cannot find goal")
+		return nil
+	end
+
+	local mapName = engine.GetMapName():lower()
+
+	if currentTask == "Objective" then
+		if mapName:find("plr_") or mapName:find("pl_") then
+			return findPayloadGoal()
+		elseif mapName:find("ctf_") then
+			return findFlagGoal()
+		else
+			-- fallback to following the closest teammate
+			return findFollowGoal()
+		end
+	elseif currentTask == "Health" then
+		return findHealthGoal()
+	elseif currentTask == "Follow" then
+		return findFollowGoal()
+	else
+		Log:Debug("Unknown task: %s", currentTask)
+	end
+
+	-- Fallbacks when no goal was found by specific strategies
+	-- 1) Try following a teammate as a generic goal
+	local node, pos = findFollowGoal()
+	if node and pos then
+		return node, pos
+	end
+
+	-- 2) Roaming fallback: pick a reasonable nearby node to move towards
+	if G.Navigation.nodes and next(G.Navigation.nodes) then
+		local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
+		if startNode then
+			local bestNode = nil
+			local bestDist = math.huge
+			for _, candidate in pairs(G.Navigation.nodes) do
+				if candidate and candidate.id ~= startNode.id and candidate.pos then
+					local d = (candidate.pos - G.pLocal.Origin):Length()
+					-- Prefer nodes within 300..1200 units to avoid picking ourselves or too far targets
+					if d > 300 and d < 1200 and d < bestDist then
+						bestDist = d
+						bestNode = candidate
+					end
+				end
+			end
+			if not bestNode then
+				-- If none in preferred band, just pick the closest different node
+				for _, candidate in pairs(G.Navigation.nodes) do
+					if candidate and candidate.id ~= startNode.id and candidate.pos then
+						local d = (candidate.pos - G.pLocal.Origin):Length()
+						if d < bestDist then
+							bestDist = d
+							bestNode = candidate
+						end
+					end
+				end
+			end
+			if bestNode then
+				-- Throttle info log
+				local now = globals.TickCount()
+				G.lastRoamLogTick = G.lastRoamLogTick or 0
+				if now - G.lastRoamLogTick > 60 then
+					Log:Info("Using roaming fallback to node %d (dist=%.0f)", bestNode.id, bestDist)
+					G.lastRoamLogTick = now
+				end
+				return bestNode, bestNode.pos
+			end
+		end
+	end
+
+	-- Nothing found
+	return nil
+end
+
+return GoalFinder
+
+end)
+__bundle_register("NavBot.Navigation", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+PERFORMANCE OPTIMIZATION STRATEGY:
+- Heavy validation (accessibility checks) happens at setup time via pruneInvalidConnections()
+- A* uses Node.GetAdjacentAreasForPath() — area-to-area only (doors resolve to neighbor areas)
+- Precise walkability uses NavPredict.CanSkip (straight line + door portals + hull traces)
+- Invalid connections are pruned at setup; line checks run at movement time
+]]
+
+local Navigation = {}
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Node = require("NavBot.Navigation.Node")
+local AStar = require("NavBot.Algorithms.A-Star")
+local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
+local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local Lib = Common.Lib
+local Log = Lib.Utils.Logger.new("NavBot")
+Log.Level = 0
+
+-- Constants
+local STEP_HEIGHT = 18
+local UP_VECTOR = Vector3(0, 0, 1)
+local DROP_HEIGHT = 144 -- Define your constants outside the function
+local HULL_MIN = G.pLocal.vHitbox.Min
+local HULL_MAX = G.pLocal.vHitbox.Max
+local TRACE_MASK = MASK_PLAYERSOLID
+local TICK_RATE = 66
+local GROUND_TRACE_OFFSET_START = Vector3(0, 0, 5)
+local GROUND_TRACE_OFFSET_END = Vector3(0, 0, -67)
+local MAX_SLOPE_ANGLE = 55 -- Maximum angle (in degrees) that is climbable
+
+-- Add a connection between two nodes
+function Navigation.AddConnection(nodeA, nodeB)
+	if not nodeA or not nodeB then
+		Log:Warn("AddConnection: One or both nodes are nil")
+		return
+	end
+	Node.AddConnection(nodeA, nodeB)
+	Node.AddConnection(nodeB, nodeA)
+	G.Navigation.navMeshUpdated = true
+end
+
+-- Remove a connection between two nodes
+function Navigation.RemoveConnection(nodeA, nodeB)
+	if not nodeA or not nodeB then
+		Log:Warn("RemoveConnection: One or both nodes are nil")
+		return
+	end
+	Node.RemoveConnection(nodeA, nodeB)
+	Node.RemoveConnection(nodeB, nodeA)
+	G.Navigation.navMeshUpdated = true
+end
+
+-- Add cost to a connection between two nodes
+function Navigation.AddCostToConnection(nodeA, nodeB, cost)
+	if not nodeA or not nodeB then
+		Log:Warn("AddCostToConnection: One or both nodes are nil")
+		return
+	end
+
+	-- Use Node module's implementation to avoid duplication
+	Node.AddCostToConnection(nodeA, nodeB, cost)
+end
+
+-- ========================================================================
+-- SETUP & INITIALIZATION
+-- ========================================================================
+
+function Navigation.Setup()
+	if engine.GetMapName() then
+		Node.Setup()
+		Navigation.ClearPath()
+	end
+end
+
+-- ========================================================================
+-- NODE QUERIES
+-- ========================================================================
+
+-- Get a node by ID
+---@param nodeId integer
+---@return table|nil
+function Navigation.GetNode(nodeId)
+	if not nodeId then
+		Log:Warn("GetNode: nodeId is nil")
+		return nil
+	end
+
+	return Node.GetNodeByID(nodeId)
+end
+
+-- Get adjacent nodes for a given node ID (areas only, no doors)
+---@param nodeId integer
+---@return integer[]
+function Navigation.GetAdjacentNodes(nodeId)
+	if not nodeId then
+		Log:Warn("GetAdjacentNodes: nodeId is nil")
+		return {}
+	end
+
+	local node = Node.GetNodeByID(nodeId)
+	if not node then
+		Log:Warn("GetAdjacentNodes: node %d not found", nodeId)
+		return {}
+	end
+
+	local neighbors = Node.GetAdjacentAreasForPath(node, G.Navigation.nodes)
+
+	-- Extract node IDs
+	local adjacentIds = {}
+	for _, neighbor in ipairs(neighbors) do
+		if neighbor.node and neighbor.node.id then
+			table.insert(adjacentIds, neighbor.node.id)
+		end
+	end
+
+	return adjacentIds
+end
+
+-- ========================================================================
+-- PATH QUERIES
+-- ========================================================================
+
+-- Get the current path
+---@return Node[]|nil
+function Navigation.GetCurrentPath()
+	return G.Navigation.path
+end
+
+-- ========================================================================
+-- PATH MANAGEMENT
+-- ========================================================================
+
+-- Clear the current path
+function Navigation.ClearPath()
+	G.Navigation.path = {}
+	G.Navigation.currentNodeIndex = 1
+	-- Also clear door/center/goal waypoints to avoid stale movement/visuals
+	G.Navigation.waypoints = {}
+	G.Navigation.currentWaypointIndex = 1
+	-- Clear path traversal history used by stuck analysis
+	G.Navigation.pathHistory = {}
+	G.Navigation.apexPath = nil
+	G.Navigation.apexIndex = 1
+	G.Navigation.slowSpeedTicks = 0
+	NodeSkipper.Reset()
+end
+
+function Navigation.RebuildApexPath()
+	local path = G.Navigation.path
+	if not path or #path == 0 then
+		G.Navigation.apexPath = nil
+		G.Navigation.apexIndex = 1
+		return
+	end
+	local startPos = G.pLocal and G.pLocal.Origin or nil
+	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(path, G.Navigation.goalPos, startPos)
+	G.Navigation.apexIndex = 1
+end
+
+-- Set the current path
+---@param path Node[]
+function Navigation.SetCurrentPath(path)
+	if not path then
+		Log:Error("Failed to set path, it's nil")
+		return
+	end
+	G.Navigation.path = path
+	-- Use weak values to avoid strong retention of node objects (nodes table holds strong refs)
+	pcall(setmetatable, G.Navigation.path, { __mode = "v" })
+	G.Navigation.currentNodeIndex = 1 -- Start from the first node (start) and work towards goal
+	-- Build area-center waypoints (door threading via NavPredict at runtime)
+	--ProfilerBegin and ProfilerEnd are not available here, so rely on caller's profiling
+	Navigation.BuildDoorWaypointsFromPath()
+	Navigation.RebuildApexPath()
+	G.Navigation.pathHistory = {}
+	NodeSkipper.Reset()
+end
+
+-- Remove the current node from the path (we've reached it)
+function Navigation.RemoveCurrentNode()
+	G.Navigation.currentNodeTicks = 0
+	if G.Navigation.path and #G.Navigation.path > 0 then
+		-- Remove the first node (current node we just reached)
+		local reached = table.remove(G.Navigation.path, 1)
+		-- Track reached nodes from last to first
+		if reached then
+			G.Navigation.pathHistory = G.Navigation.pathHistory or {}
+			table.insert(G.Navigation.pathHistory, 1, reached)
+			-- Bound history size
+			if #G.Navigation.pathHistory > 32 then
+				table.remove(G.Navigation.pathHistory)
+			end
+		end
+		-- currentNodeIndex stays at 1 since we always target the first node in the remaining path
+		G.Navigation.currentNodeIndex = 1
+		-- Rebuild waypoints to reflect new leading edge
+		Navigation.BuildDoorWaypointsFromPath()
+		Navigation.RebuildApexPath()
+	end
+end
+function Navigation.ResetTickTimer()
+	G.Navigation.currentNodeTicks = 0
+end
+
+function Navigation.ResetNodeSkipping()
+	NodeSkipper.Reset()
+end
+
+-- ========================================================================
+-- NODE VALIDATION & CHECKS
+-- ========================================================================
+
+-- Check if next node is walkable from current position
+function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
+	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
+		Log:Debug(
+			"CheckNextNodeWalkable: Invalid node data - currentNode=%s, nextNode=%s",
+			tostring(currentNode and currentNode.id),
+			tostring(nextNode and nextNode.id)
+		)
+		return false
+	end
+
+	-- Straight-line walk check via NavPredict.CanSkip
+	local currentArea = Node.GetAreaAtPosition(currentPos)
+	if not currentArea then
+		Log:Debug("CheckNextNodeWalkable: Could not find current area")
+		return false
+	end
+
+	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+	local success, canWalk = pcall(NavPredict.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
+
+	if success and canWalk then
+		Log:Debug("Next node %d is walkable from current position", nextNode.id)
+		return true
+	else
+		Log:Debug("Next node %d is not walkable from current position", nextNode.id)
+		return false
+	end
+end
+
+-- Check if next node is closer than current node
+function Navigation.CheckNextNodeCloser(currentPos, currentNode, nextNode)
+	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
+		Log:Debug(
+			"CheckNextNodeCloser: Invalid node data - currentNode=%s, nextNode=%s",
+			tostring(currentNode and currentNode.id),
+			tostring(nextNode and nextNode.id)
+		)
+		return false
+	end
+
+	local distanceToCurrent = Common.Distance2D(currentPos, currentNode.pos)
+	local distanceToNext = Common.Distance2D(currentPos, nextNode.pos)
+
+	if distanceToNext < distanceToCurrent then
+		Log:Debug("Next node %d is closer (%.2f < %.2f)", nextNode.id, distanceToNext, distanceToCurrent)
+		return true
+	else
+		Log:Debug(
+			"Current node %d is closer or equal (%.2f >= %.2f)",
+			currentNode.id,
+			distanceToCurrent,
+			distanceToNext
+		)
+		return false
+	end
+end
+
+-- ========================================================================
+-- WAYPOINT BUILDING
+-- ========================================================================
+
+-- Goal-only waypoint list; movement uses PathSteering portal string-pull on G.Navigation.path
+function Navigation.BuildDoorWaypointsFromPath()
+	if not G.Navigation.waypoints then
+		G.Navigation.waypoints = {}
+	else
+		for i = #G.Navigation.waypoints, 1, -1 do
+			G.Navigation.waypoints[i] = nil
+		end
+	end
+	G.Navigation.currentWaypointIndex = 1
+
+	local goalPos = G.Navigation.goalPos
+	if goalPos then
+		table.insert(G.Navigation.waypoints, { pos = goalPos, kind = "goal" })
+	end
+end
+
+function Navigation.GetCurrentWaypoint()
+	local wpList = G.Navigation.waypoints
+	local idx = G.Navigation.currentWaypointIndex or 1
+	if wpList and idx and wpList[idx] then
+		return wpList[idx]
+	end
+	return nil
+end
+
+function Navigation.AdvanceWaypoint()
+	local wpList = G.Navigation.waypoints
+	local idx = G.Navigation.currentWaypointIndex or 1
+	if not (wpList and wpList[idx]) then
+		return
+	end
+	local current = wpList[idx]
+
+	-- FIXED: Reset timer when reaching ANY waypoint on path, not just center
+	-- This ensures node skipping timer resets when reaching any point on the path
+	if G.Navigation.path and #G.Navigation.path > 0 then
+		-- Reset the node timer when we reach any waypoint
+		Navigation.ResetTickTimer()
+		-- Reset node skipping cooldowns when reaching waypoints
+		-- SCRAPPED: Don't reset cooldowns on waypoint reach - let agent-based system run on its own schedule
+		-- local NodeSkipper = require("NavBot.Bot.NodeSkipper")
+		-- NodeSkipper.ResetWalkabilityCooldown()
+		-- If we reached a center of the next area, advance the area path too
+		-- if current.kind == "center" then
+		-- 	-- path[1] is previous area; popping it moves us into the new area
+		-- 	Navigation.RemoveCurrentNode()
+		-- end
+	end
+
+	G.Navigation.currentWaypointIndex = idx + 1
+end
+
+function Navigation.SkipWaypoints(count)
+	local wpList = G.Navigation.waypoints
+	if not wpList then
+		return
+	end
+	local idx = (G.Navigation.currentWaypointIndex or 1) + (count or 1)
+	if idx < 1 then
+		idx = 1
+	end
+	if idx > #wpList + 1 then
+		idx = #wpList + 1
+	end
+
+	-- FIXED: Reset timer when skipping ANY waypoints on path
+	-- This ensures node skipping timer resets when skipping any points on the path
+	if G.Navigation.path and #G.Navigation.path > 0 then
+		-- Reset the node timer when we skip waypoints
+		Navigation.ResetTickTimer()
+		-- If we skip over a center, reflect area progression
+		local current = G.Navigation.waypoints[G.Navigation.currentWaypointIndex or 1]
+		if current and current.kind ~= "center" then
+			for j = (G.Navigation.currentWaypointIndex or 1), math.min(idx - 1, #wpList) do
+				if wpList[j].kind == "center" and G.Navigation.path and #G.Navigation.path > 0 then
+					Navigation.RemoveCurrentNode()
+				end
+			end
+		end
+	end
+
+	G.Navigation.currentWaypointIndex = idx
+end
+
+-- Function to convert degrees to radians
+local function degreesToRadians(degrees)
+	return degrees * math.pi / 180
+end
+
+-- Checks for an obstruction between two points using a hull trace.
+local function isPathClear(startPos, endPos)
+	local traceResult = engine.TraceHull(startPos, endPos, HULL_MIN, HULL_MAX, MASK_PLAYERSOLID_BRUSHONLY)
+	return traceResult
+end
+
+-- Checks if the ground is stable at a given position.
+local function isGroundStable(position)
+	local groundTraceResult = engine.TraceLine(
+		position + GROUND_TRACE_OFFSET_START,
+		position + GROUND_TRACE_OFFSET_END,
+		MASK_PLAYERSOLID_BRUSHONLY
+	)
+	return groundTraceResult.fraction < 1
+end
+
+-- Function to get the ground normal at a given position
+local function getGroundNormal(position)
+	local groundTraceResult = engine.TraceLine(
+		position + GROUND_TRACE_OFFSET_START,
+		position + GROUND_TRACE_OFFSET_END,
+		MASK_PLAYERSOLID_BRUSHONLY
+	)
+	return groundTraceResult.plane
+end
+
+-- Precomputed up vector and max slope angle in radians
+local MAX_SLOPE_ANGLE_RAD = degreesToRadians(MAX_SLOPE_ANGLE)
+
+-- Function to get forward speed by class
+function Navigation.GetMaxSpeed(entity)
+	return entity:GetPropFloat("m_flMaxspeed")
+end
+
+-- Function to compute the move direction
+local function ComputeMove(pCmd, a, b)
+	local diff = b - a
+	if diff:Length() == 0 then
+		return Vector3(0, 0, 0)
+	end
+
+	local x = diff.x
+	local y = diff.y
+	local vSilent = Vector3(x, y, 0)
+
+	local ang = vSilent:Angles()
+	local cYaw = pCmd:GetViewAngles().yaw
+	local yaw = math.rad(ang.y - cYaw)
+	local move = Vector3(math.cos(yaw), -math.sin(yaw), 0)
+
+	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity) + 1
+	return move * maxSpeed
+end
+
+-- Function to implement fast stop
+local function FastStop(pCmd, pLocal)
+	local velocity = pLocal:GetVelocity()
+	velocity.z = 0
+	local speed = velocity:Length2D()
+
+	if speed < 1 then
+		pCmd:SetForwardMove(0)
+		pCmd:SetSideMove(0)
+		return
+	end
+
+	local accel = 5.5
+	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity)
+	local playerSurfaceFriction = 1.0
+	local max_accelspeed = accel * (1 / TICK_RATE) * maxSpeed * playerSurfaceFriction
+
+	local wishspeed
+	if speed - max_accelspeed <= -1 then
+		wishspeed = max_accelspeed / (speed / (accel * (1 / TICK_RATE)))
+	else
+		wishspeed = max_accelspeed
+	end
+
+	local ndir = (velocity * -1):Angles()
+	ndir.y = pCmd:GetViewAngles().y - ndir.y
+	ndir = ndir:ToVector()
+
+	pCmd:SetForwardMove(ndir.x * wishspeed)
+	pCmd:SetSideMove(ndir.y * wishspeed)
+end
+
+---@param pos Vector3|{ x:number, y:number, z:number }
+---@return Node|nil
+function Navigation.GetClosestNode(pos)
+	-- Safety check: ensure nodes are available
+	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
+		Log:Debug("No navigation nodes available for GetClosestNode")
+		return nil
+	end
+	local n = Node.GetClosestNode(pos)
+	if not n then
+		return nil
+	end
+	return n
+end
+
+-- Get area at position using multi-point distance check (more precise than GetClosestNode)
+---@param pos Vector3|{ x:number, y:number, z:number }
+---@return Node|nil
+function Navigation.GetAreaAtPosition(pos)
+	-- Safety check: ensure nodes are available
+	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
+		Log:Debug("No navigation nodes available for GetAreaAtPosition")
+		return nil
+	end
+	local n = Node.GetAreaAtPosition(pos)
+	if not n then
+		return nil
+	end
+	return n
+end
+
+-- Main pathfinding function - FIXED TO USE DUAL A* SYSTEM
+---@param startNode Node
+---@param goalNode Node
+function Navigation.FindPath(startNode, goalNode)
+	if not startNode or not startNode.pos then
+		Log:Error("Navigation.FindPath: invalid start node")
+		return Navigation
+	end
+	if not goalNode or not goalNode.pos then
+		Log:Error("Navigation.FindPath: invalid goal node")
+		return Navigation
+	end
+
+	local horizontalDistance = math.abs(goalNode.pos.x - startNode.pos.x) + math.abs(goalNode.pos.y - startNode.pos.y)
+	local verticalDistance = math.abs(goalNode.pos.z - startNode.pos.z)
+
+	-- Try A* pathfinding as primary algorithm (more reliable than D*)
+	local success, path = pcall(AStar.NormalPath, startNode, goalNode, G.Navigation.nodes, Node.GetAdjacentAreasForPath)
+
+	if not success then
+		Log:Error("A* pathfinding crashed: %s", tostring(path))
+		G.Navigation.path = nil
+		Navigation.pathFailed = true
+		Navigation.pathFound = false
+
+		-- Add circuit breaker penalty for this failed connection
+		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
+			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
+		end
+		return Navigation
+	end
+
+	G.Navigation.path = path
+
+	if not G.Navigation.path or #G.Navigation.path == 0 then
+		Log:Error("Failed to find path from %d to %d!", startNode.id, goalNode.id)
+		G.Navigation.path = nil
+		Navigation.pathFailed = true
+		Navigation.pathFound = false
+
+		-- Add circuit breaker penalty for this failed connection
+		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
+			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
+		end
+	else
+		Log:Info("Path found from %d to %d with %d nodes", startNode.id, goalNode.id, #G.Navigation.path)
+		Navigation.pathFound = true
+		Navigation.pathFailed = false
+		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
+		-- Reset node skipping agents for new path
+		G.Navigation.skipAgents = nil
+		Navigation.BuildDoorWaypointsFromPath()
+		Navigation.RebuildApexPath()
+		-- REMOVED: All path optimization now handled by NodeSkipper.CheckContinuousSkip
+		-- Reset traversed-node history for new path
+		G.Navigation.pathHistory = {}
+	end
+
+	return Navigation
+end
+
+return Navigation
+
+end)
+__bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+Node Skipper — runs every tick; skip current node when NavPredict.CanSkip passes (no doors-only).
+Door portals are reserved for PathStringPull at path-build time.
+]]
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
+local PathSteering = require("NavBot.Navigation.PathSteering")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
+
+local Log = Common.Log.new("NodeSkipper")
+
+local NodeSkipper = {}
+
+local lastBlockedLogKey = nil
+local lastBlockedLogTick = 0
+local BLOCKED_LOG_INTERVAL = 66
+
+local function lockIntentAfterSkip(playerPos)
+	local path = G.Navigation.path
+	if path and path[1] then
+		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
+	end
+end
+
+local function rebuildApexPath(playerPos)
+	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(G.Navigation.path, G.Navigation.goalPos, playerPos)
+	G.Navigation.apexIndex = 1
+end
+
+local function logSkipBlocked(currentNode, nextNode, reason)
+	local key = tostring(currentNode.id) .. "->" .. tostring(nextNode.id) .. ":" .. reason
+	local now = globals.TickCount()
+	if key == lastBlockedLogKey and (now - lastBlockedLogTick) < BLOCKED_LOG_INTERVAL then
+		return
+	end
+	lastBlockedLogKey = key
+	lastBlockedLogTick = now
+	Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
+end
+
+local function canSkipSegment(playerPos, goalPos, fromAreaNode, allowJump)
+	if not fromAreaNode then
+		return false
+	end
+	-- doorsOnly=false for skipping; doors-only mode is for string-pull apex build
+	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, false, allowJump)
+	return success and canSkip == true
+end
+
+local function trySkipCurrentNode(playerPos, currentNode, nextNode)
+	local goalPos = nextNode.pos
+	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+
+	if not canSkipSegment(playerPos, goalPos, currentNode, allowJump) then
+		logSkipBlocked(currentNode, nextNode, "not_walkable")
+		return false
+	end
+
+	local missedNode = table.remove(G.Navigation.path, 1)
+	G.Navigation.pathHistory = G.Navigation.pathHistory or {}
+	table.insert(G.Navigation.pathHistory, 1, missedNode)
+	while #G.Navigation.pathHistory > 32 do
+		table.remove(G.Navigation.pathHistory)
+	end
+
+	G.Navigation.lastSkipTick = globals.TickCount()
+	G.Navigation.currentNodeIndex = 1
+	rebuildApexPath(playerPos)
+	Log:Info("Skipped node %s, targeting %s", tostring(missedNode.id), tostring(nextNode.id))
+	return true
+end
+
+function NodeSkipper.Reset()
+	G.Navigation.nodePassTrack = nil
+	lastBlockedLogKey = nil
+	lastBlockedLogTick = 0
+end
+
+function NodeSkipper.Tick(playerPos)
+	assert(playerPos, "Tick: playerPos missing")
+
+	if not G.Menu.Navigation.Skip_Nodes then
+		return false
+	end
+
+	local path = G.Navigation.path
+	if not path or #path < 2 then
+		return false
+	end
+
+	local currentNode = path[1]
+	local nextNode = path[2]
+	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
+		return false
+	end
+
+	if trySkipCurrentNode(playerPos, currentNode, nextNode) then
+		lockIntentAfterSkip(playerPos)
+		return true
+	end
+
+	return false
+end
+
+return NodeSkipper
+
+end)
+__bundle_register("NavBot.Navigation.PathSteering", function(require, _LOADED, __bundle_register, __bundle_modules)
+--##########################################################################
+--  PathSteering.lua  ·  Pass detection + intent (movement via PathStringPull)
+--##########################################################################
+
+local Common = require("NavBot.Core.Common")
+local G = require("NavBot.Core.Globals")
+local Node = require("NavBot.Navigation.Node")
+local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
+local PathStringPull = require("NavBot.Navigation.PathStringPull")
+
+local PathSteering = {}
+
+local function getPassDirDotThreshold()
+	return G.Misc.NodePassDirDotThreshold or 0.5
+end
+
+local function getTouchDistance()
+	return G.Misc.NodeTouchDistance or 16
+end
+
+local function getOvershootTouchDistance()
+	return G.Misc.NodeOvershootTouchDistance or 48
+end
+
+local function horizontalDir(from, to)
+	local dx = to.x - from.x
+	local dy = to.y - from.y
+	local len = math.sqrt(dx * dx + dy * dy)
+	if len < 0.001 then
+		return nil, 0
+	end
+	return Vector3(dx / len, dy / len, 0), len
+end
+
+local function horizontalUnit(vec)
+	if not vec then
+		return nil
+	end
+	local flat = Vector3(vec.x, vec.y, 0)
+	local len = flat:Length2D()
+	if len < 0.001 then
+		return nil
+	end
+	return flat / len
+end
+
+local function isInsideNodeAABB(pos, node)
+	if Node.IsDoorNode(node) then
+		return false
+	end
+	return AreaSpatial.IsWithinArea(pos, node)
+end
+
+function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
+	if not (targetNode and targetNode.pos) then
+		G.Navigation.nodePassTrack = nil
+		return
+	end
+
+	local steer = PathStringPull.GetMovementTarget(playerPos)
+	local dir = horizontalDir(playerPos, steer or targetNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	G.Navigation.nodePassTrack = {
+		nodeId = targetNode.id,
+		dirToTarget = dir,
+	}
+end
+
+local function ensureSegmentIntent(playerPos, currentNode, nextNode)
+	local track = G.Navigation.nodePassTrack
+	if track and track.nodeId == currentNode.id and track.dirToTarget then
+		return track
+	end
+
+	local steer = PathStringPull.GetMovementTarget(playerPos)
+	local dir = horizontalDir(playerPos, steer or currentNode.pos)
+	if not dir then
+		dir = horizontalUnit(G.BotIntendedWishDir)
+	end
+
+	track = {
+		nodeId = currentNode.id,
+		dirToTarget = dir,
+	}
+	G.Navigation.nodePassTrack = track
+	return track
+end
+
+function PathSteering.getMovementTarget(playerPos, _path, _goalPos)
+	return PathStringPull.GetMovementTarget(playerPos)
+end
+
+function PathSteering.getReachDistance2D(_currentNode, _nextNode)
+	return getTouchDistance()
+end
+
+function PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
+	return PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
+end
+
+return PathSteering
+
+end)
+__bundle_register("NavBot.Algorithms.A-Star", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- A* Pathfinding Algorithm Implementation
+-- Uses a priority queue (heap) for efficient node exploration
+-- Area-only graph; door precision handled by NavPredict at movement time
+
+local Heap = require("NavBot.Algorithms.Heap")
+local Common = require("NavBot.Core.Common")
+local Log = Common.Log.new("AStar")
+
+-- Memory Pooling System for GC Optimization
+local tablePool = {}
+local poolSize = 0
+local maxPoolSize = 1000
+
+local function getPooledTable()
+	local t = table.remove(tablePool)
+	if t then
+		poolSize = poolSize - 1
+		return t
+	end
+	return {}
+end
+
+local function releaseTable(t)
+	if not t then
+		return
+	end
+
+	-- Clear the table
+	for k in pairs(t) do
+		t[k] = nil
+	end
+
+	-- Add to pool if not full
+	if poolSize < maxPoolSize then
+		table.insert(tablePool, t)
+		poolSize = poolSize + 1
+	end
+end
+
+-- Batch release for efficiency
+local function releaseTables(...)
+	for i = 1, select("#", ...) do
+		releaseTable(select(i, ...))
+	end
+end
+
+-- Type definitions for A* pathfinding
+
+---@class Vector3
+local function heuristicCost(nodeA, nodeB)
+	-- Euclidean distance heuristic
+	local dx = nodeA.pos.x - nodeB.pos.x
+	local dy = nodeA.pos.y - nodeB.pos.y
+	local dz = nodeA.pos.z - nodeB.pos.z
+	local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+	return dist
+end
+
+----------------------------------------------------------------
+-- Path Reconstruction (O(n) instead of O(n²))
+----------------------------------------------------------------
+---@param cameFrom table<Node, {node:Node}>
+---@param startNode Node
+---@param goalNode Node
+---@return Node[]|nil
+local function reconstructPath(cameFrom, startNode, goalNode)
+	local path = {}
+	local current = goalNode
+
+	-- Build reversed path (sequential memory writes)
+	while current and current ~= startNode do
+		path[#path + 1] = current
+		local cf = cameFrom[current]
+		if cf and cf.node then
+			current = cf.node
+		else
+			Log:Error("A* reconstructPath failed: missing cameFrom for node " .. (current.id or "unknown"))
+			return nil
+		end
+	end
+
+	if not current or current ~= startNode then
+		return nil
+	end
+
+	path[#path + 1] = startNode
+
+	-- Reverse in place (O(n) total)
+	local i, j = 1, #path
+	while i < j do
+		path[i], path[j] = path[j], path[i]
+		i = i + 1
+		j = j - 1
+	end
+
+	return path
+end
+
+-- No post-smoothing: shortcuts are validated at runtime by NavPredict.CanSkip (NodeSkipper)
+
+-- A* Module Table
+local AStar = {}
+
+---Find the shortest path between two nodes using A* algorithm
+---@param startNode Node Starting node
+---@param goalNode Node Target node
+---@param nodes table<integer, Node> Lookup table of all nodes by ID
+---@param adjacentFun fun(node: Node, nodes: table): NeighborDataArray Function to get adjacent nodes
+---@return Node[]|nil path Array of nodes representing the path, or nil if no path exists
+function AStar.NormalPath(startNode, goalNode, nodes, adjacentFun)
+	if not (startNode and goalNode and startNode.id and goalNode.id) then
+		return nil
+	end
+
+	local openSet = Heap.new(function(a, b)
+		return a.fScore < b.fScore
+	end)
+
+	local openSetLookup = getPooledTable()
+	local closedSet = getPooledTable()
+	local gScore = getPooledTable()
+	local fScore = getPooledTable()
+	local cameFrom = getPooledTable()
+
+	gScore[startNode] = 0
+	fScore[startNode] = heuristicCost(startNode, goalNode)
+
+	openSet:push({ node = startNode, fScore = fScore[startNode] })
+	openSetLookup[startNode] = true
+
+	while not openSet:empty() do
+		local currentEntry = openSet:pop()
+		local current = currentEntry.node
+		openSetLookup[current] = nil
+
+		if closedSet[current] then
+			goto continue
+		end
+
+		if current == goalNode then
+			local path = reconstructPath(cameFrom, startNode, current)
+			releaseTables(openSetLookup, closedSet, gScore, fScore, cameFrom)
+			return path
+		end
+
+		closedSet[current] = true
+
+		-- Direct call, no pcall overhead
+		local neighbors = adjacentFun(current, nodes)
+		for i = 1, #neighbors do
+			local neighborData = neighbors[i]
+			local nextNode = neighborData.node
+			if closedSet[nextNode] then
+				goto continueNeighbor
+			end
+
+			local connectionCost = neighborData.cost or (current.pos - nextNode.pos):Length()
+
+			local tentativeG = gScore[current] + connectionCost
+			if not gScore[nextNode] or tentativeG < gScore[nextNode] then
+				cameFrom[nextNode] = { node = current }
+				gScore[nextNode] = tentativeG
+				fScore[nextNode] = tentativeG + heuristicCost(nextNode, goalNode)
+
+				if not openSetLookup[nextNode] then
+					openSet:push({ node = nextNode, fScore = fScore[nextNode] })
+					openSetLookup[nextNode] = true
+				else
+					-- Duplicate push instead of decrease-key hack
+					openSet:push({ node = nextNode, fScore = fScore[nextNode] })
+				end
+			end
+
+			::continueNeighbor::
+		end
+
+		::continue::
+	end
+
+	releaseTables(openSetLookup, closedSet, gScore, fScore, cameFrom)
+	return nil
+end
+
+return AStar
+
+end)
+__bundle_register("NavBot.Algorithms.Heap", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+    Enhanced Heap implementation in Lua.
+    Modifications made for robustness and preventing memory leaks.
+    Credits: github.com/GlorifiedPig/Luafinding
+]]
+
+local Heap = {}
+Heap.__index = Heap
+
+-- Constructor for the heap.
+-- @param compare? Function for comparison, defining the heap property. Defaults to a min-heap.
+function Heap.new(compare)
+	return setmetatable({
+		_data = {},
+		_size = 0,
+		Compare = compare or function(a, b)
+			return a < b
+		end,
+	}, Heap)
+end
+
+-- Helper function to maintain the heap property while inserting an element.
+local function sortUp(heap, index)
+	while index > 1 do
+		local parentIndex = math.floor(index / 2)
+		if heap.Compare(heap._data[index], heap._data[parentIndex]) then
+			heap._data[index], heap._data[parentIndex] = heap._data[parentIndex], heap._data[index]
+			index = parentIndex
+		else
+			break
+		end
+	end
+end
+
+-- Helper function to maintain the heap property after removing the root element.
+local function sortDown(heap, index)
+	while true do
+		local leftIndex, rightIndex = 2 * index, 2 * index + 1
+		local smallest = index
+
+		if leftIndex <= heap._size and heap.Compare(heap._data[leftIndex], heap._data[smallest]) then
+			smallest = leftIndex
+		end
+		if rightIndex <= heap._size and heap.Compare(heap._data[rightIndex], heap._data[smallest]) then
+			smallest = rightIndex
+		end
+
+		if smallest ~= index then
+			heap._data[index], heap._data[smallest] = heap._data[smallest], heap._data[index]
+			index = smallest
+		else
+			break
+		end
+	end
+end
+
+-- Checks if the heap is empty.
+function Heap:empty()
+	return self._size == 0
+end
+
+-- Clears the heap, allowing Lua's garbage collector to reclaim memory.
+function Heap:clear()
+	for i = 1, self._size do
+		self._data[i] = nil
+	end
+	self._size = 0
+end
+
+-- Adds an item to the heap.
+-- @param item The item to be added.
+function Heap:push(item)
+	self._size = self._size + 1
+	self._data[self._size] = item
+	sortUp(self, self._size)
+end
+
+-- Returns the root element of the heap without removing it.
+function Heap:peek()
+	if self._size == 0 then
+		return nil
+	end
+	return self._data[1]
+end
+
+-- Removes and returns the root element of the heap.
+function Heap:pop()
+	if self._size == 0 then
+		return nil
+	end
+	local root = self._data[1]
+	self._data[1] = self._data[self._size]
+	self._data[self._size] = nil -- Clear the reference to the removed item
+	self._size = self._size - 1
+	if self._size > 0 then
+		sortDown(self, 1)
+	end
+	return root
+end
+
+return Heap
 
 end)
 __bundle_register("NavBot.WorkManager", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -9183,1947 +11090,6 @@ function GroundMovement.isOnGround(player)
 end
 
 return GroundMovement
-
-end)
-__bundle_register("NavBot.Navigation.PathSteering", function(require, _LOADED, __bundle_register, __bundle_modules)
---##########################################################################
---  PathSteering.lua  ·  Pass detection + intent (movement via PathStringPull)
---##########################################################################
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local Node = require("NavBot.Navigation.Node")
-local AreaSpatial = require("NavBot.Navigation.AreaSpatial")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
-
-local PathSteering = {}
-
-local function getPassDirDotThreshold()
-	return G.Misc.NodePassDirDotThreshold or 0.5
-end
-
-local function getTouchDistance()
-	return G.Misc.NodeTouchDistance or 16
-end
-
-local function getOvershootTouchDistance()
-	return G.Misc.NodeOvershootTouchDistance or 48
-end
-
-local function horizontalDir(from, to)
-	local dx = to.x - from.x
-	local dy = to.y - from.y
-	local len = math.sqrt(dx * dx + dy * dy)
-	if len < 0.001 then
-		return nil, 0
-	end
-	return Vector3(dx / len, dy / len, 0), len
-end
-
-local function horizontalUnit(vec)
-	if not vec then
-		return nil
-	end
-	local flat = Vector3(vec.x, vec.y, 0)
-	local len = flat:Length2D()
-	if len < 0.001 then
-		return nil
-	end
-	return flat / len
-end
-
-local function isInsideNodeAABB(pos, node)
-	if Node.IsDoorNode(node) then
-		return false
-	end
-	return AreaSpatial.IsWithinArea(pos, node)
-end
-
-function PathSteering.lockIntentTowardNode(playerPos, targetNode, nodeAfter)
-	if not (targetNode and targetNode.pos) then
-		G.Navigation.nodePassTrack = nil
-		return
-	end
-
-	local steer = PathStringPull.GetMovementTarget(playerPos)
-	local dir = horizontalDir(playerPos, steer or targetNode.pos)
-	if not dir then
-		dir = horizontalUnit(G.BotIntendedWishDir)
-	end
-
-	G.Navigation.nodePassTrack = {
-		nodeId = targetNode.id,
-		dirToTarget = dir,
-	}
-end
-
-local function ensureSegmentIntent(playerPos, currentNode, nextNode)
-	local track = G.Navigation.nodePassTrack
-	if track and track.nodeId == currentNode.id and track.dirToTarget then
-		return track
-	end
-
-	local steer = PathStringPull.GetMovementTarget(playerPos)
-	local dir = horizontalDir(playerPos, steer or currentNode.pos)
-	if not dir then
-		dir = horizontalUnit(G.BotIntendedWishDir)
-	end
-
-	track = {
-		nodeId = currentNode.id,
-		dirToTarget = dir,
-	}
-	G.Navigation.nodePassTrack = track
-	return track
-end
-
-function PathSteering.getMovementTarget(playerPos, _path, _goalPos)
-	return PathStringPull.GetMovementTarget(playerPos)
-end
-
-function PathSteering.getReachDistance2D(_currentNode, _nextNode)
-	return getTouchDistance()
-end
-
-function PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
-	return PathStringPull.HasPassedSegment(playerPos, currentNode, nextNode)
-end
-
-return PathSteering
-
-end)
-__bundle_register("NavBot.Navigation", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-PERFORMANCE OPTIMIZATION STRATEGY:
-- Heavy validation (accessibility checks) happens at setup time via pruneInvalidConnections()
-- A* uses Node.GetAdjacentAreasForPath() — area-to-area only (doors resolve to neighbor areas)
-- Precise walkability uses NavPredict.CanSkip (straight line + door portals + hull traces)
-- Invalid connections are pruned at setup; line checks run at movement time
-]]
-
-local Navigation = {}
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local Node = require("NavBot.Navigation.Node")
-local AStar = require("NavBot.Algorithms.A-Star")
-local ConnectionUtils = require("NavBot.Navigation.ConnectionUtils")
-local NodeSkipper = require("NavBot.Bot.NodeSkipper")
-local PathStringPull = require("NavBot.Navigation.PathStringPull")
-local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local Lib = Common.Lib
-local Log = Lib.Utils.Logger.new("NavBot")
-Log.Level = 0
-
--- Constants
-local STEP_HEIGHT = 18
-local UP_VECTOR = Vector3(0, 0, 1)
-local DROP_HEIGHT = 144 -- Define your constants outside the function
-local HULL_MIN = G.pLocal.vHitbox.Min
-local HULL_MAX = G.pLocal.vHitbox.Max
-local TRACE_MASK = MASK_PLAYERSOLID
-local TICK_RATE = 66
-local GROUND_TRACE_OFFSET_START = Vector3(0, 0, 5)
-local GROUND_TRACE_OFFSET_END = Vector3(0, 0, -67)
-local MAX_SLOPE_ANGLE = 55 -- Maximum angle (in degrees) that is climbable
-
--- Add a connection between two nodes
-function Navigation.AddConnection(nodeA, nodeB)
-	if not nodeA or not nodeB then
-		Log:Warn("AddConnection: One or both nodes are nil")
-		return
-	end
-	Node.AddConnection(nodeA, nodeB)
-	Node.AddConnection(nodeB, nodeA)
-	G.Navigation.navMeshUpdated = true
-end
-
--- Remove a connection between two nodes
-function Navigation.RemoveConnection(nodeA, nodeB)
-	if not nodeA or not nodeB then
-		Log:Warn("RemoveConnection: One or both nodes are nil")
-		return
-	end
-	Node.RemoveConnection(nodeA, nodeB)
-	Node.RemoveConnection(nodeB, nodeA)
-	G.Navigation.navMeshUpdated = true
-end
-
--- Add cost to a connection between two nodes
-function Navigation.AddCostToConnection(nodeA, nodeB, cost)
-	if not nodeA or not nodeB then
-		Log:Warn("AddCostToConnection: One or both nodes are nil")
-		return
-	end
-
-	-- Use Node module's implementation to avoid duplication
-	Node.AddCostToConnection(nodeA, nodeB, cost)
-end
-
--- ========================================================================
--- SETUP & INITIALIZATION
--- ========================================================================
-
-function Navigation.Setup()
-	if engine.GetMapName() then
-		Node.Setup()
-		Navigation.ClearPath()
-	end
-end
-
--- ========================================================================
--- NODE QUERIES
--- ========================================================================
-
--- Get a node by ID
----@param nodeId integer
----@return table|nil
-function Navigation.GetNode(nodeId)
-	if not nodeId then
-		Log:Warn("GetNode: nodeId is nil")
-		return nil
-	end
-
-	return Node.GetNodeByID(nodeId)
-end
-
--- Get adjacent nodes for a given node ID (areas only, no doors)
----@param nodeId integer
----@return integer[]
-function Navigation.GetAdjacentNodes(nodeId)
-	if not nodeId then
-		Log:Warn("GetAdjacentNodes: nodeId is nil")
-		return {}
-	end
-
-	local node = Node.GetNodeByID(nodeId)
-	if not node then
-		Log:Warn("GetAdjacentNodes: node %d not found", nodeId)
-		return {}
-	end
-
-	local neighbors = Node.GetAdjacentAreasForPath(node, G.Navigation.nodes)
-
-	-- Extract node IDs
-	local adjacentIds = {}
-	for _, neighbor in ipairs(neighbors) do
-		if neighbor.node and neighbor.node.id then
-			table.insert(adjacentIds, neighbor.node.id)
-		end
-	end
-
-	return adjacentIds
-end
-
--- ========================================================================
--- PATH QUERIES
--- ========================================================================
-
--- Get the current path
----@return Node[]|nil
-function Navigation.GetCurrentPath()
-	return G.Navigation.path
-end
-
--- ========================================================================
--- PATH MANAGEMENT
--- ========================================================================
-
--- Clear the current path
-function Navigation.ClearPath()
-	G.Navigation.path = {}
-	G.Navigation.currentNodeIndex = 1
-	-- Also clear door/center/goal waypoints to avoid stale movement/visuals
-	G.Navigation.waypoints = {}
-	G.Navigation.currentWaypointIndex = 1
-	-- Clear path traversal history used by stuck analysis
-	G.Navigation.pathHistory = {}
-	G.Navigation.apexPath = nil
-	G.Navigation.apexIndex = 1
-	NodeSkipper.Reset()
-end
-
-function Navigation.RebuildApexPath()
-	local path = G.Navigation.path
-	if not path or #path == 0 then
-		G.Navigation.apexPath = nil
-		G.Navigation.apexIndex = 1
-		return
-	end
-	local startPos = G.pLocal and G.pLocal.Origin or nil
-	G.Navigation.apexPath = PathStringPull.ProcessAreaPath(path, G.Navigation.goalPos, startPos)
-	G.Navigation.apexIndex = 1
-end
-
--- Set the current path
----@param path Node[]
-function Navigation.SetCurrentPath(path)
-	if not path then
-		Log:Error("Failed to set path, it's nil")
-		return
-	end
-	G.Navigation.path = path
-	-- Use weak values to avoid strong retention of node objects (nodes table holds strong refs)
-	pcall(setmetatable, G.Navigation.path, { __mode = "v" })
-	G.Navigation.currentNodeIndex = 1 -- Start from the first node (start) and work towards goal
-	-- Build area-center waypoints (door threading via NavPredict at runtime)
-	--ProfilerBegin and ProfilerEnd are not available here, so rely on caller's profiling
-	Navigation.BuildDoorWaypointsFromPath()
-	Navigation.RebuildApexPath()
-	G.Navigation.pathHistory = {}
-	NodeSkipper.Reset()
-end
-
--- Remove the current node from the path (we've reached it)
-function Navigation.RemoveCurrentNode()
-	G.Navigation.currentNodeTicks = 0
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Remove the first node (current node we just reached)
-		local reached = table.remove(G.Navigation.path, 1)
-		-- Track reached nodes from last to first
-		if reached then
-			G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-			table.insert(G.Navigation.pathHistory, 1, reached)
-			-- Bound history size
-			if #G.Navigation.pathHistory > 32 then
-				table.remove(G.Navigation.pathHistory)
-			end
-		end
-		-- currentNodeIndex stays at 1 since we always target the first node in the remaining path
-		G.Navigation.currentNodeIndex = 1
-		-- Rebuild waypoints to reflect new leading edge
-		Navigation.BuildDoorWaypointsFromPath()
-		Navigation.RebuildApexPath()
-	end
-end
-function Navigation.ResetTickTimer()
-	G.Navigation.currentNodeTicks = 0
-end
-
-function Navigation.ResetNodeSkipping()
-	NodeSkipper.Reset()
-end
-
--- ========================================================================
--- NODE VALIDATION & CHECKS
--- ========================================================================
-
--- Check if next node is walkable from current position
-function Navigation.CheckNextNodeWalkable(currentPos, currentNode, nextNode)
-	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
-		Log:Debug(
-			"CheckNextNodeWalkable: Invalid node data - currentNode=%s, nextNode=%s",
-			tostring(currentNode and currentNode.id),
-			tostring(nextNode and nextNode.id)
-		)
-		return false
-	end
-
-	-- Straight-line walk check via NavPredict.CanSkip
-	local currentArea = Node.GetAreaAtPosition(currentPos)
-	if not currentArea then
-		Log:Debug("CheckNextNodeWalkable: Could not find current area")
-		return false
-	end
-
-	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-	local success, canWalk = pcall(NavPredict.CanSkip, currentPos, nextNode.pos, currentArea, true, allowJump)
-
-	if success and canWalk then
-		Log:Debug("Next node %d is walkable from current position", nextNode.id)
-		return true
-	else
-		Log:Debug("Next node %d is not walkable from current position", nextNode.id)
-		return false
-	end
-end
-
--- Check if next node is closer than current node
-function Navigation.CheckNextNodeCloser(currentPos, currentNode, nextNode)
-	if not currentNode or not nextNode or not currentNode.pos or not nextNode.pos then
-		Log:Debug(
-			"CheckNextNodeCloser: Invalid node data - currentNode=%s, nextNode=%s",
-			tostring(currentNode and currentNode.id),
-			tostring(nextNode and nextNode.id)
-		)
-		return false
-	end
-
-	local distanceToCurrent = Common.Distance2D(currentPos, currentNode.pos)
-	local distanceToNext = Common.Distance2D(currentPos, nextNode.pos)
-
-	if distanceToNext < distanceToCurrent then
-		Log:Debug("Next node %d is closer (%.2f < %.2f)", nextNode.id, distanceToNext, distanceToCurrent)
-		return true
-	else
-		Log:Debug(
-			"Current node %d is closer or equal (%.2f >= %.2f)",
-			currentNode.id,
-			distanceToCurrent,
-			distanceToNext
-		)
-		return false
-	end
-end
-
--- ========================================================================
--- WAYPOINT BUILDING
--- ========================================================================
-
--- Goal-only waypoint list; movement uses PathSteering portal string-pull on G.Navigation.path
-function Navigation.BuildDoorWaypointsFromPath()
-	if not G.Navigation.waypoints then
-		G.Navigation.waypoints = {}
-	else
-		for i = #G.Navigation.waypoints, 1, -1 do
-			G.Navigation.waypoints[i] = nil
-		end
-	end
-	G.Navigation.currentWaypointIndex = 1
-
-	local goalPos = G.Navigation.goalPos
-	if goalPos then
-		table.insert(G.Navigation.waypoints, { pos = goalPos, kind = "goal" })
-	end
-end
-
-function Navigation.GetCurrentWaypoint()
-	local wpList = G.Navigation.waypoints
-	local idx = G.Navigation.currentWaypointIndex or 1
-	if wpList and idx and wpList[idx] then
-		return wpList[idx]
-	end
-	return nil
-end
-
-function Navigation.AdvanceWaypoint()
-	local wpList = G.Navigation.waypoints
-	local idx = G.Navigation.currentWaypointIndex or 1
-	if not (wpList and wpList[idx]) then
-		return
-	end
-	local current = wpList[idx]
-
-	-- FIXED: Reset timer when reaching ANY waypoint on path, not just center
-	-- This ensures node skipping timer resets when reaching any point on the path
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Reset the node timer when we reach any waypoint
-		Navigation.ResetTickTimer()
-		-- Reset node skipping cooldowns when reaching waypoints
-		-- SCRAPPED: Don't reset cooldowns on waypoint reach - let agent-based system run on its own schedule
-		-- local NodeSkipper = require("NavBot.Bot.NodeSkipper")
-		-- NodeSkipper.ResetWalkabilityCooldown()
-		-- If we reached a center of the next area, advance the area path too
-		-- if current.kind == "center" then
-		-- 	-- path[1] is previous area; popping it moves us into the new area
-		-- 	Navigation.RemoveCurrentNode()
-		-- end
-	end
-
-	G.Navigation.currentWaypointIndex = idx + 1
-end
-
-function Navigation.SkipWaypoints(count)
-	local wpList = G.Navigation.waypoints
-	if not wpList then
-		return
-	end
-	local idx = (G.Navigation.currentWaypointIndex or 1) + (count or 1)
-	if idx < 1 then
-		idx = 1
-	end
-	if idx > #wpList + 1 then
-		idx = #wpList + 1
-	end
-
-	-- FIXED: Reset timer when skipping ANY waypoints on path
-	-- This ensures node skipping timer resets when skipping any points on the path
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		-- Reset the node timer when we skip waypoints
-		Navigation.ResetTickTimer()
-		-- If we skip over a center, reflect area progression
-		local current = G.Navigation.waypoints[G.Navigation.currentWaypointIndex or 1]
-		if current and current.kind ~= "center" then
-			for j = (G.Navigation.currentWaypointIndex or 1), math.min(idx - 1, #wpList) do
-				if wpList[j].kind == "center" and G.Navigation.path and #G.Navigation.path > 0 then
-					Navigation.RemoveCurrentNode()
-				end
-			end
-		end
-	end
-
-	G.Navigation.currentWaypointIndex = idx
-end
-
--- Function to convert degrees to radians
-local function degreesToRadians(degrees)
-	return degrees * math.pi / 180
-end
-
--- Checks for an obstruction between two points using a hull trace.
-local function isPathClear(startPos, endPos)
-	local traceResult = engine.TraceHull(startPos, endPos, HULL_MIN, HULL_MAX, MASK_PLAYERSOLID_BRUSHONLY)
-	return traceResult
-end
-
--- Checks if the ground is stable at a given position.
-local function isGroundStable(position)
-	local groundTraceResult = engine.TraceLine(
-		position + GROUND_TRACE_OFFSET_START,
-		position + GROUND_TRACE_OFFSET_END,
-		MASK_PLAYERSOLID_BRUSHONLY
-	)
-	return groundTraceResult.fraction < 1
-end
-
--- Function to get the ground normal at a given position
-local function getGroundNormal(position)
-	local groundTraceResult = engine.TraceLine(
-		position + GROUND_TRACE_OFFSET_START,
-		position + GROUND_TRACE_OFFSET_END,
-		MASK_PLAYERSOLID_BRUSHONLY
-	)
-	return groundTraceResult.plane
-end
-
--- Precomputed up vector and max slope angle in radians
-local MAX_SLOPE_ANGLE_RAD = degreesToRadians(MAX_SLOPE_ANGLE)
-
--- Function to get forward speed by class
-function Navigation.GetMaxSpeed(entity)
-	return entity:GetPropFloat("m_flMaxspeed")
-end
-
--- Function to compute the move direction
-local function ComputeMove(pCmd, a, b)
-	local diff = b - a
-	if diff:Length() == 0 then
-		return Vector3(0, 0, 0)
-	end
-
-	local x = diff.x
-	local y = diff.y
-	local vSilent = Vector3(x, y, 0)
-
-	local ang = vSilent:Angles()
-	local cYaw = pCmd:GetViewAngles().yaw
-	local yaw = math.rad(ang.y - cYaw)
-	local move = Vector3(math.cos(yaw), -math.sin(yaw), 0)
-
-	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity) + 1
-	return move * maxSpeed
-end
-
--- Function to implement fast stop
-local function FastStop(pCmd, pLocal)
-	local velocity = pLocal:GetVelocity()
-	velocity.z = 0
-	local speed = velocity:Length2D()
-
-	if speed < 1 then
-		pCmd:SetForwardMove(0)
-		pCmd:SetSideMove(0)
-		return
-	end
-
-	local accel = 5.5
-	local maxSpeed = Navigation.GetMaxSpeed(G.pLocal.entity)
-	local playerSurfaceFriction = 1.0
-	local max_accelspeed = accel * (1 / TICK_RATE) * maxSpeed * playerSurfaceFriction
-
-	local wishspeed
-	if speed - max_accelspeed <= -1 then
-		wishspeed = max_accelspeed / (speed / (accel * (1 / TICK_RATE)))
-	else
-		wishspeed = max_accelspeed
-	end
-
-	local ndir = (velocity * -1):Angles()
-	ndir.y = pCmd:GetViewAngles().y - ndir.y
-	ndir = ndir:ToVector()
-
-	pCmd:SetForwardMove(ndir.x * wishspeed)
-	pCmd:SetSideMove(ndir.y * wishspeed)
-end
-
----@param pos Vector3|{ x:number, y:number, z:number }
----@return Node|nil
-function Navigation.GetClosestNode(pos)
-	-- Safety check: ensure nodes are available
-	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
-		Log:Debug("No navigation nodes available for GetClosestNode")
-		return nil
-	end
-	local n = Node.GetClosestNode(pos)
-	if not n then
-		return nil
-	end
-	return n
-end
-
--- Get area at position using multi-point distance check (more precise than GetClosestNode)
----@param pos Vector3|{ x:number, y:number, z:number }
----@return Node|nil
-function Navigation.GetAreaAtPosition(pos)
-	-- Safety check: ensure nodes are available
-	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
-		Log:Debug("No navigation nodes available for GetAreaAtPosition")
-		return nil
-	end
-	local n = Node.GetAreaAtPosition(pos)
-	if not n then
-		return nil
-	end
-	return n
-end
-
--- Main pathfinding function - FIXED TO USE DUAL A* SYSTEM
----@param startNode Node
----@param goalNode Node
-function Navigation.FindPath(startNode, goalNode)
-	if not startNode or not startNode.pos then
-		Log:Error("Navigation.FindPath: invalid start node")
-		return Navigation
-	end
-	if not goalNode or not goalNode.pos then
-		Log:Error("Navigation.FindPath: invalid goal node")
-		return Navigation
-	end
-
-	local horizontalDistance = math.abs(goalNode.pos.x - startNode.pos.x) + math.abs(goalNode.pos.y - startNode.pos.y)
-	local verticalDistance = math.abs(goalNode.pos.z - startNode.pos.z)
-
-	-- Try A* pathfinding as primary algorithm (more reliable than D*)
-	local success, path = pcall(AStar.NormalPath, startNode, goalNode, G.Navigation.nodes, Node.GetAdjacentAreasForPath)
-
-	if not success then
-		Log:Error("A* pathfinding crashed: %s", tostring(path))
-		G.Navigation.path = nil
-		Navigation.pathFailed = true
-		Navigation.pathFound = false
-
-		-- Add circuit breaker penalty for this failed connection
-		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
-			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
-		end
-		return Navigation
-	end
-
-	G.Navigation.path = path
-
-	if not G.Navigation.path or #G.Navigation.path == 0 then
-		Log:Error("Failed to find path from %d to %d!", startNode.id, goalNode.id)
-		G.Navigation.path = nil
-		Navigation.pathFailed = true
-		Navigation.pathFound = false
-
-		-- Add circuit breaker penalty for this failed connection
-		if G.CircuitBreaker and G.CircuitBreaker.addConnectionFailure then
-			G.CircuitBreaker.addConnectionFailure(startNode, goalNode)
-		end
-	else
-		Log:Info("Path found from %d to %d with %d nodes", startNode.id, goalNode.id, #G.Navigation.path)
-		Navigation.pathFound = true
-		Navigation.pathFailed = false
-		pcall(setmetatable, G.Navigation.path, { __mode = "v" })
-		-- Reset node skipping agents for new path
-		G.Navigation.skipAgents = nil
-		Navigation.BuildDoorWaypointsFromPath()
-		Navigation.RebuildApexPath()
-		-- REMOVED: All path optimization now handled by NodeSkipper.CheckContinuousSkip
-		-- Reset traversed-node history for new path
-		G.Navigation.pathHistory = {}
-	end
-
-	return Navigation
-end
-
-return Navigation
-
-end)
-__bundle_register("NavBot.Bot.NodeSkipper", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-Node Skipper - Single-node skip only, validated by NavPredict.CanSkip.
-Pass detection from PathSteering; no multi-node forward skip.
-]]
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local Node = require("NavBot.Navigation.Node")
-local PathSteering = require("NavBot.Navigation.PathSteering")
-local WorkManager = require("NavBot.WorkManager")
-
-local Log = Common.Log.new("NodeSkipper")
-
-local NodeSkipper = {}
-
-local lastBlockedLogKey = nil
-local lastBlockedLogTick = 0
-local BLOCKED_LOG_INTERVAL = 66
-
-local function lockIntentAfterSkip(playerPos)
-	local path = G.Navigation.path
-	if path and path[1] then
-		PathSteering.lockIntentTowardNode(playerPos, path[1], path[2])
-	end
-end
-
-local function logSkipBlocked(currentNode, nextNode, reason)
-	local key = tostring(currentNode.id) .. "->" .. tostring(nextNode.id) .. ":" .. reason
-	local now = globals.TickCount()
-	if key == lastBlockedLogKey and (now - lastBlockedLogTick) < BLOCKED_LOG_INTERVAL then
-		return
-	end
-	lastBlockedLogKey = key
-	lastBlockedLogTick = now
-	Log:Debug("SKIP blocked (not walkable): %s -> %s (%s)", tostring(currentNode.id), tostring(nextNode.id), reason)
-end
-
-local function canSkipSegment(playerPos, goalPos, fromAreaNode, allowJump)
-	if not fromAreaNode then
-		return false
-	end
-	local success, canSkip = pcall(NavPredict.CanSkip, playerPos, goalPos, fromAreaNode, true, allowJump)
-	return success and canSkip == true
-end
-
-local function trySkipCurrentNode(playerPos, currentNode, nextNode, reason)
-	if not G.Menu.Navigation.Skip_Nodes then
-		return false
-	end
-
-	local goalPos = nextNode.pos
-	local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-
-	-- Always validate from the path node we are leaving, not overlap-picked area
-	if not canSkipSegment(playerPos, goalPos, currentNode, allowJump) then
-		logSkipBlocked(currentNode, nextNode, reason)
-		return false
-	end
-
-	local missedNode = table.remove(G.Navigation.path, 1)
-	G.Navigation.pathHistory = G.Navigation.pathHistory or {}
-	table.insert(G.Navigation.pathHistory, 1, missedNode)
-	while #G.Navigation.pathHistory > 32 do
-		table.remove(G.Navigation.pathHistory)
-	end
-
-	G.Navigation.lastSkipTick = globals.TickCount()
-	Log:Info("Skipped node %s (%s), targeting %s", tostring(missedNode.id), reason, tostring(nextNode.id))
-	return true
-end
-
-local function shouldAttemptSkip(playerPos, currentNode, nextNode)
-	local passed, passReason = PathSteering.hasPassedNode(playerPos, currentNode, nextNode)
-	if passed then
-		return true, passReason
-	end
-
-	local playerArea = Node.GetAreaAtPosition(playerPos)
-	if playerArea and playerArea.id == nextNode.id then
-		return true, "inside_next_area"
-	end
-
-	return false, nil
-end
-
-function NodeSkipper.Reset()
-	G.Navigation.nodePassTrack = nil
-	lastBlockedLogKey = nil
-	lastBlockedLogTick = 0
-end
-
-function NodeSkipper.Tick(playerPos)
-	assert(playerPos, "Tick: playerPos missing")
-
-	if not WorkManager.attemptWork(1, "node_skipping") then
-		return false
-	end
-
-	local path = G.Navigation.path
-	if not path or #path < 2 then
-		return false
-	end
-
-	local currentNode = path[1]
-	local nextNode = path[2]
-	if not (currentNode and currentNode.pos and nextNode and nextNode.pos) then
-		return false
-	end
-
-	local shouldSkip, skipReason = shouldAttemptSkip(playerPos, currentNode, nextNode)
-	if not shouldSkip then
-		return false
-	end
-
-	if trySkipCurrentNode(playerPos, currentNode, nextNode, skipReason) then
-		lockIntentAfterSkip(playerPos)
-		G.Navigation.currentNodeIndex = 1
-		return true
-	end
-
-	return false
-end
-
-return NodeSkipper
-
-end)
-__bundle_register("NavBot.Algorithms.A-Star", function(require, _LOADED, __bundle_register, __bundle_modules)
--- A* Pathfinding Algorithm Implementation
--- Uses a priority queue (heap) for efficient node exploration
--- Area-only graph; door precision handled by NavPredict at movement time
-
-local Heap = require("NavBot.Algorithms.Heap")
-local Common = require("NavBot.Core.Common")
-local Log = Common.Log.new("AStar")
-
--- Memory Pooling System for GC Optimization
-local tablePool = {}
-local poolSize = 0
-local maxPoolSize = 1000
-
-local function getPooledTable()
-	local t = table.remove(tablePool)
-	if t then
-		poolSize = poolSize - 1
-		return t
-	end
-	return {}
-end
-
-local function releaseTable(t)
-	if not t then
-		return
-	end
-
-	-- Clear the table
-	for k in pairs(t) do
-		t[k] = nil
-	end
-
-	-- Add to pool if not full
-	if poolSize < maxPoolSize then
-		table.insert(tablePool, t)
-		poolSize = poolSize + 1
-	end
-end
-
--- Batch release for efficiency
-local function releaseTables(...)
-	for i = 1, select("#", ...) do
-		releaseTable(select(i, ...))
-	end
-end
-
--- Type definitions for A* pathfinding
-
----@class Vector3
-local function heuristicCost(nodeA, nodeB)
-	-- Euclidean distance heuristic
-	local dx = nodeA.pos.x - nodeB.pos.x
-	local dy = nodeA.pos.y - nodeB.pos.y
-	local dz = nodeA.pos.z - nodeB.pos.z
-	local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-	return dist
-end
-
-----------------------------------------------------------------
--- Path Reconstruction (O(n) instead of O(n²))
-----------------------------------------------------------------
----@param cameFrom table<Node, {node:Node}>
----@param startNode Node
----@param goalNode Node
----@return Node[]|nil
-local function reconstructPath(cameFrom, startNode, goalNode)
-	local path = {}
-	local current = goalNode
-
-	-- Build reversed path (sequential memory writes)
-	while current and current ~= startNode do
-		path[#path + 1] = current
-		local cf = cameFrom[current]
-		if cf and cf.node then
-			current = cf.node
-		else
-			Log:Error("A* reconstructPath failed: missing cameFrom for node " .. (current.id or "unknown"))
-			return nil
-		end
-	end
-
-	if not current or current ~= startNode then
-		return nil
-	end
-
-	path[#path + 1] = startNode
-
-	-- Reverse in place (O(n) total)
-	local i, j = 1, #path
-	while i < j do
-		path[i], path[j] = path[j], path[i]
-		i = i + 1
-		j = j - 1
-	end
-
-	return path
-end
-
--- No post-smoothing: shortcuts are validated at runtime by NavPredict.CanSkip (NodeSkipper)
-
--- A* Module Table
-local AStar = {}
-
----Find the shortest path between two nodes using A* algorithm
----@param startNode Node Starting node
----@param goalNode Node Target node
----@param nodes table<integer, Node> Lookup table of all nodes by ID
----@param adjacentFun fun(node: Node, nodes: table): NeighborDataArray Function to get adjacent nodes
----@return Node[]|nil path Array of nodes representing the path, or nil if no path exists
-function AStar.NormalPath(startNode, goalNode, nodes, adjacentFun)
-	if not (startNode and goalNode and startNode.id and goalNode.id) then
-		return nil
-	end
-
-	local openSet = Heap.new(function(a, b)
-		return a.fScore < b.fScore
-	end)
-
-	local openSetLookup = getPooledTable()
-	local closedSet = getPooledTable()
-	local gScore = getPooledTable()
-	local fScore = getPooledTable()
-	local cameFrom = getPooledTable()
-
-	gScore[startNode] = 0
-	fScore[startNode] = heuristicCost(startNode, goalNode)
-
-	openSet:push({ node = startNode, fScore = fScore[startNode] })
-	openSetLookup[startNode] = true
-
-	while not openSet:empty() do
-		local currentEntry = openSet:pop()
-		local current = currentEntry.node
-		openSetLookup[current] = nil
-
-		if closedSet[current] then
-			goto continue
-		end
-
-		if current == goalNode then
-			local path = reconstructPath(cameFrom, startNode, current)
-			releaseTables(openSetLookup, closedSet, gScore, fScore, cameFrom)
-			return path
-		end
-
-		closedSet[current] = true
-
-		-- Direct call, no pcall overhead
-		local neighbors = adjacentFun(current, nodes)
-		for i = 1, #neighbors do
-			local neighborData = neighbors[i]
-			local nextNode = neighborData.node
-			if closedSet[nextNode] then
-				goto continueNeighbor
-			end
-
-			local connectionCost = neighborData.cost or (current.pos - nextNode.pos):Length()
-
-			local tentativeG = gScore[current] + connectionCost
-			if not gScore[nextNode] or tentativeG < gScore[nextNode] then
-				cameFrom[nextNode] = { node = current }
-				gScore[nextNode] = tentativeG
-				fScore[nextNode] = tentativeG + heuristicCost(nextNode, goalNode)
-
-				if not openSetLookup[nextNode] then
-					openSet:push({ node = nextNode, fScore = fScore[nextNode] })
-					openSetLookup[nextNode] = true
-				else
-					-- Duplicate push instead of decrease-key hack
-					openSet:push({ node = nextNode, fScore = fScore[nextNode] })
-				end
-			end
-
-			::continueNeighbor::
-		end
-
-		::continue::
-	end
-
-	releaseTables(openSetLookup, closedSet, gScore, fScore, cameFrom)
-	return nil
-end
-
-return AStar
-
-end)
-__bundle_register("NavBot.Algorithms.Heap", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-    Enhanced Heap implementation in Lua.
-    Modifications made for robustness and preventing memory leaks.
-    Credits: github.com/GlorifiedPig/Luafinding
-]]
-
-local Heap = {}
-Heap.__index = Heap
-
--- Constructor for the heap.
--- @param compare? Function for comparison, defining the heap property. Defaults to a min-heap.
-function Heap.new(compare)
-	return setmetatable({
-		_data = {},
-		_size = 0,
-		Compare = compare or function(a, b)
-			return a < b
-		end,
-	}, Heap)
-end
-
--- Helper function to maintain the heap property while inserting an element.
-local function sortUp(heap, index)
-	while index > 1 do
-		local parentIndex = math.floor(index / 2)
-		if heap.Compare(heap._data[index], heap._data[parentIndex]) then
-			heap._data[index], heap._data[parentIndex] = heap._data[parentIndex], heap._data[index]
-			index = parentIndex
-		else
-			break
-		end
-	end
-end
-
--- Helper function to maintain the heap property after removing the root element.
-local function sortDown(heap, index)
-	while true do
-		local leftIndex, rightIndex = 2 * index, 2 * index + 1
-		local smallest = index
-
-		if leftIndex <= heap._size and heap.Compare(heap._data[leftIndex], heap._data[smallest]) then
-			smallest = leftIndex
-		end
-		if rightIndex <= heap._size and heap.Compare(heap._data[rightIndex], heap._data[smallest]) then
-			smallest = rightIndex
-		end
-
-		if smallest ~= index then
-			heap._data[index], heap._data[smallest] = heap._data[smallest], heap._data[index]
-			index = smallest
-		else
-			break
-		end
-	end
-end
-
--- Checks if the heap is empty.
-function Heap:empty()
-	return self._size == 0
-end
-
--- Clears the heap, allowing Lua's garbage collector to reclaim memory.
-function Heap:clear()
-	for i = 1, self._size do
-		self._data[i] = nil
-	end
-	self._size = 0
-end
-
--- Adds an item to the heap.
--- @param item The item to be added.
-function Heap:push(item)
-	self._size = self._size + 1
-	self._data[self._size] = item
-	sortUp(self, self._size)
-end
-
--- Returns the root element of the heap without removing it.
-function Heap:peek()
-	if self._size == 0 then
-		return nil
-	end
-	return self._data[1]
-end
-
--- Removes and returns the root element of the heap.
-function Heap:pop()
-	if self._size == 0 then
-		return nil
-	end
-	local root = self._data[1]
-	self._data[1] = self._data[self._size]
-	self._data[self._size] = nil -- Clear the reference to the removed item
-	self._size = self._size - 1
-	if self._size > 0 then
-		sortDown(self, 1)
-	end
-	return root
-end
-
-return Heap
-
-end)
-__bundle_register("NavBot.Bot.CircuitBreaker", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-Circuit Breaker - Prevents infinite loops on problematic connections
-Tracks connection failures and temporarily blocks connections that fail repeatedly
-]]
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
--- local Node = require("NavBot.Navigation.Node")  -- Temporarily disabled for bundle compatibility
-
-local CircuitBreaker = {}
-local Log = Common.Log.new("CircuitBreaker")
-
--- Circuit breaker state
-local state = {
-	failures = {}, -- [connectionKey] = { count, lastFailTime, isBlocked }
-	maxFailures = 2, -- Max failures before blocking connection temporarily
-	blockDuration = 300, -- Ticks to block connection (5 seconds)
-	cleanupInterval = 1800, -- Clean up old entries every 30 seconds
-	lastCleanup = 0,
-}
-
--- Add a connection failure to the circuit breaker
-function CircuitBreaker.addFailure(nodeA, nodeB)
-	if not nodeA or not nodeB then
-		return false
-	end
-
-	local connectionKey = nodeA.id .. "->" .. nodeB.id
-	local currentTick = globals.TickCount()
-
-	-- Initialize or update failure count
-	if not state.failures[connectionKey] then
-		state.failures[connectionKey] = { count = 0, lastFailTime = 0, isBlocked = false }
-	end
-
-	local failure = state.failures[connectionKey]
-	failure.count = failure.count + 1
-	failure.lastFailTime = currentTick
-
-	-- Each failure adds MORE penalty (makes path progressively more expensive)
-	local additionalPenalty = 100 -- Add 100 units per failure
-	-- Node.AddFailurePenalty(nodeA, nodeB, additionalPenalty)  -- Temporarily disabled for bundle compatibility
-
-	Log:Debug(
-		"Connection %s failure #%d - added %d penalty (total accumulating)",
-		connectionKey,
-		failure.count,
-		additionalPenalty
-	)
-
-	-- Block connection if too many failures
-	if failure.count >= state.maxFailures then
-		failure.isBlocked = true
-		-- Add a big penalty to ensure A* avoids this completely
-		local blockingPenalty = 500
-		-- Node.AddFailurePenalty(nodeA, nodeB, blockingPenalty)  -- Temporarily disabled for bundle compatibility
-
-		Log:Warn(
-			"Connection %s BLOCKED after %d failures (added final %d penalty)",
-			connectionKey,
-			failure.count,
-			blockingPenalty
-		)
-		return true
-	end
-
-	return false
-end
-
--- Check if a connection is blocked by circuit breaker
-function CircuitBreaker.isBlocked(nodeA, nodeB)
-	if not nodeA or not nodeB then
-		return false
-	end
-
-	local connectionKey = nodeA.id .. "->" .. nodeB.id
-	local failure = state.failures[connectionKey]
-
-	if not failure or not failure.isBlocked then
-		return false
-	end
-
-	local currentTick = globals.TickCount()
-	-- Unblock if enough time has passed (penalties remain but connection becomes usable)
-	if currentTick - failure.lastFailTime > state.blockDuration then
-		failure.isBlocked = false
-		failure.count = 0 -- Reset failure count (penalties stay, giving A* a chance to reconsider)
-
-		Log:Info(
-			"Connection %s UNBLOCKED after timeout (accumulated penalties remain as lesson learned)",
-			connectionKey
-		)
-		return false
-	end
-
-	return true
-end
-
--- Clean up old circuit breaker entries
-function CircuitBreaker.cleanup()
-	local currentTick = globals.TickCount()
-	if currentTick - state.lastCleanup < state.cleanupInterval then
-		return
-	end
-
-	state.lastCleanup = currentTick
-	local cleaned = 0
-
-	for connectionKey, failure in pairs(state.failures) do
-		-- Clean up old, unblocked entries
-		if not failure.isBlocked and (currentTick - failure.lastFailTime) > state.blockDuration * 2 then
-			state.failures[connectionKey] = nil
-			cleaned = cleaned + 1
-		end
-	end
-
-	if cleaned > 0 then
-		Log:Debug("Circuit breaker cleaned up %d old entries", cleaned)
-	end
-end
-
--- Get circuit breaker status for debugging
-function CircuitBreaker.getStatus()
-	local currentTick = globals.TickCount()
-	local blockedCount = 0
-	local totalFailures = 0
-
-	for connectionKey, failure in pairs(state.failures) do
-		totalFailures = totalFailures + failure.count
-		if failure.isBlocked then
-			blockedCount = blockedCount + 1
-		end
-	end
-
-	return {
-		connections = state.failures,
-		blockedCount = blockedCount,
-		totalFailures = totalFailures,
-		settings = {
-			maxFailures = state.maxFailures,
-			blockDuration = state.blockDuration,
-		},
-	}
-end
-
--- Clear all circuit breaker data
-function CircuitBreaker.clear()
-	state.failures = {}
-	Log:Info("Circuit breaker cleared - all connections reset")
-end
-
--- Manually block/unblock connections
-function CircuitBreaker.manualBlock(nodeA, nodeB)
-	local connectionKey = tostring(nodeA) .. "->" .. tostring(nodeB)
-	state.failures[connectionKey] = {
-		count = state.maxFailures,
-		lastFailTime = globals.TickCount(),
-		isBlocked = true,
-	}
-	Log:Info("Manually blocked connection %s", connectionKey)
-end
-
-function CircuitBreaker.manualUnblock(nodeA, nodeB)
-	local connectionKey = tostring(nodeA) .. "->" .. tostring(nodeB)
-	if state.failures[connectionKey] then
-		state.failures[connectionKey].isBlocked = false
-		state.failures[connectionKey].count = 0
-		Log:Info("Manually unblocked connection %s", connectionKey)
-	end
-end
-
-return CircuitBreaker
-
-end)
-__bundle_register("NavBot.Bot.StateHandler", function(require, _LOADED, __bundle_register, __bundle_modules)
---##########################################################################
---  StateHandler.lua  ·  Game state management and transitions
---##########################################################################
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local Navigation = require("NavBot.Navigation")
-local Node = require("NavBot.Navigation.Node")
-local WorkManager = require("NavBot.WorkManager")
-local GoalFinder = require("NavBot.Bot.GoalFinder")
-local CircuitBreaker = require("NavBot.Bot.CircuitBreaker")
-local NavPredict = require("NavBot.Navigation.Prediction.NavPredict")
-local SmartJump = require("NavBot.Bot.SmartJump")
-local MovementDecisions = require("NavBot.Bot.MovementDecisions")
-
-local StateHandler = {}
-local Log = Common.Log.new("StateHandler")
-
--- Log:Debug now automatically respects G.Menu.Main.Debug, no wrapper needed
-
-function StateHandler.handleUserInput(userCmd)
-	if userCmd:GetForwardMove() ~= 0 or userCmd:GetSideMove() ~= 0 then
-		G.Navigation.currentNodeTicks = 0
-		G.currentState = G.States.IDLE
-		G.wasManualWalking = true
-		G.BotIsMoving = false
-		-- Set timestamp when user last moved to prevent immediate pathfinding
-		G.lastManualMovementTick = globals.TickCount()
-		return true
-	end
-	return false
-end
-
-function StateHandler.handleIdleState()
-	G.BotIsMoving = false
-
-	-- Prevent pathfinding spam after manual movement (66 tick cooldown = 1 second)
-	local currentTick = globals.TickCount()
-	if G.lastManualMovementTick and (currentTick - G.lastManualMovementTick) < 66 then
-		return -- Still in cooldown after manual movement
-	end
-
-	-- Ensure navigation is ready before any goal work
-	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
-		Log:Debug("No navigation nodes available, staying in IDLE state")
-		return
-	end
-
-	-- Use WorkManager's simple cooldown pattern instead of complex priority system
-	if not WorkManager.attemptWork(5, "goal_search") then
-		return -- Still on cooldown
-	end
-
-	-- Check for immediate goals
-	local goalNode, goalPos = GoalFinder.findGoal("Objective")
-	if goalNode and goalPos then
-		local distance = (G.pLocal.Origin - goalPos):Length()
-
-		-- Only use direct-walk shortcut outside CTF and for short hops
-		local mapName = engine.GetMapName():lower()
-		local allowDirectWalk = not mapName:find("ctf_") and distance > 25 and distance <= 300
-		if allowDirectWalk then
-			local currentArea = Navigation.GetAreaAtPosition(G.pLocal.Origin)
-			if currentArea then
-				local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
-				local success, canWalk =
-					pcall(NavPredict.CanSkip, G.pLocal.Origin, goalPos, currentArea, true, allowJump)
-				if success and canWalk then
-					Log:Info("Direct-walk (short hop), moving immediately (dist: %.1f)", distance)
-					G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-					G.Navigation.goalPos = goalPos
-					G.Navigation.goalNodeId = goalNode.id
-					Navigation.RebuildApexPath()
-					G.currentState = G.States.MOVING
-					G.lastPathfindingTick = globals.TickCount()
-					return
-				end
-			end
-		end
-
-		-- Check if goal has changed significantly from current path
-		if G.Navigation.goalPos then
-			local goalChanged = (G.Navigation.goalPos - goalPos):Length() > 150
-			if goalChanged then
-				Log:Info("Goal changed significantly, forcing immediate repath (new distance: %.1f)", distance)
-				G.lastPathfindingTick = 0 -- Force repath immediately
-			end
-		end
-	end
-
-	-- Check if path was recently modified by node skipper (prevent immediate overwrite)
-	local currentTick = globals.TickCount()
-	if G.Navigation.lastSkipTick and (currentTick - G.Navigation.lastSkipTick) < 10 then
-		Log:Debug("Path was recently skipped, not overwriting")
-		return
-	end
-
-	-- Prevent pathfinding spam by limiting frequency
-	G.lastPathfindingTick = G.lastPathfindingTick or 0
-	if currentTick - G.lastPathfindingTick < 33 then
-		return
-	end
-
-	-- (nodes were already checked above)
-
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
-	if not startNode then
-		Log:Warn("Could not find start node")
-		return
-	end
-
-	if not (goalNode and goalPos) then
-		-- Throttle warn to avoid log spam
-		G.lastNoGoalWarnTick = G.lastNoGoalWarnTick or 0
-		if currentTick - G.lastNoGoalWarnTick > 60 then
-			Log:Warn("Could not find goal node")
-			G.lastNoGoalWarnTick = currentTick
-		end
-		return
-	end
-
-	G.Navigation.goalPos = goalPos
-	G.Navigation.goalNodeId = goalNode and goalNode.id or nil
-
-	-- Check if we're on same node OR neighbor node for smooth following
-	local isNeighbor = false
-	if startNode.id ~= goalNode.id and startNode.c then
-		-- Check if goal node is a direct neighbor (connected)
-		for _, dir in pairs(startNode.c) do
-			if dir.connections then
-				for _, conn in ipairs(dir.connections) do
-					if conn.node == goalNode.id then
-						isNeighbor = true
-						break
-					end
-				end
-			end
-			if isNeighbor then
-				break
-			end
-		end
-	end
-
-	-- Avoid pathfinding if we're at goal node or neighboring area
-	if startNode.id == goalNode.id or isNeighbor then
-		if goalPos then
-			-- Check distance to see if we're close enough
-			local dist = (G.pLocal.Origin - goalPos):Length()
-			local stopRadius = G.Menu.Navigation.StopDistance or 50
-			G.Navigation.followingStopRadius = stopRadius
-
-			if dist <= stopRadius then
-				-- Within stop radius - enter FOLLOWING state and just track position
-				-- DON'T set lastPathfindingTick - this isn't pathfinding, just direct movement
-				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-				Navigation.RebuildApexPath()
-				G.currentState = G.States.FOLLOWING
-				G.Navigation.followingDistance = dist
-				Log:Debug(
-					"Within stop radius (%.0f/%.0f) - entering FOLLOWING state %s",
-					dist,
-					stopRadius,
-					isNeighbor and "(neighbor)" or "(same node)"
-				)
-			else
-				-- Too far - move closer (still direct movement, not pathfinding)
-				G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-				Navigation.RebuildApexPath()
-				G.currentState = G.States.MOVING
-				G.Navigation.followingStopRadius = nil
-				Log:Info(
-					"Moving to goal position (%.0f, %.0f, %.0f) from node %d (dist=%.0f) %s",
-					goalPos.x,
-					goalPos.y,
-					goalPos.z,
-					startNode.id,
-					dist,
-					isNeighbor and "[neighbor]" or ""
-				)
-			end
-		else
-			Log:Debug("No goal position available, staying in IDLE")
-			G.lastPathfindingTick = currentTick
-			G.Navigation.followingStopRadius = nil
-		end
-		return
-	end
-
-	Log:Info("Generating new path from node %d to node %d", startNode.id, goalNode.id)
-	WorkManager.addWork(Navigation.FindPath, { startNode, goalNode }, 33, "Pathfinding")
-	G.currentState = G.States.PATHFINDING
-	G.lastPathfindingTick = currentTick
-end
-
-function StateHandler.handlePathfindingState()
-	if Navigation.pathFound then
-		G.currentState = G.States.MOVING
-		Navigation.pathFound = false
-	elseif Navigation.pathFailed then
-		Log:Warn("Pathfinding failed")
-		G.currentState = G.States.IDLE
-		Navigation.pathFailed = false
-	else
-		-- If no work in progress, start pathfinding
-		local pathfindingWork = WorkManager.works["Pathfinding"]
-		if not pathfindingWork or pathfindingWork.wasExecuted then
-			local goalPos = G.Navigation.goalPos
-			local goalNodeId = G.Navigation.goalNodeId
-
-			if goalPos and goalNodeId then
-				local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
-				local goalNode = G.Navigation.nodes and G.Navigation.nodes[goalNodeId]
-
-				if startNode and goalNode and startNode.id ~= goalNode.id then
-					local currentTick = globals.TickCount()
-					if not G.lastRepathTick then
-						G.lastRepathTick = 0
-					end
-
-					if currentTick - G.lastRepathTick > 30 then
-						Log:Info("Repathing from stuck state: node %d to node %d", startNode.id, goalNode.id)
-						WorkManager.addWork(Navigation.FindPath, { startNode, goalNode }, 33, "Pathfinding")
-						G.lastRepathTick = currentTick
-					end
-				else
-					Log:Debug("Cannot repath - invalid start/goal nodes, returning to IDLE")
-					G.currentState = G.States.IDLE
-				end
-			else
-				Log:Debug("No existing goal for repath, returning to IDLE")
-				G.currentState = G.States.IDLE
-			end
-		end
-	end
-end
-
--- Simplified unstuck logic - guarantee bot never gets stuck
--- Only checks velocity/timeout when bot is walking autonomously
-function StateHandler.handleStuckState(userCmd)
-	local currentTick = globals.TickCount()
-
-	-- Velocity/timeout checks ONLY when bot is walking autonomously
-	if G.Menu.Main.EnableWalking then
-		-- Check velocity for stuck detection
-		local pLocal = G.pLocal.entity
-		if pLocal then
-			local velocity = pLocal:EstimateAbsVelocity()
-			local speed2D = 0
-			if velocity and type(velocity.x) == "number" and type(velocity.y) == "number" then
-				speed2D = math.sqrt(velocity.x ^ 2 + velocity.y ^ 2)
-			end
-
-			-- MAIN TRIGGER: Velocity < 50 = STUCK
-			if speed2D < 50 then
-				Log:Warn("STUCK DETECTED: velocity " .. tostring(speed2D) .. " < 50 - adding penalties and repathing")
-
-				-- Disable node skipping for 132 ticks (2 seconds) by setting work cooldown
-				WorkManager.setWorkCooldown("node_skipping", 132)
-				Log:Debug("Node skipping disabled for 132 ticks due to stuck")
-
-				-- Add cost penalties to current connection (node->node, node->door, door->door)
-				StateHandler.addStuckPenalties()
-
-				-- ALWAYS repath when stuck (simplified approach)
-				StateHandler.forceRepath("Velocity too low")
-				return
-			end
-		end
-	end
-
-	-- Reset stuck detection if moving normally
-	G.Navigation.unwalkableCount = 0
-	G.Navigation.stuckStartTick = nil
-
-	-- Reset node skipping cooldown to 1 tick when unstuck
-	WorkManager.setWorkCooldown("node_skipping", 1)
-end
-
--- Add cost penalties to connections when stuck
-function StateHandler.addStuckPenalties()
-	local path = G.Navigation.path
-	if not path or #path < 2 then
-		return
-	end
-
-	-- Add penalty to current connection (between any two path elements)
-	local currentElement = path[1]
-	local nextElement = path[2]
-
-	if currentElement and nextElement then
-		-- Handle different connection types: node->node, node->door, door->door
-		local fromId = currentElement.id or currentElement.fromId
-		local toId = nextElement.id or nextElement.toId or nextElement.areaId
-
-		if fromId and toId then
-			-- Find and penalize the connection
-			local fromNode = G.Navigation.nodes and G.Navigation.nodes[fromId]
-			local toNode = G.Navigation.nodes and G.Navigation.nodes[toId]
-
-			if fromNode and toNode then
-				local connection = Node.GetConnectionEntry(fromNode, toNode)
-				if connection then
-					connection.cost = (connection.cost or 1) + 50
-					Log:Info(
-						"Added 50 cost penalty to connection "
-							.. tostring(fromId)
-							.. " -> "
-							.. tostring(toId)
-							.. " (stuck penalty)"
-					)
-				end
-			end
-		end
-	end
-end
-
--- Force immediate repath (with cooldown to prevent spam)
-function StateHandler.forceRepath(reason)
-	-- Prevent repath spam with 33 tick cooldown
-	if not WorkManager.attemptWork(33, "force_repath_cooldown") then
-		return -- Still on cooldown, ignore repath request
-	end
-
-	Log:Warn("Force repath triggered: %s", reason)
-
-	-- Clear stuck state
-	G.Navigation.stuckStartTick = nil
-	G.Navigation.unwalkableCount = 0
-	Navigation.ResetTickTimer()
-
-	-- Force immediate repath
-	G.currentState = G.States.PATHFINDING
-	G.lastPathfindingTick = 0
-
-	-- Reset work manager to allow immediate repath
-	WorkManager.clearWork("Pathfinding")
-end
-
--- Handle FOLLOWING state - direct following of dynamic targets on same node
-function StateHandler.handleFollowingState(userCmd)
-	local currentTick = globals.TickCount()
-
-	-- Throttle updates to every 5 ticks (~83ms) for responsive tracking
-	if not G.Navigation.lastFollowUpdateTick then
-		G.Navigation.lastFollowUpdateTick = 0
-	end
-
-	if currentTick - G.Navigation.lastFollowUpdateTick < 5 then
-		-- Use MovementDecisions to continue moving to current target
-		if G.Navigation.path and #G.Navigation.path > 0 then
-			MovementDecisions.handleMovingState(userCmd)
-		end
-		return
-	end
-
-	G.Navigation.lastFollowUpdateTick = currentTick
-
-	-- Re-check goal position (payload/player may have moved)
-	local goalNode, goalPos = GoalFinder.findGoal("Objective")
-
-	if not goalNode or not goalPos then
-		-- Lost target - return to IDLE (clear pathfinding throttle for immediate repath)
-		Log:Debug("Lost target in FOLLOWING state, returning to IDLE")
-		G.currentState = G.States.IDLE
-		G.lastPathfindingTick = 0
-		G.Navigation.followingStopRadius = nil
-		return
-	end
-
-	-- Check if still on same node
-	local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
-	if not startNode or startNode.id ~= goalNode.id then
-		-- No longer on same node - return to IDLE to trigger pathfinding (clear throttle)
-		Log:Debug("Left target node in FOLLOWING state, returning to IDLE")
-		G.currentState = G.States.IDLE
-		G.lastPathfindingTick = 0
-		G.Navigation.followingStopRadius = nil
-		return
-	end
-
-	-- Check distance change
-	local currentDist = (G.pLocal.Origin - goalPos):Length()
-	local stopRadius = G.Menu.Navigation.StopDistance or 50
-	local distChange = math.abs(currentDist - (G.Navigation.followingDistance or currentDist))
-
-	-- Only update if distance changed significantly (>30 units)
-	if distChange > 10 then
-		G.Navigation.path = { { pos = goalPos, id = goalNode.id } }
-		Navigation.RebuildApexPath()
-		G.Navigation.followingDistance = currentDist
-		G.Navigation.goalPos = goalPos
-		Log:Debug("Target moved %.0f units, updating position (dist=%.0f)", distChange, currentDist)
-
-		-- If moved outside stop radius, switch to MOVING
-		if currentDist > stopRadius then
-			Log:Debug("Target moved outside stop radius, switching to MOVING")
-			G.currentState = G.States.MOVING
-			G.Navigation.followingStopRadius = nil
-		end
-	end
-
-	-- Continue moving to target
-	if G.Navigation.path and #G.Navigation.path > 0 then
-		MovementDecisions.handleMovingState(userCmd)
-	end
-end
-
-return StateHandler
-
-end)
-__bundle_register("NavBot.Bot.GoalFinder", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-Goal Finder - Finds navigation goals based on current tasks
-Handles payload, CTF, health pack, and teammate following goals
-]]
-
-local Common = require("NavBot.Core.Common")
-local G = require("NavBot.Core.Globals")
-local Navigation = require("NavBot.Navigation")
-
-local GoalFinder = {}
-local Log = Common.Log.new("GoalFinder")
-
-local function findPayloadGoal()
-	-- Cache payload entities for 90 ticks (1.5 seconds) to avoid expensive entity searches
-	local currentTick = globals.TickCount()
-	if not G.World.payloadCacheTime or (currentTick - G.World.payloadCacheTime) > 90 then
-		G.World.payloads = entities.FindByClass("CObjectCartDispenser")
-		G.World.payloadCacheTime = currentTick
-	end
-
-	local pLocal = G.pLocal.entity
-	local myTeam = pLocal:GetTeamNumber()
-	local ownCart = nil
-	local enemyCart = nil
-
-	-- First pass: find own cart and enemy cart
-	for _, entity in pairs(G.World.payloads or {}) do
-		if entity:IsValid() then
-			local cartTeam = entity:GetTeamNumber()
-			if cartTeam == myTeam then
-				ownCart = entity
-			else
-				enemyCart = entity
-			end
-		end
-	end
-
-	-- If we found our own cart, use it
-	if ownCart then
-		local pos = ownCart:GetAbsOrigin()
-		-- Offset down by 80 units to get ground-level position
-		pos = Vector3(pos.x, pos.y, pos.z - 80)
-		return Navigation.GetAreaAtPosition(pos), pos
-	end
-
-	-- If we're on defense (no own cart found) and enemy cart exists, defend enemy cart
-	if enemyCart then
-		local pos = enemyCart:GetAbsOrigin()
-		-- Offset down by 80 units to get ground-level position
-		pos = Vector3(pos.x, pos.y, pos.z - 80)
-		Log:Info("Own cart not found, defending enemy cart at position")
-		return Navigation.GetAreaAtPosition(pos), pos
-	end
-end
-
-local function findFlagGoal()
-	local pLocal = G.pLocal.entity
-	local myItem = pLocal:GetPropInt("m_hItem")
-
-	-- Cache flag entities for 90 ticks (1.5 seconds) to avoid expensive entity searches
-	local currentTick = globals.TickCount()
-	if not G.World.flagCacheTime or (currentTick - G.World.flagCacheTime) > 90 then
-		G.World.flags = entities.FindByClass("CCaptureFlag")
-		G.World.flagCacheTime = currentTick
-	end
-
-	-- Throttle debug logging to avoid spam (only log every 60 ticks)
-	if not G.lastFlagLogTick then
-		G.lastFlagLogTick = 0
-	end
-	local shouldLog = (currentTick - G.lastFlagLogTick) > 60
-
-	if shouldLog then
-		Log:Debug("CTF Flag Detection: myItem=%d, playerTeam=%d", myItem, pLocal:GetTeamNumber())
-		G.lastFlagLogTick = currentTick
-	end
-
-	local targetFlag = nil
-	local targetPos = nil
-
-	for _, entity in pairs(G.World.flags or {}) do
-		local flagTeam = entity:GetTeamNumber()
-		local myTeam = flagTeam == pLocal:GetTeamNumber()
-		local pos = entity:GetAbsOrigin()
-
-		if shouldLog then
-			Log:Debug("Flag found: team=%d, isMyTeam=%s, pos=%s", flagTeam, tostring(myTeam), tostring(pos))
-		end
-
-		-- If carrying enemy intel (myItem > 0), go to our team's capture point
-		-- If not carrying intel (myItem <= 0), go get the enemy intel
-		if (myItem > 0 and myTeam) or (myItem <= 0 and not myTeam) then
-			targetFlag = entity
-			targetPos = pos
-			if shouldLog then
-				Log:Info(
-					"CTF Goal: %s (carrying=%s)",
-					myItem > 0 and "Return to base" or "Get enemy intel",
-					tostring(myItem > 0)
-				)
-			end
-			break -- Take the first valid target
-		end
-	end
-
-	if targetFlag and targetPos then
-		return Navigation.GetAreaAtPosition(targetPos), targetPos
-	end
-
-	if shouldLog then
-		Log:Debug("No suitable flag target found - available flags: %d", #G.World.flags)
-	end
-	return nil
-end
-
-local function findHealthGoal()
-	local closestDist = math.huge
-	local closestNode = nil
-	local closestPos = nil
-	for _, pos in pairs(G.World.healthPacks) do
-		local healthNode = Navigation.GetAreaAtPosition(pos)
-		if healthNode then
-			local dist = (G.pLocal.Origin - pos):Length()
-			if dist < closestDist then
-				closestDist = dist
-				closestNode = healthNode
-				closestPos = pos
-			end
-		end
-	end
-	return closestNode, closestPos
-end
-
--- Find and follow the closest teammate using FastPlayers (throttled to avoid lag)
-local function findFollowGoal()
-	local localWP = Common.FastPlayers.GetLocal()
-	if not localWP then
-		return nil
-	end
-	local origin = localWP:GetRawEntity():GetAbsOrigin()
-	local closestDist = math.huge
-	local closestNode = nil
-	local targetPos = nil
-	local foundTarget = false
-
-	-- Cache teammate search for 30 ticks (0.5 seconds) to reduce expensive player iteration
-	local currentTick = globals.TickCount()
-	if not G.World.teammatesCacheTime or (currentTick - G.World.teammatesCacheTime) > 30 then
-		G.World.cachedTeammates = Common.FastPlayers.GetTeammates(true)
-		G.World.teammatesCacheTime = currentTick
-	end
-
-	for _, wp in ipairs(G.World.cachedTeammates or {}) do
-		local ent = wp:GetRawEntity()
-		if ent and ent:IsValid() and ent:IsAlive() then
-			foundTarget = true
-			local pos = ent:GetAbsOrigin()
-			local dist = (pos - origin):Length()
-			if dist < closestDist then
-				closestDist = dist
-				-- Update our memory of where we last saw this target
-				G.Navigation.lastKnownTargetPosition = pos
-				closestNode = Navigation.GetAreaAtPosition(pos)
-				targetPos = pos
-			end
-		end
-	end
-
-	-- If no alive teammates found, but we have a last known position, use that
-	if not foundTarget and G.Navigation.lastKnownTargetPosition then
-		Log:Info("No alive teammates found, moving to last known position")
-		closestNode = Navigation.GetAreaAtPosition(G.Navigation.lastKnownTargetPosition)
-		targetPos = G.Navigation.lastKnownTargetPosition
-	end
-
-	-- If the target is very close (same node), add some distance to avoid pathfinding to self
-	if closestNode and closestDist < 150 then -- 150 units is quite close
-		local startNode = Navigation.GetClosestNode(origin)
-		if startNode and closestNode.id == startNode.id then
-			Log:Debug("Target too close (same node), expanding search radius")
-			-- Look for a node near the target but not the same as our current node
-			for _, node in pairs(G.Navigation.nodes or {}) do
-				if node.id ~= startNode.id then
-					local targetPos = G.Navigation.lastKnownTargetPosition or closestNode.pos
-					local nodeToTargetDist = (node.pos - targetPos):Length()
-					if nodeToTargetDist < 200 then -- Within 200 units of target
-						closestNode = node
-						break
-					end
-				end
-			end
-		end
-	end
-
-	return closestNode, targetPos
-end
-
--- Main function to find goal node based on current task
-function GoalFinder.findGoal(currentTask)
-	-- Safety check: ensure nodes are loaded before proceeding
-	if not G.Navigation.nodes or not next(G.Navigation.nodes) then
-		Log:Debug("No navigation nodes available, cannot find goal")
-		return nil
-	end
-
-	local mapName = engine.GetMapName():lower()
-
-	if currentTask == "Objective" then
-		if mapName:find("plr_") or mapName:find("pl_") then
-			return findPayloadGoal()
-		elseif mapName:find("ctf_") then
-			return findFlagGoal()
-		else
-			-- fallback to following the closest teammate
-			return findFollowGoal()
-		end
-	elseif currentTask == "Health" then
-		return findHealthGoal()
-	elseif currentTask == "Follow" then
-		return findFollowGoal()
-	else
-		Log:Debug("Unknown task: %s", currentTask)
-	end
-
-	-- Fallbacks when no goal was found by specific strategies
-	-- 1) Try following a teammate as a generic goal
-	local node, pos = findFollowGoal()
-	if node and pos then
-		return node, pos
-	end
-
-	-- 2) Roaming fallback: pick a reasonable nearby node to move towards
-	if G.Navigation.nodes and next(G.Navigation.nodes) then
-		local startNode = Navigation.GetClosestNode(G.pLocal.Origin)
-		if startNode then
-			local bestNode = nil
-			local bestDist = math.huge
-			for _, candidate in pairs(G.Navigation.nodes) do
-				if candidate and candidate.id ~= startNode.id and candidate.pos then
-					local d = (candidate.pos - G.pLocal.Origin):Length()
-					-- Prefer nodes within 300..1200 units to avoid picking ourselves or too far targets
-					if d > 300 and d < 1200 and d < bestDist then
-						bestDist = d
-						bestNode = candidate
-					end
-				end
-			end
-			if not bestNode then
-				-- If none in preferred band, just pick the closest different node
-				for _, candidate in pairs(G.Navigation.nodes) do
-					if candidate and candidate.id ~= startNode.id and candidate.pos then
-						local d = (candidate.pos - G.pLocal.Origin):Length()
-						if d < bestDist then
-							bestDist = d
-							bestNode = candidate
-						end
-					end
-				end
-			end
-			if bestNode then
-				-- Throttle info log
-				local now = globals.TickCount()
-				G.lastRoamLogTick = G.lastRoamLogTick or 0
-				if now - G.lastRoamLogTick > 60 then
-					Log:Info("Using roaming fallback to node %d (dist=%.0f)", bestNode.id, bestDist)
-					G.lastRoamLogTick = now
-				end
-				return bestNode, bestNode.pos
-			end
-		end
-	end
-
-	-- Nothing found
-	return nil
-end
-
-return GoalFinder
 
 end)
 __bundle_register("NavBot.Algorithms.Greedy", function(require, _LOADED, __bundle_register, __bundle_modules)

@@ -97,13 +97,9 @@ local function onCreateMove(userCmd)
 	elseif G.currentState == G.States.FOLLOWING then
 		StateHandler.handleFollowingState(userCmd)
 	elseif G.currentState == G.States.STUCK then
-		-- Only run stuck logic if walking is enabled (manual override mode = no stuck logic)
-		if G.Menu.Main.EnableWalking then
-			StateHandler.handleStuckState(userCmd)
-		else
-			-- Manual mode: just transition back to MOVING, skipping still works
-			G.currentState = G.States.MOVING
-		end
+		-- Legacy state: keep walking, repath handled from MOVING.checkStuckState now
+		G.currentState = G.States.MOVING
+		MovementDecisions.handleMovingState(userCmd)
 	end
 
 	-- Work management
