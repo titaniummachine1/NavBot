@@ -257,37 +257,6 @@ local function OnDrawMenu()
 		TimMenu.EndSector()
 		TimMenu.NextLine()
 
-		-- ISWalkable Test Section
-		TimMenu.BeginSector("ISWalkable Test")
-
-		-- Initialize ISWalkableTest menu variables
-		if G.Menu.Visuals.ISWalkableTest == nil then
-			G.Menu.Visuals.ISWalkableTest = false
-		end
-
-		G.Menu.Visuals.ISWalkableTest = TimMenu.Checkbox("ISWalkable Test", G.Menu.Visuals.ISWalkableTest)
-		TimMenu.Tooltip("Enable ISWalkable testing suite (hold SHIFT to set target position)")
-		TimMenu.NextLine()
-
-		TimMenu.EndSector()
-		TimMenu.NextLine()
-
-		-- Optimized ISWalkable Test Section
-		TimMenu.BeginSector("Optimized ISWalkable Test")
-
-		-- Initialize OptimizedISWalkableTest menu variables
-		if G.Menu.Visuals.OptimizedISWalkableTest == nil then
-			G.Menu.Visuals.OptimizedISWalkableTest = false
-		end
-
-		G.Menu.Visuals.OptimizedISWalkableTest =
-			TimMenu.Checkbox("Optimized ISWalkable Test", G.Menu.Visuals.OptimizedISWalkableTest)
-		TimMenu.Tooltip("EXPERIMENTAL: Navmesh-optimized ISWalkable (hold F to test)")
-		TimMenu.NextLine()
-
-		TimMenu.EndSector()
-		TimMenu.NextLine()
-
 		-- IsNavigable Test Section
 		TimMenu.BeginSector("IsNavigable Test")
 
@@ -298,6 +267,14 @@ local function OnDrawMenu()
 
 		G.Menu.Visuals.IsNavigableTest = TimMenu.Checkbox("IsNavigable Test", G.Menu.Visuals.IsNavigableTest)
 		TimMenu.Tooltip("Press F to place target point, then walk away to test navigability")
+		TimMenu.NextLine()
+
+		if G.Menu.Visuals.IsNavigableTestDoorsOnly == nil then
+			G.Menu.Visuals.IsNavigableTestDoorsOnly = false
+		end
+		G.Menu.Visuals.IsNavigableTestDoorsOnly =
+			TimMenu.Checkbox("Doors Only Portal", G.Menu.Visuals.IsNavigableTestDoorsOnly)
+		TimMenu.Tooltip("Portal check uses door hitbox (±12) instead of full shared edge overlap")
 		TimMenu.NextLine()
 
 		TimMenu.EndSector()

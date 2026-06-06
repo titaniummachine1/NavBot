@@ -70,8 +70,6 @@ local HealthLogic = require("NavBot.Bot.HealthLogic")
 
 --[[ Additional Systems ]]
 local SmartJump = require("NavBot.Bot.SmartJump")
-require("NavBot.Bot.ISWalkableTest")
-require("NavBot.Bot.OptimizedISWalkableTest")
 require("NavBot.Bot.IsNavigableTest")
 require("NavBot.Visuals")
 require("NavBot.Utils.Config")
@@ -623,37 +621,6 @@ local function OnDrawMenu()
 		TimMenu.EndSector()
 		TimMenu.NextLine()
 
-		-- ISWalkable Test Section
-		TimMenu.BeginSector("ISWalkable Test")
-
-		-- Initialize ISWalkableTest menu variables
-		if G.Menu.Visuals.ISWalkableTest == nil then
-			G.Menu.Visuals.ISWalkableTest = false
-		end
-
-		G.Menu.Visuals.ISWalkableTest = TimMenu.Checkbox("ISWalkable Test", G.Menu.Visuals.ISWalkableTest)
-		TimMenu.Tooltip("Enable ISWalkable testing suite (hold SHIFT to set target position)")
-		TimMenu.NextLine()
-
-		TimMenu.EndSector()
-		TimMenu.NextLine()
-
-		-- Optimized ISWalkable Test Section
-		TimMenu.BeginSector("Optimized ISWalkable Test")
-
-		-- Initialize OptimizedISWalkableTest menu variables
-		if G.Menu.Visuals.OptimizedISWalkableTest == nil then
-			G.Menu.Visuals.OptimizedISWalkableTest = false
-		end
-
-		G.Menu.Visuals.OptimizedISWalkableTest =
-			TimMenu.Checkbox("Optimized ISWalkable Test", G.Menu.Visuals.OptimizedISWalkableTest)
-		TimMenu.Tooltip("EXPERIMENTAL: Navmesh-optimized ISWalkable (hold F to test)")
-		TimMenu.NextLine()
-
-		TimMenu.EndSector()
-		TimMenu.NextLine()
-
 		-- IsNavigable Test Section
 		TimMenu.BeginSector("IsNavigable Test")
 
@@ -664,6 +631,14 @@ local function OnDrawMenu()
 
 		G.Menu.Visuals.IsNavigableTest = TimMenu.Checkbox("IsNavigable Test", G.Menu.Visuals.IsNavigableTest)
 		TimMenu.Tooltip("Press F to place target point, then walk away to test navigability")
+		TimMenu.NextLine()
+
+		if G.Menu.Visuals.IsNavigableTestDoorsOnly == nil then
+			G.Menu.Visuals.IsNavigableTestDoorsOnly = false
+		end
+		G.Menu.Visuals.IsNavigableTestDoorsOnly =
+			TimMenu.Checkbox("Doors Only Portal", G.Menu.Visuals.IsNavigableTestDoorsOnly)
+		TimMenu.Tooltip("Portal check uses door hitbox (±12) instead of full shared edge overlap")
 		TimMenu.NextLine()
 
 		TimMenu.EndSector()
@@ -868,7 +843,8 @@ defaultconfig = {
 		showNodeIds = false, -- Show node ID numbers for debugging
 		showAgentBoxes = false, -- Show agent boxes
 		showSmartJump = false, -- Show SmartJump hitbox and trajectory visualization
-		ISWalkableTest = false, -- ISWalkable test suite toggle
+		IsNavigableTest = false,
+		IsNavigableTestDoorsOnly = false,
 		Debug_Mode = false, -- Master debug toggle for visuals and debug logging
 	},
 	Movement = {
@@ -2185,7 +2161,6 @@ __bundle_register("NavBot.Visuals", function(require, _LOADED, __bundle_register
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
-local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local MathUtils = require("NavBot.Utils.MathUtils")
 
 local Visuals = {}
@@ -3002,9 +2977,6 @@ local function OnDraw()
 			end
 		end
 	end
-
-	-- Draw PathValidator debug traces if enabled
-	PathValidator.DrawDebugTraces()
 end
 
 --[[ Callbacks ]]
@@ -3304,259 +3276,6 @@ function MathUtils.RoundTo(value, decimals)
 end
 
 return MathUtils
-
-end)
-__bundle_register("NavBot.Navigation.isWalkable.IsWalkable", function(require, _LOADED, __bundle_register, __bundle_modules)
--- Path Validation Module - Uses trace hulls to check if path A→B is walkable
--- This is NOT movement execution, just validation logic
--- Ported from A_standstillDummy.lua (working reference implementation)
-local PathValidator = {}
-local G = require("NavBot.Core.Globals")
-local Common = require("NavBot.Core.Common")
-
--- Constants
-local PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
-local MaxSpeed = 450
-local STEP_HEIGHT = 18
-local STEP_HEIGHT_Vector = Vector3(0, 0, STEP_HEIGHT)
-local MAX_FALL_DISTANCE = 250
-local MAX_FALL_DISTANCE_Vector = Vector3(0, 0, MAX_FALL_DISTANCE)
-local STEP_FRACTION = STEP_HEIGHT / MAX_FALL_DISTANCE
-local UP_VECTOR = Vector3(0, 0, 1)
-local MIN_STEP_SIZE = MaxSpeed * globals.TickInterval()
-local MAX_SURFACE_ANGLE = 45
-local MAX_ITERATIONS = 37
-
--- Debug mode: set at load time, never changes
-local DEBUG_TRACES = false
-
--- Debug storage
-local hullTraces = {}
-local lineTraces = {}
-local currentTickLogged = -1
-
--- Trace functions (set at load based on DEBUG_TRACES)
-local TraceHullFunc
-local TraceLineFunc
-
--- Wrap trace hull to log positions for debug visualization
-local function traceHullWrapper(startPos, endPos, minHull, maxHull, mask, filter)
-	local currentTick = globals.TickCount()
-
-	if currentTick > currentTickLogged then
-		hullTraces = {}
-		lineTraces = {}
-		currentTickLogged = currentTick
-	end
-
-	local result = engine.TraceHull(startPos, endPos, minHull, maxHull, mask, filter)
-
-	table.insert(hullTraces, {
-		startPos = startPos,
-		endPos = result.endpos,
-		tick = currentTick,
-	})
-
-	return result
-end
-
--- Wrap trace line to log positions for debug visualization
-local function traceLineWrapper(startPos, endPos, mask, filter)
-	local currentTick = globals.TickCount()
-
-	if currentTick > currentTickLogged then
-		hullTraces = {}
-		lineTraces = {}
-		currentTickLogged = currentTick
-	end
-
-	local result = engine.TraceLine(startPos, endPos, mask, filter)
-
-	table.insert(lineTraces, {
-		startPos = startPos,
-		endPos = result.endpos,
-		tick = currentTick,
-	})
-
-	return result
-end
-
--- Initialize trace functions based on debug mode at load time
-if DEBUG_TRACES then
-	TraceHullFunc = traceHullWrapper
-	TraceLineFunc = traceLineWrapper
-else
-	TraceHullFunc = engine.TraceHull
-	TraceLineFunc = engine.TraceLine
-end
-
--- Filter function for traces
-local function shouldHitEntity(entity)
-	local pLocal = G.pLocal and G.pLocal.entity
-	return entity ~= pLocal
-end
-
-local function Normalize(vec)
-	return vec / vec:Length()
-end
-
-local function getHorizontalManhattanDistance(point1, point2)
-	return math.abs(point1.x - point2.x) + math.abs(point1.y - point2.y)
-end
-
--- Adjust the direction vector to align with the surface normal
-local function adjustDirectionToSurface(direction, surfaceNormal)
-	direction = Normalize(direction)
-	local angle = math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
-
-	if angle > MAX_SURFACE_ANGLE then
-		return direction
-	end
-
-	local dotProduct = direction:Dot(surfaceNormal)
-	direction.z = direction.z - surfaceNormal.z * dotProduct
-
-	return Normalize(direction)
-end
-
--- Main walkability check - ported from A_standstillDummy.lua
-function PathValidator.IsWalkable(startPos, goalPos)
-	-- Clear trace tables for debugging
-	hullTraces = {}
-	lineTraces = {}
-	local blocked = false
-
-	-- Initialize variables
-	local currentPos = startPos
-
-	-- Adjust start position to ground level
-	local startGroundTrace = TraceHullFunc(
-		startPos + STEP_HEIGHT_Vector,
-		startPos - MAX_FALL_DISTANCE_Vector,
-		PLAYER_HULL.Min,
-		PLAYER_HULL.Max,
-		MASK_PLAYERSOLID,
-		shouldHitEntity
-	)
-
-	currentPos = startGroundTrace.endpos
-
-	-- Initial direction towards goal, adjusted for ground normal
-	local lastPos = currentPos
-	local lastDirection = adjustDirectionToSurface(goalPos - currentPos, startGroundTrace.plane)
-
-	local MaxDistance = getHorizontalManhattanDistance(startPos, goalPos)
-
-	-- Main loop to iterate towards the goal
-	for iteration = 1, MAX_ITERATIONS do
-		-- Calculate distance to goal and update direction
-		local distanceToGoal = (currentPos - goalPos):Length()
-		local direction = lastDirection
-
-		-- Calculate next position
-		local NextPos = lastPos + direction * distanceToGoal
-
-		-- Forward collision check
-		local wallTrace = TraceHullFunc(
-			lastPos + STEP_HEIGHT_Vector,
-			NextPos + STEP_HEIGHT_Vector,
-			PLAYER_HULL.Min,
-			PLAYER_HULL.Max,
-			MASK_PLAYERSOLID,
-			shouldHitEntity
-		)
-		currentPos = wallTrace.endpos
-
-		if wallTrace.fraction == 0 then
-			blocked = true -- Path is blocked by a wall
-		end
-
-		-- Ground collision with segmentation
-		local totalDistance = (currentPos - lastPos):Length()
-		local numSegments = math.max(1, math.floor(totalDistance / MIN_STEP_SIZE))
-
-		for seg = 1, numSegments do
-			local t = seg / numSegments
-			local segmentPos = lastPos + (currentPos - lastPos) * t
-			local segmentTop = segmentPos + STEP_HEIGHT_Vector
-			local segmentBottom = segmentPos - MAX_FALL_DISTANCE_Vector
-
-			local groundTrace = TraceHullFunc(
-				segmentTop,
-				segmentBottom,
-				PLAYER_HULL.Min,
-				PLAYER_HULL.Max,
-				MASK_PLAYERSOLID,
-				shouldHitEntity
-			)
-
-			if groundTrace.fraction == 1 then
-				return false -- No ground beneath; path is unwalkable
-			end
-
-			if groundTrace.fraction > STEP_FRACTION or seg == numSegments then
-				-- Adjust position to ground
-				direction = adjustDirectionToSurface(direction, groundTrace.plane)
-				currentPos = groundTrace.endpos
-				blocked = false
-				break
-			end
-		end
-
-		-- Calculate current horizontal distance to goal
-		local currentDistance = getHorizontalManhattanDistance(currentPos, goalPos)
-		if blocked or currentDistance > MaxDistance then
-			return false
-		elseif currentDistance < 24 then
-			local verticalDist = math.abs(goalPos.z - currentPos.z)
-			if verticalDist < 24 then
-				return true -- Goal is within reach; path is walkable
-			else
-				return false -- Goal is too far vertically; path is unwalkable
-			end
-		end
-
-		-- Prepare for the next iteration
-		lastPos = currentPos
-		lastDirection = direction
-	end
-
-	return false -- Max iterations reached without finding a path
-end
-
--- Debug visualization - call once per frame
-function PathValidator.DrawDebugTraces()
-	if not DEBUG_TRACES then
-		return
-	end
-
-	-- Draw hull traces as blue arrows
-	for _, trace in ipairs(hullTraces) do
-		if trace.startPos and trace.endPos then
-			draw.Color(0, 50, 255, 255)
-			Common.DrawArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
-		end
-	end
-
-	-- Draw line traces as white lines
-	for _, trace in ipairs(lineTraces) do
-		if trace.startPos and trace.endPos then
-			draw.Color(255, 255, 255, 255)
-			local w2s_start = client.WorldToScreen(trace.startPos)
-			local w2s_end = client.WorldToScreen(trace.endPos)
-			if w2s_start and w2s_end then
-				draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-			end
-		end
-	end
-end
-
--- Toggle debug (for runtime switching if needed)
-function PathValidator.SetDebug(enabled)
-	DEBUG_TRACES = enabled
-end
-
-return PathValidator
 
 end)
 __bundle_register("NavBot.Navigation.Node", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -6234,10 +5953,12 @@ local function OnCreateMove(Cmd)
 
 		if startNode then
 			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+			local doorsOnly = G.Menu.Visuals.IsNavigableTestDoorsOnly == true
 			local testKey = string.format(
-				"%d|%s|%.0f|%.0f|%.0f|%.0f",
+				"%d|%s|%s|%.0f|%.0f|%.0f|%.0f",
 				startNode.id,
 				allowJump and "j" or "w",
+				doorsOnly and "d" or "e",
 				TestState.startPos.x,
 				TestState.startPos.y,
 				TestState.currentPos.x,
@@ -6250,7 +5971,7 @@ local function OnCreateMove(Cmd)
 
 			local startTime, startMemory = BenchmarkStart()
 			TestState.isNavigable =
-				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, true, allowJump)
+				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, doorsOnly, allowJump)
 			Navigable.SetDebugResult(TestState.isNavigable)
 			BenchmarkStop(startTime, startMemory)
 		else
@@ -6288,15 +6009,24 @@ local function OnDraw()
 	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
 	draw.Text(20, 210, string.format("Result: %s", TestState.isNavigable and "NAVIGABLE" or "NOT NAVIGABLE"))
 	draw.Text(20, 240, "Press F to set target | Walk away to test")
+	draw.Text(
+		20,
+		270,
+		string.format(
+			"Portal mode: %s",
+			G.Menu.Visuals.IsNavigableTestDoorsOnly and "Doors Only (±12)" or "Full Edge Overlap"
+		)
+	)
 
 	local debugWps = Navigable.GetDebugWaypoints()
 	if debugWps then
 		draw.Text(
 			20,
-			270,
+			300,
 			string.format("Area waypoints: %d | Hull traces: %d", #debugWps, Navigable.GetDebugHullTraceCount())
 		)
-		draw.Text(20, 300, "Green/red = area path | Blue = clear hull | Red = wall/blocked")
+		draw.Text(20, 330, "Green/red = path | Cyan = edge portal | Gold = door portal")
+		draw.Text(20, 360, "Blue = clear hull | Red = wall/blocked")
 	end
 
 	Navigable.DrawDebugTraces()
@@ -6343,40 +6073,215 @@ return IsNavigableTest
 end)
 __bundle_register("NavBot.Navigation.isWalkable.isNavigable", function(require, _LOADED, __bundle_register, __bundle_modules)
 --[[
-    Simple Ray-Marching Path Validator
-    Like IsWalkable but uses navmesh awareness to minimize traces
+    Back-compat shim — use NavBot.Navigation.Prediction.NavPredict
+    Imported by: Navigation, StateHandler, NodeSkipper, IsNavigableTest
 ]]
 
-local Navigable = {}
+return require("NavBot.Navigation.Prediction.NavPredict")
+
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavPredict", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[
+    NavPredict — straight-line nav-area path prediction
+    Phase 1: portal march (full edge overlap, or door hitbox when doorsOnly)
+    Phase 2: hull traces after Phase 1 succeeds
+    Imported by: isNavigable, Navigation, StateHandler, NodeSkipper, IsNavigableTest
+]]
+
 local G = require("NavBot.Core.Globals")
-local Node = require("NavBot.Navigation.Node")
 local Common = require("NavBot.Core.Common")
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
+local NavGeometry = require("NavBot.Navigation.Prediction.NavGeometry")
+local NavPortal = require("NavBot.Navigation.Prediction.NavPortal")
+local NavTrace = require("NavBot.Navigation.Prediction.NavTrace")
 
--- Constants
-local PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
-local STEP_HEIGHT = 18
-local JUMP_HEIGHT = 72
-local STEP_HEIGHT_Vector = Vector3(0, 0, STEP_HEIGHT)
-local JUMP_HEIGHT_Vector = Vector3(0, 0, JUMP_HEIGHT)
-local FORWARD_STEP = 100 -- Max distance per forward trace
-local HILL_THRESHOLD = 4 -- 0.5x step height for significant elevation changes
+local NavPredict = {}
 
-local MaxSpeed = 450
-local MAX_FALL_DISTANCE = 250
-local MAX_FALL_DISTANCE_Vector = Vector3(0, 0, MAX_FALL_DISTANCE)
-local STEP_FRACTION = STEP_HEIGHT / MAX_FALL_DISTANCE
-local UP_VECTOR = Vector3(0, 0, 1)
-local MIN_STEP_SIZE = MaxSpeed * globals.TickInterval()
-local MAX_SURFACE_ANGLE = 55
-local MAX_ITERATIONS = 37
-local TOLERANCE = 16.0
-local OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
--- Debug
-local DEBUG_MODE = false
-local hullTraces = {}
-local debugWaypoints = nil
-local debugLastResult = nil
-local debugFailLine = nil
+local MAX_ITERATIONS = NavConstants.MAX_ITERATIONS
+local SLOPE_WAYPOINT_Z_DIFF = NavConstants.SLOPE_WAYPOINT_Z_DIFF
+
+local DIR_NAMES = { [1] = "N", [2] = "E", [3] = "S", [4] = "W" }
+
+function NavPredict.CanSkip(startPos, goalPos, startNode, doorsOnly, allowJump)
+	assert(startNode, "CanSkip: startNode required")
+	local nodes = G.Navigation and G.Navigation.nodes
+	assert(nodes, "CanSkip: G.Navigation.nodes is nil")
+
+	NavDebug.BeginRun()
+
+	local currentPos = startPos
+	local currentNode = startNode
+	local waypoints = {}
+
+	local startZ, startNormal = NavGeometry.GetGroundZFromQuad(startPos, startNode)
+	if startZ then
+		currentPos = Vector3(startPos.x, startPos.y, startZ)
+	end
+
+	local pathLineOrigin = Vector3(currentPos.x, currentPos.y, 0)
+	local pathLineDelta = Vector3(goalPos.x - pathLineOrigin.x, goalPos.y - pathLineOrigin.y, 0)
+	if pathLineDelta:Length() < 0.001 then
+		NavDebug.SetResult(false)
+		return false
+	end
+	local pathLineDir = Common.Normalize(pathLineDelta)
+
+	table.insert(waypoints, {
+		pos = currentPos,
+		node = startNode,
+		normal = startNormal,
+	})
+
+	local visitedNodes = {}
+
+	for _iteration = 1, MAX_ITERATIONS do
+		if visitedNodes[currentNode.id] then
+			NavDebug.Log(string.format("[NavPredict] FAIL: Cycle detected at node %d", currentNode.id))
+			NavDebug.SavePath(waypoints)
+			NavDebug.SetResult(false)
+			return false
+		end
+		visitedNodes[currentNode.id] = true
+
+		if NavGeometry.IsPointInNodeBounds(goalPos, currentNode) then
+			local goalZ, goalNormal = NavGeometry.GetGroundZFromQuad(goalPos, currentNode)
+			local goalWpPos = goalZ and Vector3(goalPos.x, goalPos.y, goalZ) or goalPos
+			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = goalNormal })
+			NavDebug.Log(
+				string.format(
+					"[NavPredict] Phase1 SUCCESS: goal in node %d (%d waypoints) — starting Phase2",
+					currentNode.id,
+					#waypoints
+				)
+			)
+			NavDebug.SavePath(waypoints)
+			local navigable = NavTrace.TraceWaypoints(waypoints, allowJump)
+			NavDebug.SetResult(navigable)
+			return navigable
+		end
+
+		local snappedX, snappedY =
+			NavGeometry.ProjectXYOntoGoalLine(currentPos.x, currentPos.y, pathLineOrigin, pathLineDir)
+		local groundZ, _groundNormal =
+			NavGeometry.GetGroundZFromQuad(Vector3(snappedX, snappedY, currentPos.z), currentNode)
+		if groundZ then
+			currentPos = Vector3(snappedX, snappedY, groundZ)
+		else
+			currentPos = Vector3(snappedX, snappedY, currentPos.z)
+		end
+
+		local exitPoint, _exitDist, exitDir = NavGeometry.FindNodeExit(currentPos, pathLineDir, currentNode)
+		if exitPoint then
+			local exitZ = NavGeometry.GetGroundZFromQuad(exitPoint, currentNode)
+			if exitZ then
+				exitPoint = Vector3(exitPoint.x, exitPoint.y, exitZ)
+			end
+		end
+
+		if not exitPoint or not exitDir then
+			NavDebug.Log(string.format("[NavPredict] FAIL: No exit found from node %d", currentNode.id))
+			NavDebug.SavePath(waypoints)
+			NavDebug.SaveFail(currentPos, currentPos + pathLineDir * 50)
+			NavDebug.SetResult(false)
+			return false
+		end
+
+		NavDebug.Log(
+			string.format(
+				"[NavPredict] Exit via %s at (%.1f, %.1f)",
+				DIR_NAMES[exitDir] or "?",
+				exitPoint.x,
+				exitPoint.y
+			)
+		)
+
+		local neighborNode, snappedExit =
+			NavPortal.FindNeighborAtExit(currentNode, exitPoint, exitDir, nodes, doorsOnly == true)
+		if snappedExit then
+			exitPoint = snappedExit
+			local exitZ = NavGeometry.GetGroundZFromQuad(exitPoint, currentNode)
+			if exitZ then
+				exitPoint = Vector3(exitPoint.x, exitPoint.y, exitZ)
+			end
+		end
+		if not neighborNode then
+			NavDebug.SavePath(waypoints)
+			NavDebug.SaveFail(currentPos, exitPoint)
+			NavDebug.SetResult(false)
+			return false
+		end
+
+		local entryX, entryY = NavGeometry.ProjectXYOntoGoalLine(exitPoint.x, exitPoint.y, pathLineOrigin, pathLineDir)
+		local entryZ, entryNormal = NavGeometry.GetGroundZFromQuad(Vector3(entryX, entryY, 0), neighborNode)
+		if not entryZ then
+			NavDebug.Log(string.format("[NavPredict] FAIL: No ground geometry at entry to node %d", neighborNode.id))
+			NavDebug.SavePath(waypoints)
+			NavDebug.SaveFail(currentPos, exitPoint)
+			NavDebug.SetResult(false)
+			return false
+		end
+
+		local entryPos = Vector3(entryX, entryY, entryZ)
+		local zDiff = math.abs(entryZ - currentPos.z)
+		if zDiff > SLOPE_WAYPOINT_Z_DIFF then
+			local exitZ = NavGeometry.GetGroundZFromQuad(exitPoint, currentNode)
+			if exitZ then
+				local exitPos = Vector3(exitPoint.x, exitPoint.y, exitZ)
+				local _, exitNormal = NavGeometry.GetGroundZFromQuad(exitPoint, currentNode)
+				table.insert(waypoints, { pos = exitPos, node = currentNode, normal = exitNormal })
+				NavDebug.Log(string.format("[NavPredict] Added slope waypoint at exit (Z=%.1f)", exitZ))
+			end
+		end
+
+		table.insert(waypoints, { pos = entryPos, node = neighborNode, normal = entryNormal })
+		NavDebug.Log(string.format("[NavPredict] Crossed to node %d (Z=%.1f)", neighborNode.id, entryZ))
+
+		currentPos = entryPos
+		currentNode = neighborNode
+	end
+
+	NavDebug.Log(string.format("[NavPredict] FAIL: Max iterations (%d) exceeded", MAX_ITERATIONS))
+	NavDebug.SavePath(waypoints)
+	NavDebug.SetResult(false)
+	return false
+end
+
+function NavPredict.GetDebugWaypoints()
+	return NavDebug.GetWaypoints()
+end
+
+function NavPredict.GetDebugHullTraceCount()
+	return NavDebug.GetHullTraceCount()
+end
+
+function NavPredict.SetDebugResult(isNavigable)
+	NavDebug.SetResult(isNavigable)
+end
+
+function NavPredict.DrawDebugTraces()
+	NavDebug.Draw()
+end
+
+function NavPredict.SetDebug(enabled)
+	NavDebug.SetEnabled(enabled)
+end
+
+return NavPredict
+
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavTrace", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPredict ]]
+
+local G = require("NavBot.Core.Globals")
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
+
+local NavTrace = {}
+
+local PLAYER_HULL = NavConstants.PLAYER_HULL
+local STEP_HEIGHT = NavConstants.STEP_HEIGHT
+local JUMP_HEIGHT = NavConstants.JUMP_HEIGHT
 
 local engineTraceHull = engine.TraceHull
 
@@ -6385,371 +6290,16 @@ local function shouldHitEntity(entity)
 	return entity ~= pLocal
 end
 
-local function traceHullWrapper(startPos, endPos, minHull, maxHull, mask, filter)
-	local result = engineTraceHull(startPos, endPos, minHull, maxHull, mask, filter)
-	local blocked = result.fraction < 0.999
-	table.insert(hullTraces, {
-		startPos = startPos,
-		endPos = result.endpos,
-		blocked = blocked,
-	})
-	return result
-end
-
-local function getTraceHull()
-	if DEBUG_MODE then
-		return traceHullWrapper
-	end
-	return engineTraceHull
-end
-
-local function snapshotWaypoints(waypoints)
-	local snapshot = {}
-	for i = 1, #waypoints do
-		local wp = waypoints[i]
-		snapshot[i] = {
-			pos = wp.pos,
-			nodeId = wp.node and wp.node.id or nil,
-		}
-	end
-	return snapshot
-end
-
-local function saveDebugPath(waypoints)
-	if not DEBUG_MODE then
-		return
-	end
-	debugWaypoints = snapshotWaypoints(waypoints)
-end
-
-local function setDebugResult(isNavigable)
-	if DEBUG_MODE then
-		debugLastResult = isNavigable == true
-	end
-end
-
-local function isDebugLogMuted()
-	return engine.Con_IsVisible() or engine.IsGameUIVisible()
-end
-
-local function debugLog(message)
-	if not DEBUG_MODE or isDebugLogMuted() then
-		return
-	end
-	print(message)
-end
-
-local function saveDebugFail(fromPos, toPos)
-	if not DEBUG_MODE or not fromPos or not toPos then
-		return
-	end
-	debugFailLine = { from = fromPos, to = toPos }
-end
-
-local function setPathDrawColor(isNavigable)
-	if isNavigable then
-		draw.Color(0, 255, 0, 255)
-	else
-		draw.Color(255, 0, 0, 255)
-	end
-end
-
-local function drawWorldLine(a, b)
-	local w2sA = client.WorldToScreen(a)
-	local w2sB = client.WorldToScreen(b)
-	if w2sA and w2sB then
-		draw.Line(w2sA[1], w2sA[2], w2sB[1], w2sB[2])
-	end
-end
-
--- Helper: Get surface angle from normal-- curently unused
-local function getSurfaceAngle(surfaceNormal)
-	if not surfaceNormal then
-		return 0
-	end
-	return math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
-end
-
--- Keep XY bearing fixed; only add pitch (Z) from the surface normal
-local function applyPitchToSurface(horizDir, surfaceNormal)
-	local flat = Vector3(horizDir.x, horizDir.y, 0)
-	if flat:Length() < 0.001 then
-		return horizDir
-	end
-	flat = Common.Normalize(flat)
-
-	if not surfaceNormal then
-		return flat
-	end
-
-	local angle = math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
-	if angle > MAX_SURFACE_ANGLE then
-		return flat
-	end
-
-	local nx, ny, nz = surfaceNormal.x, surfaceNormal.y, surfaceNormal.z
-	if math.abs(nz) < 0.001 then
-		return flat
-	end
-
-	local dz = -(nx * flat.x + ny * flat.y) / nz
-	return Common.Normalize(Vector3(flat.x, flat.y, dz))
-end
-
-local function projectXYOntoGoalLine(x, y, lineOrigin, lineDir)
-	local px = x - lineOrigin.x
-	local py = y - lineOrigin.y
-	local along = px * lineDir.x + py * lineDir.y
-	return lineOrigin.x + lineDir.x * along, lineOrigin.y + lineDir.y * along
-end
-
--- Find where ray exits node bounds
--- Returns: exitPoint, exitDist, exitDir (1=N, 2=E, 3=S, 4=W)
-local function findNodeExit(startPos, dir, node)
-	local minX, maxX = node._minX, node._maxX
-	local minY, maxY = node._minY, node._maxY
-
-	local tMin = math.huge
-	local exitX, exitY
-	local exitDir = nil
-
-	-- Check X boundaries
-	if dir.x > 0 then
-		local t = (maxX - startPos.x) / dir.x
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = maxX
-			exitY = startPos.y + dir.y * t
-			exitDir = 2 -- East
-		end
-	elseif dir.x < 0 then
-		local t = (minX - startPos.x) / dir.x
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = minX
-			exitY = startPos.y + dir.y * t
-			exitDir = 4 -- West
-		end
-	end
-
-	-- Check Y boundaries
-	if dir.y > 0 then
-		local t = (maxY - startPos.y) / dir.y
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = startPos.x + dir.x * t
-			exitY = maxY
-			exitDir = 3 -- South
-		end
-	elseif dir.y < 0 then
-		local t = (minY - startPos.y) / dir.y
-		if t > 0 and t < tMin then
-			tMin = t
-			exitX = startPos.x + dir.x * t
-			exitY = minY
-			exitDir = 1 -- North
-		end
-	end
-
-	if tMin == math.huge then
-		return nil, nil, nil
-	end
-	return Vector3(exitX, exitY, startPos.z), tMin, exitDir
-end
-
--- Calculate ground Z position from node quad geometry (no engine call)
-local function getGroundZFromQuad(pos, node)
-	if not (node.nw and node.ne and node.sw and node.se) then
-		return nil, nil
-	end
-
-	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
-
-	-- Determine which triangle contains the point
-	-- Split quad into: Triangle1(nw,ne,se) and Triangle2(nw,se,sw)
-	local dx = pos.x - nw.x
-	local dy = pos.y - nw.y
-	local dx_ne = ne.x - nw.x
-	local dy_se = se.y - nw.y
-
-	local inTriangle1 = (dx / dx_ne + dy / dy_se) <= 1.0
-
-	local v0, v1, v2
-	if inTriangle1 then
-		-- Triangle: nw, ne, se
-		v0, v1, v2 = nw, ne, se
-	else
-		-- Triangle: nw, se, sw
-		v0, v1, v2 = nw, se, sw
-	end
-
-	-- Barycentric interpolation for Z
-	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
-	if math.abs(denom) < 0.0001 then
-		return v0.z, UP_VECTOR -- Degenerate triangle, use first vertex
-	end
-
-	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
-	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
-	local w2 = 1.0 - w0 - w1
-
-	local z = w0 * v0.z + w1 * v1.z + w2 * v2.z
-
-	-- Calculate normal from cross product
-	local edge1 = v1 - v0
-	local edge2 = v2 - v0
-	local normal = edge1:Cross(edge2)
-	normal = Common.Normalize(normal)
-	if not normal then
-		normal = UP_VECTOR
-	end
-
-	return z, normal
-end
-
--- Helper: Check if horizontal point is within node bounds (with tolerance)
-local function isPointInNodeBounds(point, node, tolerance)
-	tolerance = tolerance or 0
-	local inX = point.x >= (node._minX - tolerance) and point.x <= (node._maxX + tolerance)
-	local inY = point.y >= (node._minY - tolerance) and point.y <= (node._maxY + tolerance)
-	return inX and inY
-end
-
-local function isAreaNode(node)
-	return node and node._minX and node._maxX and node._minY and node._maxY
-end
-
--- Min/max on the axis that varies along the facing wall (shared axis between areas)
-local function getFacingEdgeSpan(area, exitDir)
-	local nw, ne, sw, se = area.nw, area.ne, area.sw, area.se
-	if nw and ne and sw and se then
-		if exitDir == 2 then
-			return math.min(ne.y, se.y), math.max(ne.y, se.y)
-		elseif exitDir == 4 then
-			return math.min(nw.y, sw.y), math.max(nw.y, sw.y)
-		elseif exitDir == 3 then
-			return math.min(sw.x, se.x), math.max(sw.x, se.x)
-		elseif exitDir == 1 then
-			return math.min(nw.x, ne.x), math.max(nw.x, ne.x)
-		end
-	end
-
-	if exitDir == 2 or exitDir == 4 then
-		return area._minY, area._maxY
-	end
-	return area._minX, area._maxX
-end
-
--- Overlap of both facing edges on the shared axis — the real walkable portal
-local function getSharedPortalSpan(currentNode, neighborNode, exitDir)
-	local aMin, aMax = getFacingEdgeSpan(currentNode, exitDir)
-	local oppDir = OPPOSITE_EXIT_DIR[exitDir]
-	local bMin, bMax = getFacingEdgeSpan(neighborNode, oppDir)
-	local portalMin = math.max(aMin, bMin)
-	local portalMax = math.min(aMax, bMax)
-	if portalMax <= portalMin then
-		return nil, nil
-	end
-	return portalMin, portalMax
-end
-
-local function getSharedAxisCoord(point, exitDir)
-	if exitDir == 2 or exitDir == 4 then
-		return point.y
-	end
-	return point.x
-end
-
-local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
-	local coord = getSharedAxisCoord(exitPoint, exitDir)
-	return coord >= portalMin and coord <= portalMax
-end
-
-local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
-	local targetId = (type(connection) == "table") and (connection.node or connection.id) or connection
-	local target = nodes[targetId]
-	if not target then
-		return nil
-	end
-
-	if isAreaNode(target) then
-		if target.id ~= currentNodeId then
-			return target
-		end
-		return nil
-	end
-
-	-- Door id encodes the two areas: "4053_4224_left"
-	local pair = string.match(tostring(targetId), "^(%d+_%d+)_")
-	if pair then
-		local areaA, areaB = string.match(pair, "^(%d+)_(%d+)$")
-		if areaA and areaB then
-			areaA = tonumber(areaA)
-			areaB = tonumber(areaB)
-			if areaA == currentNodeId then
-				return nodes[areaB]
-			end
-			if areaB == currentNodeId then
-				return nodes[areaA]
-			end
-		end
-	end
-
-	return nil
-end
-
--- Phase 1: exit coord inside shared-axis edge overlap for a connected neighbor
-local function findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
-	local dirData = currentNode.c[exitDir]
-	if not dirData or not dirData.connections then
-		return nil
-	end
-
-	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
-	local checkedNeighborIds = {}
-
-	for i = 1, #dirData.connections do
-		local connection = dirData.connections[i]
-		local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
-		if neighborArea and not checkedNeighborIds[neighborArea.id] then
-			checkedNeighborIds[neighborArea.id] = true
-			local portalMin, portalMax = getSharedPortalSpan(currentNode, neighborArea, exitDir)
-			if portalMin and isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
-				debugLog(
-					string.format(
-						"[IsNavigable]   Portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
-						exitDir,
-						neighborArea.id,
-						exitCoord,
-						portalMin,
-						portalMax
-					)
-				)
-				return neighborArea
-			end
-			if portalMin then
-				debugLog(
-					string.format(
-						"[IsNavigable]   Skip area=%d: coord=%.1f outside [%.1f,%.1f]",
-						neighborArea.id,
-						exitCoord,
-						portalMin,
-						portalMax
-					)
-				)
-			end
-		end
-	end
-
-	debugLog(string.format("[IsNavigable] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
-	return nil
-end
-
 local function runTraceHull(startPos, endPos)
-	return getTraceHull()(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
+	if NavDebug.IsEnabled() then
+		local result =
+			engineTraceHull(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
+		NavDebug.RecordHullTrace(startPos, result.endpos, result.fraction < 0.999)
+		return result
+	end
+	return engineTraceHull(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
 end
 
--- One hull trace across a segment (step height, optional jump retry)
 local function traceOneBigSegment(startPos, endPos, _startNormal, allowJump)
 	local toTarget = endPos - startPos
 	if toTarget:Length() < 0.001 then
@@ -6769,7 +6319,9 @@ local function traceOneBigSegment(startPos, endPos, _startNormal, allowJump)
 			return true
 		end
 		if stepIndex < #stepHeights then
-			debugLog(string.format("[IsNavigable] Segment blocked at step %d, trying jump...", stepHeights[stepIndex]))
+			NavDebug.Log(
+				string.format("[NavPredict] Segment blocked at step %d, trying jump...", stepHeights[stepIndex])
+			)
 		end
 	end
 
@@ -6783,8 +6335,7 @@ local function getWaypointNodeId(waypoint)
 	return nil
 end
 
--- Phase 2 only: hull traces after Phase 1 built the full area path
-local function traceWaypoints(waypoints, allowJump)
+function NavTrace.TraceWaypoints(waypoints, allowJump)
 	local traceCount = 0
 	local index = 1
 
@@ -6804,9 +6355,9 @@ local function traceWaypoints(waypoints, allowJump)
 		local fromWp = waypoints[nodeStartIndex]
 		local toWp = waypoints[nodeEndIndex]
 
-		debugLog(
+		NavDebug.Log(
 			string.format(
-				"[IsNavigable] Phase2 node trace %s -> %s (node %s)",
+				"[NavPredict] Phase2 node trace %s -> %s (node %s)",
 				tostring(nodeStartIndex),
 				tostring(nodeEndIndex),
 				tostring(nodeId)
@@ -6814,8 +6365,8 @@ local function traceWaypoints(waypoints, allowJump)
 		)
 
 		if not traceOneBigSegment(fromWp.pos, toWp.pos, fromWp.normal, allowJump) then
-			debugLog(string.format("[IsNavigable] FAIL: Phase2 node %s segment blocked", tostring(nodeId)))
-			saveDebugFail(fromWp.pos, toWp.pos)
+			NavDebug.Log(string.format("[NavPredict] FAIL: Phase2 node %s segment blocked", tostring(nodeId)))
+			NavDebug.SaveFail(fromWp.pos, toWp.pos)
 			return false
 		end
 		traceCount = traceCount + 1
@@ -6824,23 +6375,19 @@ local function traceWaypoints(waypoints, allowJump)
 			local nextWp = waypoints[nodeEndIndex + 1]
 			local nextNodeId = getWaypointNodeId(nextWp)
 			if nextNodeId ~= nodeId then
-				debugLog(
-					string.format(
-						"[IsNavigable] Phase2 boundary trace %s -> %s",
-						tostring(nodeId),
-						tostring(nextNodeId)
-					)
+				NavDebug.Log(
+					string.format("[NavPredict] Phase2 boundary trace %s -> %s", tostring(nodeId), tostring(nextNodeId))
 				)
 
 				if not traceOneBigSegment(toWp.pos, nextWp.pos, toWp.normal, allowJump) then
-					debugLog(
+					NavDebug.Log(
 						string.format(
-							"[IsNavigable] FAIL: Phase2 boundary %s -> %s blocked",
+							"[NavPredict] FAIL: Phase2 boundary %s -> %s blocked",
 							tostring(nodeId),
 							tostring(nextNodeId)
 						)
 					)
-					saveDebugFail(toWp.pos, nextWp.pos)
+					NavDebug.SaveFail(toWp.pos, nextWp.pos)
 					return false
 				end
 				traceCount = traceCount + 1
@@ -6850,184 +6397,140 @@ local function traceWaypoints(waypoints, allowJump)
 		index = nodeEndIndex + 1
 	end
 
-	debugLog(string.format("[IsNavigable] Phase2 SUCCESS: %d hull traces (%d waypoints)", traceCount, #waypoints))
-
+	NavDebug.Log(string.format("[NavPredict] Phase2 SUCCESS: %d hull traces (%d waypoints)", traceCount, #waypoints))
 	return true
 end
 
--- MAIN FUNCTION - Phase 1: portal march only; Phase 2: hull traces if Phase 1 succeeds
--- allowJump: if true, will use jump height (72) when step height (18) fails
-function Navigable.CanSkip(startPos, goalPos, startNode, respectDoors, allowJump)
-	assert(startNode, "CanSkip: startNode required")
-	local nodes = G.Navigation and G.Navigation.nodes
-	assert(nodes, "CanSkip: G.Navigation.nodes is nil")
+return NavTrace
 
-	if DEBUG_MODE then
-		hullTraces = {}
-		debugFailLine = nil
-	end
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavDebug", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPortal, NavTrace, NavPredict, isNavigable ]]
 
-	-- ============ PHASE 1: Verify path through nodes ============
-	local currentPos = startPos
-	local currentNode = startNode
-	local waypoints = {} -- Waypoints for Phase 2
+local Common = require("NavBot.Core.Common")
 
-	-- Get starting ground Z
-	local startZ, startNormal = getGroundZFromQuad(startPos, startNode)
-	if startZ then
-		currentPos = Vector3(startPos.x, startPos.y, startZ)
-	end
+local NavDebug = {}
 
-	-- Fixed XY bearing toward goal for the whole march (no horizontal bending)
-	local pathLineOrigin = Vector3(currentPos.x, currentPos.y, 0)
-	local pathLineDelta = Vector3(goalPos.x - pathLineOrigin.x, goalPos.y - pathLineOrigin.y, 0)
-	if pathLineDelta:Length() < 0.001 then
-		setDebugResult(false)
-		return false
-	end
-	local pathLineDir = Common.Normalize(pathLineDelta)
+local enabled = false
+local hullTraces = {}
+local portalSpans = {}
+local debugWaypoints = nil
+local debugLastResult = nil
+local debugFailLine = nil
 
-	-- Add start waypoint
-	table.insert(waypoints, {
-		pos = currentPos,
-		node = startNode,
-		normal = startNormal,
-	})
-
-	local visitedNodes = {}
-
-	-- Traverse to destination (no traces - just verify path exists)
-	for iteration = 1, MAX_ITERATIONS do
-		if visitedNodes[currentNode.id] then
-			debugLog(string.format("[IsNavigable] FAIL: Cycle detected at node %d", currentNode.id))
-			saveDebugPath(waypoints)
-			setDebugResult(false)
-			return false
-		end
-		visitedNodes[currentNode.id] = true
-
-		-- Check if goal reached (Phase 1 done — run Phase 2 traces)
-		if isPointInNodeBounds(goalPos, currentNode) then
-			local goalZ, goalNormal = getGroundZFromQuad(goalPos, currentNode)
-			local goalWpPos = goalZ and Vector3(goalPos.x, goalPos.y, goalZ) or goalPos
-			table.insert(waypoints, { pos = goalWpPos, node = currentNode, normal = goalNormal })
-			debugLog(
-				string.format(
-					"[IsNavigable] Phase1 SUCCESS: goal in node %d (%d waypoints) — starting Phase2",
-					currentNode.id,
-					#waypoints
-				)
-			)
-			saveDebugPath(waypoints)
-			local navigable = traceWaypoints(waypoints, allowJump)
-			setDebugResult(navigable)
-			return navigable
-		end
-
-		-- Snap XY onto the fixed goal line (pitch/Z comes from nav quad only)
-		local snappedX, snappedY = projectXYOntoGoalLine(currentPos.x, currentPos.y, pathLineOrigin, pathLineDir)
-		local groundZ, groundNormal = getGroundZFromQuad(Vector3(snappedX, snappedY, currentPos.z), currentNode)
-		if groundZ then
-			currentPos = Vector3(snappedX, snappedY, groundZ)
-		else
-			currentPos = Vector3(snappedX, snappedY, currentPos.z)
-		end
-
-		local exitPoint, exitDist, exitDir = findNodeExit(currentPos, pathLineDir, currentNode)
-
-		if exitPoint then
-			local exitZ = getGroundZFromQuad(exitPoint, currentNode)
-			if exitZ then
-				exitPoint = Vector3(exitPoint.x, exitPoint.y, exitZ)
-			end
-		end
-
-		if not exitPoint or not exitDir then
-			debugLog(string.format("[IsNavigable] FAIL: No exit found from node %d", currentNode.id))
-			saveDebugPath(waypoints)
-			saveDebugFail(currentPos, currentPos + pathLineDir * 50)
-			setDebugResult(false)
-			return false
-		end
-
-		local dirNames = { [1] = "N", [2] = "E", [3] = "S", [4] = "W" }
-		debugLog(
-			string.format(
-				"[IsNavigable] Exit via %s at (%.1f, %.1f)",
-				dirNames[exitDir] or "?",
-				exitPoint.x,
-				exitPoint.y
-			)
-		)
-
-		-- Find neighbor
-		local neighborNode = findNeighborAtExit(currentNode, exitPoint, exitDir, nodes)
-
-		if not neighborNode then
-			saveDebugPath(waypoints)
-			saveDebugFail(currentPos, exitPoint)
-			setDebugResult(false)
-			return false
-		end
-
-		-- Entry stays on the shared edge / goal line (no independent X/Y clamping)
-		local entryX, entryY = projectXYOntoGoalLine(exitPoint.x, exitPoint.y, pathLineOrigin, pathLineDir)
-		local entryZ, entryNormal = getGroundZFromQuad(Vector3(entryX, entryY, 0), neighborNode)
-
-		if not entryZ then
-			debugLog(string.format("[IsNavigable] FAIL: No ground geometry at entry to node %d", neighborNode.id))
-			saveDebugPath(waypoints)
-			saveDebugFail(currentPos, exitPoint)
-			setDebugResult(false)
-			return false
-		end
-
-		local entryPos = Vector3(entryX, entryY, entryZ)
-
-		-- Add intermediate waypoint if Z changes significantly (for slopes/hills)
-		local zDiff = math.abs(entryZ - currentPos.z)
-		if zDiff > 8 then
-			-- Create intermediate waypoint at exit point with interpolated Z
-			local exitZ = getGroundZFromQuad(exitPoint, currentNode)
-			if exitZ then
-				local exitPos = Vector3(exitPoint.x, exitPoint.y, exitZ)
-				local _, exitNormal = getGroundZFromQuad(exitPoint, currentNode)
-				table.insert(waypoints, { pos = exitPos, node = currentNode, normal = exitNormal })
-				debugLog(string.format("[IsNavigable] Added slope waypoint at exit (Z=%.1f)", exitZ))
-			end
-		end
-
-		table.insert(waypoints, { pos = entryPos, node = neighborNode, normal = entryNormal })
-
-		debugLog(string.format("[IsNavigable] Crossed to node %d (Z=%.1f)", neighborNode.id, entryZ))
-
-		currentPos = entryPos
-		currentNode = neighborNode
-	end
-
-	debugLog(string.format("[IsNavigable] FAIL: Max iterations (%d) exceeded", MAX_ITERATIONS))
-	if DEBUG_MODE then
-		saveDebugPath(waypoints)
-		setDebugResult(false)
-	end
-	return false
+local function isLogMuted()
+	return engine.Con_IsVisible() or engine.IsGameUIVisible()
 end
 
-function Navigable.GetDebugWaypoints()
+function NavDebug.IsEnabled()
+	return enabled
+end
+
+function NavDebug.SetEnabled(value)
+	enabled = value == true
+	if not enabled then
+		hullTraces = {}
+		portalSpans = {}
+		debugWaypoints = nil
+		debugLastResult = nil
+		debugFailLine = nil
+	end
+end
+
+function NavDebug.Log(message)
+	if not enabled or isLogMuted() then
+		return
+	end
+	print(message)
+end
+
+function NavDebug.BeginRun()
+	if not enabled then
+		return
+	end
+	hullTraces = {}
+	portalSpans = {}
+	debugFailLine = nil
+end
+
+function NavDebug.SavePath(waypoints)
+	if not enabled then
+		return
+	end
+	local snapshot = {}
+	for i = 1, #waypoints do
+		local wp = waypoints[i]
+		snapshot[i] = {
+			pos = wp.pos,
+			nodeId = wp.node and wp.node.id or nil,
+		}
+	end
+	debugWaypoints = snapshot
+end
+
+function NavDebug.SetResult(isNavigable)
+	if enabled then
+		debugLastResult = isNavigable == true
+	end
+end
+
+function NavDebug.SaveFail(fromPos, toPos)
+	if not enabled or not fromPos or not toPos then
+		return
+	end
+	debugFailLine = { from = fromPos, to = toPos }
+end
+
+function NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, isDoorPortal)
+	if not enabled or not currentNode then
+		return
+	end
+	table.insert(portalSpans, {
+		node = currentNode,
+		exitDir = exitDir,
+		portalMin = portalMin,
+		portalMax = portalMax,
+		isDoorPortal = isDoorPortal == true,
+	})
+end
+
+function NavDebug.RecordHullTrace(startPos, endPos, blocked)
+	if not enabled then
+		return
+	end
+	table.insert(hullTraces, {
+		startPos = startPos,
+		endPos = endPos,
+		blocked = blocked,
+	})
+end
+
+function NavDebug.GetWaypoints()
 	return debugWaypoints
 end
 
-function Navigable.GetDebugHullTraceCount()
+function NavDebug.GetHullTraceCount()
 	return #hullTraces
 end
 
-function Navigable.SetDebugResult(isNavigable)
-	setDebugResult(isNavigable)
+local function drawWorldLine(a, b)
+	local w2sA = client.WorldToScreen(a)
+	local w2sB = client.WorldToScreen(b)
+	if w2sA and w2sB then
+		draw.Line(w2sA[1], w2sA[2], w2sB[1], w2sB[2])
+	end
 end
 
--- Debug: green/red = area path, blue = clear hull traces, red = blocked hull / portal wall
-function Navigable.DrawDebugTraces()
-	if not DEBUG_MODE then
+local function setPathDrawColor(isNavigable)
+	if isNavigable then
+		draw.Color(0, 255, 0, 255)
+	else
+		draw.Color(255, 0, 0, 255)
+	end
+end
+
+function NavDebug.Draw()
+	if not enabled then
 		return
 	end
 
@@ -7057,6 +6560,38 @@ function Navigable.DrawDebugTraces()
 		drawWorldLine(debugFailLine.to, debugFailLine.to + Vector3(0, 0, 32))
 	end
 
+	for _, portal in ipairs(portalSpans) do
+		local node = portal.node
+		local z = node.pos and node.pos.z or 0
+		local wallPos
+		if portal.exitDir == 2 then
+			wallPos = node._maxX
+		elseif portal.exitDir == 4 then
+			wallPos = node._minX
+		elseif portal.exitDir == 3 then
+			wallPos = node._maxY
+		else
+			wallPos = node._minY
+		end
+
+		if portal.isDoorPortal then
+			draw.Color(255, 200, 0, 255)
+		else
+			draw.Color(0, 200, 255, 255)
+		end
+
+		local a
+		local b
+		if portal.exitDir == 2 or portal.exitDir == 4 then
+			a = Vector3(wallPos, portal.portalMin, z)
+			b = Vector3(wallPos, portal.portalMax, z)
+		else
+			a = Vector3(portal.portalMin, wallPos, z)
+			b = Vector3(portal.portalMax, wallPos, z)
+		end
+		drawWorldLine(a, b)
+	end
+
 	for _, trace in ipairs(hullTraces) do
 		if trace.startPos and trace.endPos then
 			if trace.blocked then
@@ -7069,856 +6604,476 @@ function Navigable.DrawDebugTraces()
 	end
 end
 
-function Navigable.SetDebug(enabled)
-	DEBUG_MODE = enabled == true
-	if not DEBUG_MODE then
-		hullTraces = {}
-		debugWaypoints = nil
-		debugLastResult = nil
-		debugFailLine = nil
-	end
-end
-
-return Navigable
+return NavDebug
 
 end)
-__bundle_register("NavBot.Bot.OptimizedISWalkableTest", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-    Optimized ISWalkable Test Suite
-    EXPERIMENTAL - Navmesh-based optimization using Greedy pathfinding
-    Author: titaniummachine1 (github.com/titaniummachine1)
-]]
+__bundle_register("NavBot.Navigation.Prediction.NavConstants", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavGeometry, NavTrace, NavPredict ]]
 
-local G = require("NavBot.Core.Globals")
+local NavConstants = {}
 
--- Test state variables
-local TestState = {
-	enabled = false,
-	startPos = nil,
-	currentPos = nil,
-	isWalkable = false,
-	showVisuals = true,
+NavConstants.PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
+NavConstants.STEP_HEIGHT = 18
+NavConstants.JUMP_HEIGHT = 72
+NavConstants.MAX_FALL_DISTANCE = 250
+NavConstants.UP_VECTOR = Vector3(0, 0, 1)
+NavConstants.MAX_ITERATIONS = 37
+NavConstants.OPPOSITE_EXIT_DIR = { [1] = 3, [3] = 1, [2] = 4, [4] = 2 }
+NavConstants.SLOPE_WAYPOINT_Z_DIFF = 8
+NavConstants.DOOR_HALF_WIDTH = 12 -- matches DoorGeometry HITBOX_WIDTH / 2
+NavConstants.DOOR_SNAP_TOLERANCE = 24 -- snap straight-line exit onto nearest door portal
 
-	-- Benchmark data
-	benchmarkRecords = {},
-	MAX_RECORDS = 66,
-	averageMemoryUsage = 0,
-	averageTimeUsage = 0,
+return NavConstants
 
-	-- Visual data
-	hullTraces = {},
-	lineTraces = {},
-	greedyNodes = {}, -- Store greedy path nodes for cyan visualization
-	samplePoints = {}, -- Store navmesh sample points for yellow visualization
-}
+end)
+__bundle_register("NavBot.Navigation.Prediction.NavPortal", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPredict ]]
 
--- Constants
-local MAX_SPEED = 450
-local TWO_PI = 2 * math.pi
-local DEG_TO_RAD = math.pi / 180
-local PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
-local STEP_HEIGHT = 18
-local MAX_FALL_DISTANCE = 250
-local STEP_HEIGHT_Vector = Vector3(0, 0, STEP_HEIGHT)
-local MAX_FALL_DISTANCE_Vector = Vector3(0, 0, MAX_FALL_DISTANCE)
-local STEP_FRACTION = STEP_HEIGHT / MAX_FALL_DISTANCE
-local UP_VECTOR = Vector3(0, 0, 1)
-local MIN_STEP_SIZE = MAX_SPEED * globals.TickInterval()
-local MAX_SURFACE_ANGLE = 45
-local MAX_ITERATIONS = 37
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local NavDebug = require("NavBot.Navigation.Prediction.NavDebug")
 
--- Benchmark functions
-local function BenchmarkStart()
-	local startMemory = collectgarbage("count")
-	local startTime = os.clock()
-	return startTime, startMemory
+local NavPortal = {}
+
+local OPPOSITE_EXIT_DIR = NavConstants.OPPOSITE_EXIT_DIR
+local DOOR_HALF_WIDTH = NavConstants.DOOR_HALF_WIDTH
+local DOOR_SNAP_TOLERANCE = NavConstants.DOOR_SNAP_TOLERANCE
+
+local function isAreaNode(node)
+	return node and node._minX and node._maxX and node._minY and node._maxY
 end
 
-local function BenchmarkStop(startTime, startMemory)
-	local stopTime = os.clock()
-	local stopMemory = collectgarbage("count")
-
-	local elapsedTime = math.max(stopTime - startTime, 0)
-	local memoryDelta = math.abs(stopMemory - startMemory)
-
-	table.insert(TestState.benchmarkRecords, 1, { time = elapsedTime, memory = memoryDelta })
-	if #TestState.benchmarkRecords > TestState.MAX_RECORDS then
-		table.remove(TestState.benchmarkRecords)
+local function getConnectionId(connection)
+	if type(connection) == "table" then
+		return connection.node or connection.id
 	end
-
-	local totalTime, totalMemory = 0, 0
-	for _, record in ipairs(TestState.benchmarkRecords) do
-		totalTime = totalTime + record.time
-		totalMemory = totalMemory + record.memory
-	end
-
-	TestState.averageTimeUsage = totalTime / #TestState.benchmarkRecords
-	TestState.averageMemoryUsage = totalMemory / #TestState.benchmarkRecords
+	return connection
 end
 
--- Helper functions
-local function shouldHitEntity(entity)
-	local pLocal = entities.GetLocalPlayer()
-	return entity ~= pLocal
-end
-
-local function Normalize(vec)
-	return vec / vec:Length()
-end
-
-local function performTraceHull(startPos, endPos)
-	local result =
-		engine.TraceHull(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
-	table.insert(TestState.hullTraces, { startPos = startPos, endPos = result.endpos })
-	return result
-end
-
--- OPTIMIZED ISWalkable using Greedy pathfinding
-local function IsWalkable(startPos, goalPos)
-	-- Clear trace tables for debugging
-	TestState.hullTraces = {}
-	TestState.lineTraces = {}
-	TestState.greedyNodes = {}
-	TestState.samplePoints = {}
-
-	-- Get greedy path for navmesh-based validation
-	local greedyPath = G.Greedy.FindPathFast(startPos, goalPos, 20)
-
-	-- Store greedy node positions for cyan visualization
-	local pathNodes = {}
-	for _, nodeId in ipairs(greedyPath) do
-		local node = G.Navigation.GetNode(nodeId)
-		if node then
-			local nodePos = Vector3(node.x, node.y, node.z)
-			table.insert(TestState.greedyNodes, nodePos)
-			table.insert(pathNodes, node)
+local function getFacingEdgeSpan(area, exitDir)
+	local nw, ne, sw, se = area.nw, area.ne, area.sw, area.se
+	if nw and ne and sw and se then
+		if exitDir == 2 then
+			return math.min(ne.y, se.y), math.max(ne.y, se.y)
+		elseif exitDir == 4 then
+			return math.min(nw.y, sw.y), math.max(nw.y, sw.y)
+		elseif exitDir == 3 then
+			return math.min(sw.x, se.x), math.max(sw.x, se.x)
+		elseif exitDir == 1 then
+			return math.min(nw.x, ne.x), math.max(nw.x, ne.x)
 		end
 	end
 
-	-- OPTIMIZED: Simple quad-to-quad boundary checks (no iteration)
-	if #pathNodes < 2 then
-		return false -- Need at least 2 nodes to check
+	if exitDir == 2 or exitDir == 4 then
+		return area._minY, area._maxY
 	end
-
-	-- Check wall collision between each adjacent quad pair
-	for i = 1, #pathNodes - 1 do
-		local nodeA = pathNodes[i]
-		local nodeB = pathNodes[i + 1]
-
-		local posA = Vector3(nodeA.x, nodeA.y, nodeA.z)
-		local posB = Vector3(nodeB.x, nodeB.y, nodeB.z)
-
-		-- Store sample points for visualization
-		table.insert(TestState.samplePoints, posA)
-		table.insert(TestState.samplePoints, posB)
-
-		-- One wall trace per quad boundary at step height
-		local wallTrace = performTraceHull(posA + STEP_HEIGHT_Vector, posB + STEP_HEIGHT_Vector)
-
-		if wallTrace.fraction == 0 then
-			return false -- Path blocked at this boundary
-		end
-	end
-
-	-- Check final segment from last node to goal
-	local lastNode = pathNodes[#pathNodes]
-	local lastPos = Vector3(lastNode.x, lastNode.y, lastNode.z)
-
-	-- Check if goal is reasonable distance from path
-	local distToGoal = (lastPos - goalPos):Length()
-	if distToGoal > 500 then
-		return false -- Goal too far from navmesh path
-	end
-
-	-- Final wall check to goal
-	local finalTrace = performTraceHull(lastPos + STEP_HEIGHT_Vector, goalPos + STEP_HEIGHT_Vector)
-	if finalTrace.fraction == 0 then
-		return false -- Final segment blocked
-	end
-
-	return true -- Path is walkable
+	return area._minX, area._maxX
 end
 
--- Visual functions
-local function Draw3DBox(size, pos)
-	local halfSize = size / 2
-	local corners = {
-		Vector3(-halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, -halfSize, halfSize),
-		Vector3(halfSize, -halfSize, halfSize),
-		Vector3(halfSize, halfSize, halfSize),
-		Vector3(-halfSize, halfSize, halfSize),
-	}
-
-	local linesToDraw = {
-		{ 1, 2 },
-		{ 2, 3 },
-		{ 3, 4 },
-		{ 4, 1 },
-		{ 5, 6 },
-		{ 6, 7 },
-		{ 7, 8 },
-		{ 8, 5 },
-		{ 1, 5 },
-		{ 2, 6 },
-		{ 3, 7 },
-		{ 4, 8 },
-	}
-
-	local screenPositions = {}
-	for _, cornerPos in ipairs(corners) do
-		local worldPos = pos + cornerPos
-		local screenPos = client.WorldToScreen(worldPos)
-		if screenPos then
-			table.insert(screenPositions, { x = screenPos[1], y = screenPos[2] })
-		end
+function NavPortal.GetSharedPortalSpan(currentNode, neighborNode, exitDir)
+	local aMin, aMax = getFacingEdgeSpan(currentNode, exitDir)
+	local oppDir = OPPOSITE_EXIT_DIR[exitDir]
+	local bMin, bMax = getFacingEdgeSpan(neighborNode, oppDir)
+	local portalMin = math.max(aMin, bMin)
+	local portalMax = math.min(aMax, bMax)
+	if portalMax <= portalMin then
+		return nil, nil
 	end
-
-	for _, line in ipairs(linesToDraw) do
-		local p1, p2 = screenPositions[line[1]], screenPositions[line[2]]
-		if p1 and p2 then
-			draw.Line(p1.x, p1.y, p2.x, p2.y)
-		end
-	end
+	return portalMin, portalMax
 end
 
-local function ArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
-	if not (start_pos and end_pos) then
-		return
+local function getSharedAxisCoord(point, exitDir)
+	if exitDir == 2 or exitDir == 4 then
+		return point.y
 	end
-
-	if invert then
-		start_pos, end_pos = end_pos, start_pos
-	end
-
-	local direction = end_pos - start_pos
-	local min_acceptable_length = arrowhead_length + (arrowhead_width / 2)
-	if direction:Length() < min_acceptable_length then
-		local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-		if not (w2s_start and w2s_end) then
-			return
-		end
-		draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		return
-	end
-
-	local normalized_direction = Normalize(direction)
-	local arrow_base = end_pos - normalized_direction * arrowhead_length
-	local perpendicular = Vector3(-normalized_direction.y, normalized_direction.x, 0) * (arrowhead_width / 2)
-
-	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-	local w2s_arrow_base = client.WorldToScreen(arrow_base)
-	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
-	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
-
-	if not (w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2) then
-		return
-	end
-
-	draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp1[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
-	draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
+	return point.x
 end
 
--- Main test functions
-local function OnCreateMove(Cmd)
-	-- Check menu state
-	if not G.Menu.Visuals.OptimizedISWalkableTest then
-		TestState.enabled = false
-		return
+local function setSharedAxisCoord(point, exitDir, coord)
+	if exitDir == 2 or exitDir == 4 then
+		return Vector3(point.x, coord, point.z)
+	end
+	return Vector3(coord, point.y, point.z)
+end
+
+local function isExitInPortal(exitPoint, exitDir, portalMin, portalMax)
+	local coord = getSharedAxisCoord(exitPoint, exitDir)
+	return coord >= portalMin and coord <= portalMax
+end
+
+local function distanceToSpan(coord, portalMin, portalMax)
+	if coord < portalMin then
+		return portalMin - coord
+	end
+	if coord > portalMax then
+		return coord - portalMax
+	end
+	return 0
+end
+
+local function clampToSpan(coord, portalMin, portalMax)
+	if coord < portalMin then
+		return portalMin
+	end
+	if coord > portalMax then
+		return portalMax
+	end
+	return coord
+end
+
+local function getDoorPortalSpan(doorNode, exitDir)
+	if not doorNode or not doorNode.pos then
+		return nil, nil
+	end
+	local center = getSharedAxisCoord(doorNode.pos, exitDir)
+	return center - DOOR_HALF_WIDTH, center + DOOR_HALF_WIDTH
+end
+
+local function resolveConnectionToNeighborArea(connection, currentNodeId, nodes)
+	local targetId = getConnectionId(connection)
+	local target = nodes[targetId]
+	if not target then
+		return nil
 	end
 
-	-- Set enabled and initialize startPos if needed
-	if not TestState.enabled then
-		TestState.enabled = true
-		local pLocal = entities.GetLocalPlayer()
-		if pLocal and pLocal:IsAlive() and not TestState.startPos then
-			TestState.startPos = pLocal:GetAbsOrigin()
+	if target.isDoor then
+		if target.areaId == currentNodeId then
+			return nodes[target.targetAreaId]
+		end
+		if target.targetAreaId == currentNodeId then
+			return nodes[target.areaId]
 		end
 	end
 
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or not pLocal:IsAlive() then
-		return
+	if isAreaNode(target) then
+		if target.id ~= currentNodeId then
+			return target
+		end
+		return nil
 	end
 
-	TestState.currentPos = pLocal:GetAbsOrigin()
-
-	-- Shift to reset position
-	if input.IsButtonDown(KEY_LSHIFT) then
-		TestState.startPos = TestState.currentPos
-		return
+	local pair = string.match(tostring(targetId), "^(%d+_%d+)_")
+	if pair then
+		local areaA, areaB = string.match(pair, "^(%d+)_(%d+)$")
+		if areaA and areaB then
+			areaA = tonumber(areaA)
+			areaB = tonumber(areaB)
+			if areaA == currentNodeId then
+				return nodes[areaB]
+			end
+			if areaB == currentNodeId then
+				return nodes[areaA]
+			end
+		end
 	end
 
-	-- Don't interfere with movement
-	if Cmd:GetForwardMove() ~= 0 or Cmd:GetSideMove() ~= 0 then
-		return
-	end
+	return nil
+end
 
-	-- Only run test when F key is held
-	if not input.IsButtonDown(KEY_F) then
-		return
-	end
-
-	-- Only run test if we have both positions and they're far enough apart
-	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		local startTime, startMemory = BenchmarkStart()
-		TestState.isWalkable = IsWalkable(TestState.currentPos, TestState.startPos)
-		BenchmarkStop(startTime, startMemory)
+local function logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, doorsOnly, doorId)
+	if doorsOnly and doorId then
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Door portal dir=%d door=%s area=%d: coord=%.1f span=[%.1f,%.1f]",
+				exitDir,
+				tostring(doorId),
+				neighborArea.id,
+				exitCoord,
+				portalMin,
+				portalMax
+			)
+		)
+	else
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Edge portal dir=%d area=%d: coord=%.1f portal=[%.1f,%.1f]",
+				exitDir,
+				neighborArea.id,
+				exitCoord,
+				portalMin,
+				portalMax
+			)
+		)
 	end
 end
 
---never inside funciton
-local Fonts = { Verdana = draw.CreateFont("Verdana", 14, 510) }
-
-local function OnDraw()
-	-- Check menu state first
-	if not G.Menu.Visuals.OptimizedISWalkableTest then
-		return
+local function collectDoorCandidates(currentNode, exitDir, nodes)
+	local dirData = currentNode.c[exitDir]
+	if not dirData or not dirData.connections then
+		return {}
 	end
 
-	if engine.Con_IsVisible() or engine.IsGameUIVisible() then
-		return
-	end
-
-	draw.SetFont(Fonts.Verdana)
-	draw.Color(255, 255, 255, 255)
-
-	-- Draw target position box
-	if TestState.startPos then
-		Draw3DBox(10, TestState.startPos)
-	end
-
-	-- Draw walkability test and arrow
-	if TestState.startPos and TestState.currentPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		if TestState.isWalkable then
-			draw.Color(0, 255, 0, 255)
-		else
-			draw.Color(255, 0, 0, 255)
+	local candidates = {}
+	for i = 1, #dirData.connections do
+		local connection = dirData.connections[i]
+		local connectionId = getConnectionId(connection)
+		local doorNode = nodes[connectionId]
+		if doorNode and doorNode.isDoor then
+			local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
+			local portalMin, portalMax = getDoorPortalSpan(doorNode, exitDir)
+			if neighborArea and portalMin then
+				candidates[#candidates + 1] = {
+					connectionId = connectionId,
+					neighborArea = neighborArea,
+					portalMin = portalMin,
+					portalMax = portalMax,
+				}
+			end
 		end
-		ArrowLine(TestState.currentPos, TestState.startPos, 10, 20, false)
+	end
+	return candidates
+end
+
+local function findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
+	local candidates = collectDoorCandidates(currentNode, exitDir, nodes)
+	if #candidates == 0 then
+		return nil, nil
 	end
 
-	-- Draw benchmark info
-	draw.Color(255, 255, 255, 255)
-	draw.Text(
-		20,
-		120,
-		string.format("Optimized ISWalkable Test: %s", G.Menu.Visuals.OptimizedISWalkableTest and "ON" or "OFF")
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		NavDebug.RecordPortalSpan(currentNode, exitDir, candidate.portalMin, candidate.portalMax, true)
+		if isExitInPortal(exitPoint, exitDir, candidate.portalMin, candidate.portalMax) then
+			logPortalResult(
+				exitCoord,
+				exitDir,
+				candidate.neighborArea,
+				candidate.portalMin,
+				candidate.portalMax,
+				true,
+				candidate.connectionId
+			)
+			return candidate.neighborArea, nil
+		end
+	end
+
+	local bestCandidate = nil
+	local bestDistance = math.huge
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		local distance = distanceToSpan(exitCoord, candidate.portalMin, candidate.portalMax)
+		if distance < bestDistance then
+			bestDistance = distance
+			bestCandidate = candidate
+		end
+	end
+
+	if bestCandidate and bestDistance <= DOOR_SNAP_TOLERANCE then
+		local snappedCoord = clampToSpan(exitCoord, bestCandidate.portalMin, bestCandidate.portalMax)
+		local snappedExit = setSharedAxisCoord(exitPoint, exitDir, snappedCoord)
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Door snap dir=%d door=%s area=%d: %.1f -> %.1f (dist=%.1f) span=[%.1f,%.1f]",
+				exitDir,
+				tostring(bestCandidate.connectionId),
+				bestCandidate.neighborArea.id,
+				exitCoord,
+				snappedCoord,
+				bestDistance,
+				bestCandidate.portalMin,
+				bestCandidate.portalMax
+			)
+		)
+		return bestCandidate.neighborArea, snappedExit
+	end
+
+	for i = 1, #candidates do
+		local candidate = candidates[i]
+		NavDebug.Log(
+			string.format(
+				"[NavPredict]   Skip door=%s area=%d: coord=%.1f outside [%.1f,%.1f]",
+				tostring(candidate.connectionId),
+				candidate.neighborArea.id,
+				exitCoord,
+				candidate.portalMin,
+				candidate.portalMax
+			)
+		)
+	end
+	return nil, nil
+end
+
+local function tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
+	local neighborArea = resolveConnectionToNeighborArea(connection, currentNode.id, nodes)
+	if not neighborArea or checkedNeighborIds[neighborArea.id] then
+		return nil
+	end
+	checkedNeighborIds[neighborArea.id] = true
+
+	local portalMin, portalMax = NavPortal.GetSharedPortalSpan(currentNode, neighborArea, exitDir)
+	if not portalMin then
+		return nil
+	end
+
+	NavDebug.RecordPortalSpan(currentNode, exitDir, portalMin, portalMax, false)
+
+	if isExitInPortal(exitPoint, exitDir, portalMin, portalMax) then
+		logPortalResult(exitCoord, exitDir, neighborArea, portalMin, portalMax, false, nil)
+		return neighborArea
+	end
+
+	NavDebug.Log(
+		string.format(
+			"[NavPredict]   Skip area=%d: coord=%.1f outside [%.1f,%.1f]",
+			neighborArea.id,
+			exitCoord,
+			portalMin,
+			portalMax
+		)
 	)
-	draw.Text(20, 150, string.format("Memory usage: %.2f KB", TestState.averageMemoryUsage))
-	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
-	draw.Text(20, 210, string.format("Result: %s", TestState.isWalkable and "WALKABLE" or "NOT WALKABLE"))
-	draw.Text(20, 240, string.format("Greedy Nodes: %d", #TestState.greedyNodes))
-	draw.Text(20, 270, string.format("Sample Points: %d", #TestState.samplePoints))
-	draw.Text(20, 300, "Press SHIFT to set start | Hold F to test")
-
-	-- Draw greedy path nodes (navmesh quads) in cyan
-	if #TestState.greedyNodes > 0 then
-		draw.Color(0, 255, 255, 255) -- Cyan for greedy path nodes
-		for _, nodePos in ipairs(TestState.greedyNodes) do
-			Draw3DBox(8, nodePos)
-		end
-	else
-		draw.Color(255, 255, 255, 255)
-		draw.Text(20, 330, "No greedy path nodes found")
-	end
-
-	-- Draw navmesh sample points in yellow
-	if #TestState.samplePoints > 0 then
-		draw.Color(255, 255, 0, 255) -- Yellow for sample points
-		for _, samplePos in ipairs(TestState.samplePoints) do
-			Draw3DBox(4, samplePos)
-		end
-	end
-
-	-- Draw debug traces
-	for _, trace in ipairs(TestState.lineTraces) do
-		draw.Color(255, 255, 255, 255)
-		local w2s_start, w2s_end = client.WorldToScreen(trace.startPos), client.WorldToScreen(trace.endPos)
-		if w2s_start and w2s_end then
-			draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		end
-	end
-
-	for _, trace in ipairs(TestState.hullTraces) do
-		draw.Color(0, 50, 255, 255)
-		ArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
-	end
+	return nil
 end
 
--- Toggle function
-local function ToggleTest()
-	TestState.enabled = not TestState.enabled
-	if TestState.enabled then
-		local pLocal = entities.GetLocalPlayer()
-		if pLocal and pLocal:IsAlive() then
-			TestState.startPos = pLocal:GetAbsOrigin()
-		end
-		print("Optimized ISWalkable Test Suite: ENABLED")
-		client.Command('play "ui/buttonclick"', true)
-	else
-		print("Optimized ISWalkable Test Suite: DISABLED")
-		client.Command('play "ui/buttonclick_release"', true)
+function NavPortal.FindNeighborAtExit(currentNode, exitPoint, exitDir, nodes, doorsOnly)
+	local dirData = currentNode.c[exitDir]
+	if not dirData or not dirData.connections then
+		return nil, nil
 	end
+
+	local exitCoord = getSharedAxisCoord(exitPoint, exitDir)
+
+	if doorsOnly then
+		local neighborArea, snappedExit = findDoorNeighbor(currentNode, exitPoint, exitDir, nodes, exitCoord)
+		if neighborArea then
+			return neighborArea, snappedExit
+		end
+		NavDebug.Log(
+			string.format("[NavPredict] FAIL: coord %.1f not in any door portal on dir %d (wall)", exitCoord, exitDir)
+		)
+		return nil, nil
+	end
+
+	local checkedNeighborIds = {}
+	for i = 1, #dirData.connections do
+		local connection = dirData.connections[i]
+		local neighborArea =
+			tryEdgePortal(currentNode, exitPoint, exitDir, nodes, connection, exitCoord, checkedNeighborIds)
+		if neighborArea then
+			return neighborArea, nil
+		end
+	end
+
+	NavDebug.Log(string.format("[NavPredict] FAIL: coord %.1f not in any portal on dir %d (wall)", exitCoord, exitDir))
+	return nil, nil
 end
 
--- Public API
-local OptimizedISWalkableTest = {
-	Toggle = ToggleTest,
-	IsEnabled = function()
-		return TestState.enabled
-	end,
-	GetState = function()
-		return TestState
-	end,
-}
-
--- Auto-register callbacks
-callbacks.Register("CreateMove", "OptimizedISWalkableTest_CreateMove", OnCreateMove)
-callbacks.Register("Draw", "OptimizedISWalkableTest_Draw", OnDraw)
-
--- Add to global for easy access
-G.OptimizedISWalkableTest = OptimizedISWalkableTest
-
-print("Optimized ISWalkable Test Suite loaded. Use G.OptimizedISWalkableTest.Toggle() to enable/disable.")
-
-return OptimizedISWalkableTest
+return NavPortal
 
 end)
-__bundle_register("NavBot.Bot.ISWalkableTest", function(require, _LOADED, __bundle_register, __bundle_modules)
---[[
-    ISWalkable Test Suite
-    Standalone testing module for ISWalkable optimization
-    Mimics the visual toggle system from A_standstillDummy.lua
-    Author: titaniummachine1 (github.com/titaniummachine1)
-]]
+__bundle_register("NavBot.Navigation.Prediction.NavGeometry", function(require, _LOADED, __bundle_register, __bundle_modules)
+--[[ Imported by: NavPortal, NavPredict ]]
 
-local Fonts = { Verdana = draw.CreateFont("Verdana", 14, 510) }
-local G = require("NavBot.Core.Globals")
+local NavConstants = require("NavBot.Navigation.Prediction.NavConstants")
+local Common = require("NavBot.Core.Common")
 
--- Test state variables
-local TestState = {
-	enabled = false,
-	startPos = nil,
-	currentPos = nil,
-	isWalkable = false,
-	showVisuals = true,
+local NavGeometry = {}
 
-	-- Benchmark data
-	benchmarkRecords = {},
-	MAX_RECORDS = 66,
-	averageMemoryUsage = 0,
-	averageTimeUsage = 0,
+local UP_VECTOR = NavConstants.UP_VECTOR
 
-	-- Visual data
-	hullTraces = {},
-	lineTraces = {},
-}
-
--- Constants
-local MAX_SPEED = 450
-local TWO_PI = 2 * math.pi
-local DEG_TO_RAD = math.pi / 180
-local PLAYER_HULL = { Min = Vector3(-24, -24, 0), Max = Vector3(24, 24, 82) }
-local STEP_HEIGHT = 18
-local MAX_FALL_DISTANCE = 250
-local STEP_HEIGHT_Vector = Vector3(0, 0, STEP_HEIGHT)
-local MAX_FALL_DISTANCE_Vector = Vector3(0, 0, MAX_FALL_DISTANCE)
-local STEP_FRACTION = STEP_HEIGHT / MAX_FALL_DISTANCE
-local UP_VECTOR = Vector3(0, 0, 1)
-local MIN_STEP_SIZE = MAX_SPEED * globals.TickInterval()
-local MAX_SURFACE_ANGLE = 45
-local MAX_ITERATIONS = 37
-
--- Benchmark functions
-local function BenchmarkStart()
-	local startMemory = collectgarbage("count")
-	local startTime = os.clock()
-	return startTime, startMemory
+function NavGeometry.ProjectXYOntoGoalLine(x, y, lineOrigin, lineDir)
+	local px = x - lineOrigin.x
+	local py = y - lineOrigin.y
+	local along = px * lineDir.x + py * lineDir.y
+	return lineOrigin.x + lineDir.x * along, lineOrigin.y + lineDir.y * along
 end
 
-local function BenchmarkStop(startTime, startMemory)
-	local stopTime = os.clock()
-	local stopMemory = collectgarbage("count")
+function NavGeometry.FindNodeExit(startPos, dir, node)
+	local minX, maxX = node._minX, node._maxX
+	local minY, maxY = node._minY, node._maxY
 
-	local elapsedTime = math.max(stopTime - startTime, 0)
-	local memoryDelta = math.abs(stopMemory - startMemory)
+	local tMin = math.huge
+	local exitX, exitY
+	local exitDir = nil
 
-	table.insert(TestState.benchmarkRecords, 1, { time = elapsedTime, memory = memoryDelta })
-	if #TestState.benchmarkRecords > TestState.MAX_RECORDS then
-		table.remove(TestState.benchmarkRecords)
-	end
-
-	local totalTime, totalMemory = 0, 0
-	for _, record in ipairs(TestState.benchmarkRecords) do
-		totalTime = totalTime + record.time
-		totalMemory = totalMemory + record.memory
-	end
-
-	TestState.averageTimeUsage = totalTime / #TestState.benchmarkRecords
-	TestState.averageMemoryUsage = totalMemory / #TestState.benchmarkRecords
-end
-
--- ISWalkable implementation (optimized version from dummy)
-local function shouldHitEntity(entity)
-	local pLocal = entities.GetLocalPlayer()
-	return entity ~= pLocal
-end
-
-local function Normalize(vec)
-	return vec / vec:Length()
-end
-
-local function getHorizontalManhattanDistance(point1, point2)
-	return math.abs(point1.x - point2.x) + math.abs(point1.y - point2.y)
-end
-
-local function performTraceHull(startPos, endPos)
-	local result =
-		engine.TraceHull(startPos, endPos, PLAYER_HULL.Min, PLAYER_HULL.Max, MASK_PLAYERSOLID, shouldHitEntity)
-	table.insert(TestState.hullTraces, { startPos = startPos, endPos = result.endpos })
-	return result
-end
-
-local function adjustDirectionToSurface(direction, surfaceNormal)
-	direction = Normalize(direction)
-	local angle = math.deg(math.acos(surfaceNormal:Dot(UP_VECTOR)))
-
-	if angle > MAX_SURFACE_ANGLE then
-		return direction
-	end
-
-	local dotProduct = direction:Dot(surfaceNormal)
-	direction.z = direction.z - surfaceNormal.z * dotProduct
-	return Normalize(direction)
-end
-
--- Helper: Find closest navmesh node to a 2D position
-local function getClosestNavmeshNode(pos, pathNodes)
-	local closestNode = nil
-	local closestDist = math.huge
-
-	for _, node in ipairs(pathNodes) do
-		local nodePos = Vector3(node.x, node.y, node.z)
-		local dx = pos.x - nodePos.x
-		local dy = pos.y - nodePos.y
-		local dist2D = math.sqrt(dx * dx + dy * dy)
-
-		if dist2D < closestDist then
-			closestDist = dist2D
-			closestNode = node
+	if dir.x > 0 then
+		local t = (maxX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = maxX
+			exitY = startPos.y + dir.y * t
+			exitDir = 2
+		end
+	elseif dir.x < 0 then
+		local t = (minX - startPos.x) / dir.x
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = minX
+			exitY = startPos.y + dir.y * t
+			exitDir = 4
 		end
 	end
 
-	return closestNode, closestDist
+	if dir.y > 0 then
+		local t = (maxY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = maxY
+			exitDir = 3
+		end
+	elseif dir.y < 0 then
+		local t = (minY - startPos.y) / dir.y
+		if t > 0 and t < tMin then
+			tMin = t
+			exitX = startPos.x + dir.x * t
+			exitY = minY
+			exitDir = 1
+		end
+	end
+
+	if tMin == math.huge then
+		return nil, nil, nil
+	end
+	return Vector3(exitX, exitY, startPos.z), tMin, exitDir
 end
 
-local function IsWalkable(startPos, goalPos)
-	-- Clear trace tables for debugging
-	TestState.hullTraces = {}
-	TestState.lineTraces = {}
-	local blocked = false
-
-	local currentPos = startPos
-
-	-- Adjust start position to ground level
-	local startGroundTrace = performTraceHull(startPos + STEP_HEIGHT_Vector, startPos - MAX_FALL_DISTANCE_Vector)
-
-	currentPos = startGroundTrace.endpos
-
-	-- Initial direction towards goal, adjusted for ground normal
-	local lastPos = currentPos
-	local lastDirection = adjustDirectionToSurface(goalPos - currentPos, startGroundTrace.plane)
-
-	local MaxDistance = getHorizontalManhattanDistance(startPos, goalPos)
-
-	-- Main loop to iterate towards the goal
-	for iteration = 1, MAX_ITERATIONS do
-		local distanceToGoal = (currentPos - goalPos):Length()
-		local direction = lastDirection
-
-		local NextPos = lastPos + direction * distanceToGoal
-
-		-- Forward collision check
-		local wallTrace = performTraceHull(lastPos + STEP_HEIGHT_Vector, NextPos + STEP_HEIGHT_Vector)
-		currentPos = wallTrace.endpos
-
-		if wallTrace.fraction == 0 then
-			blocked = true -- Path is blocked by a wall
-		end
-
-		-- Ground collision with segmentation
-		local totalDistance = (currentPos - lastPos):Length()
-		local numSegments = math.max(1, math.floor(totalDistance / MIN_STEP_SIZE))
-
-		for seg = 1, numSegments do
-			local t = seg / numSegments
-			local segmentPos = lastPos + (currentPos - lastPos) * t
-			local segmentTop = segmentPos + STEP_HEIGHT_Vector
-			local segmentBottom = segmentPos - MAX_FALL_DISTANCE_Vector
-
-			local groundTrace = performTraceHull(segmentTop, segmentBottom)
-
-			if groundTrace.fraction == 1 then
-				return false -- No ground beneath; path is unwalkable
-			end
-
-			if groundTrace.fraction > STEP_FRACTION or seg == numSegments then
-				-- Adjust position to ground
-				direction = adjustDirectionToSurface(direction, groundTrace.plane)
-				currentPos = groundTrace.endpos
-				blocked = false
-				break
-			end
-		end
-
-		-- Calculate current horizontal distance to goal
-		local currentDistance = getHorizontalManhattanDistance(currentPos, goalPos)
-		if blocked or currentDistance > MaxDistance then --if target is unreachable
-			return false
-		elseif currentDistance < 24 then --within range
-			local verticalDist = math.abs(goalPos.z - currentPos.z)
-			if verticalDist < 24 then --within vertical range
-				return true -- Goal is within reach; path is walkable
-			else --unreachable
-				return false -- Goal is too far vertically; path is unwalkable
-			end
-		end
-
-		-- Prepare for the next iteration
-		lastPos = currentPos
-		lastDirection = direction
+function NavGeometry.GetGroundZFromQuad(pos, node)
+	if not (node.nw and node.ne and node.sw and node.se) then
+		return nil, nil
 	end
 
-	return false -- Max iterations reached without finding a path
-end
+	local nw, ne, sw, se = node.nw, node.ne, node.sw, node.se
+	local dx = pos.x - nw.x
+	local dy = pos.y - nw.y
+	local dx_ne = ne.x - nw.x
+	local dy_se = se.y - nw.y
+	local inTriangle1 = (dx / dx_ne + dy / dy_se) <= 1.0
 
--- Visual functions
-local function Draw3DBox(size, pos)
-	local halfSize = size / 2
-	local corners = {
-		Vector3(-halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, -halfSize, -halfSize),
-		Vector3(halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, halfSize, -halfSize),
-		Vector3(-halfSize, -halfSize, halfSize),
-		Vector3(halfSize, -halfSize, halfSize),
-		Vector3(halfSize, halfSize, halfSize),
-		Vector3(-halfSize, halfSize, halfSize),
-	}
-
-	local linesToDraw = {
-		{ 1, 2 },
-		{ 2, 3 },
-		{ 3, 4 },
-		{ 4, 1 },
-		{ 5, 6 },
-		{ 6, 7 },
-		{ 7, 8 },
-		{ 8, 5 },
-		{ 1, 5 },
-		{ 2, 6 },
-		{ 3, 7 },
-		{ 4, 8 },
-	}
-
-	local screenPositions = {}
-	for _, cornerPos in ipairs(corners) do
-		local worldPos = pos + cornerPos
-		local screenPos = client.WorldToScreen(worldPos)
-		if screenPos then
-			table.insert(screenPositions, { x = screenPos[1], y = screenPos[2] })
-		end
-	end
-
-	for _, line in ipairs(linesToDraw) do
-		local p1, p2 = screenPositions[line[1]], screenPositions[line[2]]
-		if p1 and p2 then
-			draw.Line(p1.x, p1.y, p2.x, p2.y)
-		end
-	end
-end
-
-local function ArrowLine(start_pos, end_pos, arrowhead_length, arrowhead_width, invert)
-	if not (start_pos and end_pos) then
-		return
-	end
-
-	if invert then
-		start_pos, end_pos = end_pos, start_pos
-	end
-
-	local direction = end_pos - start_pos
-	local min_acceptable_length = arrowhead_length + (arrowhead_width / 2)
-	if direction:Length() < min_acceptable_length then
-		local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-		if not (w2s_start and w2s_end) then
-			return
-		end
-		draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		return
-	end
-
-	local normalized_direction = Normalize(direction)
-	local arrow_base = end_pos - normalized_direction * arrowhead_length
-	local perpendicular = Vector3(-normalized_direction.y, normalized_direction.x, 0) * (arrowhead_width / 2)
-
-	local w2s_start, w2s_end = client.WorldToScreen(start_pos), client.WorldToScreen(end_pos)
-	local w2s_arrow_base = client.WorldToScreen(arrow_base)
-	local w2s_perp1 = client.WorldToScreen(arrow_base + perpendicular)
-	local w2s_perp2 = client.WorldToScreen(arrow_base - perpendicular)
-
-	if not (w2s_start and w2s_end and w2s_arrow_base and w2s_perp1 and w2s_perp2) then
-		return
-	end
-
-	draw.Line(w2s_start[1], w2s_start[2], w2s_arrow_base[1], w2s_arrow_base[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp1[1], w2s_perp1[2])
-	draw.Line(w2s_end[1], w2s_end[2], w2s_perp2[1], w2s_perp2[2])
-	draw.Line(w2s_perp1[1], w2s_perp1[2], w2s_perp2[1], w2s_perp2[2])
-end
-
--- Main test functions
-local function OnCreateMove(Cmd)
-	-- Check menu state
-	if not G.Menu.Visuals.ISWalkableTest then
-		TestState.enabled = false
-		return
-	end
-
-	-- Set enabled and initialize startPos if needed
-	if not TestState.enabled then
-		TestState.enabled = true
-		local pLocal = entities.GetLocalPlayer()
-		if pLocal and pLocal:IsAlive() and not TestState.startPos then
-			TestState.startPos = pLocal:GetAbsOrigin()
-		end
-	end
-
-	local pLocal = entities.GetLocalPlayer()
-	if not pLocal or not pLocal:IsAlive() then
-		return
-	end
-
-	TestState.currentPos = pLocal:GetAbsOrigin()
-
-	-- Shift to reset position
-	if input.IsButtonDown(KEY_LSHIFT) then
-		TestState.startPos = TestState.currentPos
-		return
-	end
-
-	-- Don't interfere with movement
-	if Cmd:GetForwardMove() ~= 0 or Cmd:GetSideMove() ~= 0 then
-		return
-	end
-
-	-- Only run test when F key is held
-	if not input.IsButtonDown(KEY_F) then
-		return
-	end
-
-	-- Only run test if we have both positions and they're far enough apart
-	if TestState.startPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		local startTime, startMemory = BenchmarkStart()
-		TestState.isWalkable = IsWalkable(TestState.currentPos, TestState.startPos)
-		BenchmarkStop(startTime, startMemory)
-	end
-end
-
-local function OnDraw()
-	-- Check menu state first
-	if not G.Menu.Visuals.ISWalkableTest then
-		return
-	end
-
-	if engine.Con_IsVisible() or engine.IsGameUIVisible() then
-		return
-	end
-
-	draw.SetFont(Fonts.Verdana)
-	draw.Color(255, 255, 255, 255)
-
-	-- Draw target position box
-	if TestState.startPos then
-		Draw3DBox(10, TestState.startPos)
-	end
-
-	-- Draw walkability test and arrow
-	if TestState.startPos and TestState.currentPos and (TestState.currentPos - TestState.startPos):Length() > 10 then
-		if TestState.isWalkable then
-			draw.Color(0, 255, 0, 255)
-		else
-			draw.Color(255, 0, 0, 255)
-		end
-		ArrowLine(TestState.currentPos, TestState.startPos, 10, 20, false)
-	end
-
-	-- Draw benchmark info
-	draw.Color(255, 255, 255, 255)
-	draw.Text(20, 120, string.format("ISWalkable Test: %s", G.Menu.Visuals.ISWalkableTest and "ON" or "OFF"))
-	draw.Text(20, 150, string.format("Memory usage: %.2f KB", TestState.averageMemoryUsage))
-	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
-	draw.Text(20, 210, string.format("Result: %s", TestState.isWalkable and "WALKABLE" or "NOT WALKABLE"))
-	draw.Text(20, 240, "Press SHIFT to set start | Hold F to test")
-
-	-- Draw debug traces
-	for _, trace in ipairs(TestState.lineTraces) do
-		draw.Color(255, 255, 255, 255)
-		local w2s_start, w2s_end = client.WorldToScreen(trace.startPos), client.WorldToScreen(trace.endPos)
-		if w2s_start and w2s_end then
-			draw.Line(w2s_start[1], w2s_start[2], w2s_end[1], w2s_end[2])
-		end
-	end
-
-	for _, trace in ipairs(TestState.hullTraces) do
-		draw.Color(0, 50, 255, 255)
-		ArrowLine(trace.startPos, trace.endPos - Vector3(0, 0, 0.5), 10, 20, false)
-	end
-end
-
--- Toggle function
-local function ToggleTest()
-	TestState.enabled = not TestState.enabled
-	if TestState.enabled then
-		local pLocal = entities.GetLocalPlayer()
-		if pLocal and pLocal:IsAlive() then
-			TestState.startPos = pLocal:GetAbsOrigin()
-		end
-		print("ISWalkable Test Suite: ENABLED")
-		client.Command('play "ui/buttonclick"', true)
+	local v0, v1, v2
+	if inTriangle1 then
+		v0, v1, v2 = nw, ne, se
 	else
-		print("ISWalkable Test Suite: DISABLED")
-		client.Command('play "ui/buttonclick_release"', true)
+		v0, v1, v2 = nw, se, sw
 	end
+
+	local denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y)
+	if math.abs(denom) < 0.0001 then
+		return v0.z, UP_VECTOR
+	end
+
+	local w0 = ((v1.y - v2.y) * (pos.x - v2.x) + (v2.x - v1.x) * (pos.y - v2.y)) / denom
+	local w1 = ((v2.y - v0.y) * (pos.x - v2.x) + (v0.x - v2.x) * (pos.y - v2.y)) / denom
+	local w2 = 1.0 - w0 - w1
+	local z = w0 * v0.z + w1 * v1.z + w2 * v2.z
+
+	local edge1 = v1 - v0
+	local edge2 = v2 - v0
+	local normal = edge1:Cross(edge2)
+	normal = Common.Normalize(normal)
+	if not normal then
+		normal = UP_VECTOR
+	end
+
+	return z, normal
 end
 
--- Public API
-local ISWalkableTest = {
-	Toggle = ToggleTest,
-	IsEnabled = function()
-		return TestState.enabled
-	end,
-	GetState = function()
-		return TestState
-	end,
-}
+function NavGeometry.IsPointInNodeBounds(point, node, tolerance)
+	tolerance = tolerance or 0
+	local inX = point.x >= (node._minX - tolerance) and point.x <= (node._maxX + tolerance)
+	local inY = point.y >= (node._minY - tolerance) and point.y <= (node._maxY + tolerance)
+	return inX and inY
+end
 
--- Auto-register callbacks
-callbacks.Register("CreateMove", "ISWalkableTest_CreateMove", OnCreateMove)
-callbacks.Register("Draw", "ISWalkableTest_Draw", OnDraw)
-
--- Add to global for easy access
-G.ISWalkableTest = ISWalkableTest
-
-print("ISWalkable Test Suite loaded. Use G.ISWalkableTest.Toggle() to enable/disable.")
-
-return ISWalkableTest
+return NavGeometry
 
 end)
 __bundle_register("NavBot.Bot.SmartJump", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -8739,7 +7894,6 @@ local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
-local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 
 local MovementDecisions = {}

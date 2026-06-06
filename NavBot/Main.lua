@@ -27,8 +27,6 @@ local HealthLogic = require("NavBot.Bot.HealthLogic")
 
 --[[ Additional Systems ]]
 local SmartJump = require("NavBot.Bot.SmartJump")
-require("NavBot.Bot.ISWalkableTest")
-require("NavBot.Bot.OptimizedISWalkableTest")
 require("NavBot.Bot.IsNavigableTest")
 require("NavBot.Visuals")
 require("NavBot.Utils.Config")

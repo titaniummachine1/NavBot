@@ -2,7 +2,6 @@
 local Common = require("NavBot.Core.Common")
 local G = require("NavBot.Core.Globals")
 local Node = require("NavBot.Navigation.Node")
-local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local MathUtils = require("NavBot.Utils.MathUtils")
 
 local Visuals = {}
@@ -819,9 +818,6 @@ local function OnDraw()
 			end
 		end
 	end
-
-	-- Draw PathValidator debug traces if enabled
-	PathValidator.DrawDebugTraces()
 end
 
 --[[ Callbacks ]]

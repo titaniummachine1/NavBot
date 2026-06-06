@@ -12,7 +12,6 @@ local Node = require("NavBot.Navigation.Node")
 local MovementController = require("NavBot.Bot.MovementController")
 local SmartJump = require("NavBot.Bot.SmartJump")
 local WorkManager = require("NavBot.WorkManager")
-local PathValidator = require("NavBot.Navigation.isWalkable.IsWalkable")
 local NodeSkipper = require("NavBot.Bot.NodeSkipper")
 
 local MovementDecisions = {}

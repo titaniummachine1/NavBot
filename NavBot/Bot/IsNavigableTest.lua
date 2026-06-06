@@ -157,10 +157,12 @@ local function OnCreateMove(Cmd)
 
 		if startNode then
 			local allowJump = G.Menu.Navigation.WalkableMode == "Aggressive"
+			local doorsOnly = G.Menu.Visuals.IsNavigableTestDoorsOnly == true
 			local testKey = string.format(
-				"%d|%s|%.0f|%.0f|%.0f|%.0f",
+				"%d|%s|%s|%.0f|%.0f|%.0f|%.0f",
 				startNode.id,
 				allowJump and "j" or "w",
+				doorsOnly and "d" or "e",
 				TestState.startPos.x,
 				TestState.startPos.y,
 				TestState.currentPos.x,
@@ -173,7 +175,7 @@ local function OnCreateMove(Cmd)
 
 			local startTime, startMemory = BenchmarkStart()
 			TestState.isNavigable =
-				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, true, allowJump)
+				Navigable.CanSkip(TestState.currentPos, TestState.startPos, startNode, doorsOnly, allowJump)
 			Navigable.SetDebugResult(TestState.isNavigable)
 			BenchmarkStop(startTime, startMemory)
 		else
@@ -211,15 +213,24 @@ local function OnDraw()
 	draw.Text(20, 180, string.format("Time usage: %.2f ms", TestState.averageTimeUsage * 1000))
 	draw.Text(20, 210, string.format("Result: %s", TestState.isNavigable and "NAVIGABLE" or "NOT NAVIGABLE"))
 	draw.Text(20, 240, "Press F to set target | Walk away to test")
+	draw.Text(
+		20,
+		270,
+		string.format(
+			"Portal mode: %s",
+			G.Menu.Visuals.IsNavigableTestDoorsOnly and "Doors Only (±12)" or "Full Edge Overlap"
+		)
+	)
 
 	local debugWps = Navigable.GetDebugWaypoints()
 	if debugWps then
 		draw.Text(
 			20,
-			270,
+			300,
 			string.format("Area waypoints: %d | Hull traces: %d", #debugWps, Navigable.GetDebugHullTraceCount())
 		)
-		draw.Text(20, 300, "Green/red = area path | Blue = clear hull | Red = wall/blocked")
+		draw.Text(20, 330, "Green/red = path | Cyan = edge portal | Gold = door portal")
+		draw.Text(20, 360, "Blue = clear hull | Red = wall/blocked")
 	end
 
 	Navigable.DrawDebugTraces()
